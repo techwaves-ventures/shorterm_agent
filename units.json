@@ -1,0 +1,28 @@
+[
+  {
+    "id": "unit1",
+    "name": "Quiet Spacious Home in NW DC - Unit 1",
+    "listing_match": "Unit 1",
+    "area": "Washington, DC (NW)",
+    "monthly_price": 0,
+    "max_occupancy": 0,
+    "pets_allowed": false,
+    "min_nights": 30,
+    "max_nights": 365,
+    "available_from": "2026-01-01",
+    "notes": "FILL ME IN: private entrance, parking, furnished, utilities included, etc."
+  },
+  {
+    "id": "unit2",
+    "name": "Quiet Spacious Home in NW DC - Unit 2",
+    "listing_match": "Unit 2",
+    "area": "Washington, DC (NW)",
+    "monthly_price": 0,
+    "max_occupancy": 0,
+    "pets_allowed": false,
+    "min_nights": 30,
+    "max_nights": 365,
+    "available_from": "2026-01-01",
+    "notes": "FILL ME IN: private entrance, parking, furnished, utilities included, etc."
+  }
+]

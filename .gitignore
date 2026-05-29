@@ -1,0 +1,11 @@
+.env
+*.db
+*.log
+__pycache__/
+.venv/
+venv/
+browser_profile/
+
+# runtime / local
+OTP_CODE
+.claude/

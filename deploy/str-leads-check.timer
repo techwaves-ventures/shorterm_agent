@@ -1,0 +1,11 @@
+[Unit]
+Description=STR Leads — twice-daily lead/message check (08:00 & 18:00)
+
+[Timer]
+OnCalendar=*-*-* 08,18:00:00
+# Fire on next boot if the machine was off at the scheduled time.
+Persistent=true
+Unit=str-leads-check.service
+
+[Install]
+WantedBy=timers.target

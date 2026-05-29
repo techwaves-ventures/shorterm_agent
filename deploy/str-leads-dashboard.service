@@ -1,0 +1,17 @@
+[Unit]
+Description=STR Leads dashboard (FurnishedFinder auto-responder)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/str_leads
+EnvironmentFile=/opt/str_leads/.env
+# Headless Chrome on the VM; OTP is entered via the dashboard, not a window.
+Environment=HEADLESS=1
+ExecStart=/opt/str_leads/.venv/bin/python dashboard.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

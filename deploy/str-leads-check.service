@@ -1,0 +1,10 @@
+[Unit]
+Description=STR Leads — trigger a scrape + auto-draft via the running dashboard
+After=str-leads-dashboard.service
+Requires=str-leads-dashboard.service
+
+[Service]
+Type=oneshot
+# POST /refresh runs the scrape inside the dashboard process, which auto-drafts
+# new leads and owns the OTP flow. Adjust the port if DASHBOARD_PORT differs.
+ExecStart=/usr/bin/curl -fsS -X POST http://127.0.0.1:5000/refresh

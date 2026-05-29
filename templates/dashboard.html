@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>STR Leads — FurnishedFinder</title>
+  <style>
+    :root {
+      --bg: #0f1115; --panel: #181b22; --border: #272b35; --text: #e6e8ec;
+      --muted: #9aa3b2; --accent: #4f8cff; --accent-hover: #3f76e0;
+      --ok: #2ecc71; --warn: #f5a623; --err: #ff5c5c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: var(--bg); color: var(--text);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 16px; padding: 16px 24px; border-bottom: 1px solid var(--border);
+      background: var(--panel); position: sticky; top: 0; z-index: 10;
+    }
+    header h1 { font-size: 18px; margin: 0; }
+    .account { color: var(--muted); font-size: 13px; }
+    .account b { color: var(--text); }
+    button {
+      background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+      padding: 9px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
+    }
+    button:hover { background: var(--accent-hover); }
+    button:disabled { opacity: .55; cursor: default; }
+    main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+    .banner {
+      display: none; align-items: center; gap: 12px; padding: 12px 16px;
+      border: 1px solid var(--border); border-radius: 10px; margin-bottom: 20px;
+      background: var(--panel);
+    }
+    .banner.show { display: flex; }
+    .spinner {
+      width: 16px; height: 16px; border: 2px solid var(--muted);
+      border-top-color: var(--accent); border-radius: 50%;
+      animation: spin .8s linear infinite; flex: 0 0 auto;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .banner.error { border-color: var(--err); }
+    .banner.error .spinner { display: none; }
+    .otp-row { display: none; gap: 8px; margin-left: auto; }
+    .otp-row.show { display: flex; }
+    .otp-row input {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+      color: var(--text); padding: 8px 12px; font-size: 14px; width: 140px;
+      letter-spacing: 2px;
+    }
+    section { margin-bottom: 36px; }
+    h2 { font-size: 15px; color: var(--muted); text-transform: uppercase;
+         letter-spacing: .06em; margin: 0 0 12px; }
+    table { width: 100%; border-collapse: collapse; background: var(--panel);
+            border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border);
+             vertical-align: top; }
+    th { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+    tr:last-child td { border-bottom: 0; }
+    tr:hover td { background: #1d212a; }
+    td.nowrap { white-space: nowrap; color: var(--muted); }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .empty { color: var(--muted); padding: 20px; text-align: center; }
+    .count { color: var(--muted); font-weight: 400; }
+    .apikey-note { background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; color: var(--muted); font-size: 13px; }
+    .apikey-note code { color: var(--text); }
+    .reply-cell { min-width: 280px; }
+    .mini { font-size: 12px; padding: 5px 10px; border-radius: 6px; background: #2a2f3a; }
+    .mini:hover { background: #333a47; }
+    .mini.primary { background: var(--accent); }
+    .mini.primary:hover { background: var(--accent-hover); }
+    .badge { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 6px; }
+    .badge.ok { background: rgba(46,204,113,.15); color: var(--ok); }
+    .badge.muted { background: #2a2f3a; color: var(--muted); }
+    .reason { color: var(--muted); font-size: 12px; margin: 4px 0; }
+    .draft-head { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
+    .unit { font-size: 11px; background: var(--accent); color: #fff; padding: 1px 7px; border-radius: 6px; }
+    .conf { font-size: 11px; background: #2a2f3a; color: var(--muted); padding: 1px 7px; border-radius: 6px; }
+    .draft-text { width: 100%; min-height: 96px; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; color: var(--text); padding: 8px; font: inherit; font-size: 13px; resize: vertical; }
+    .draft-actions { display: flex; gap: 6px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>STR Leads</h1>
+      <div class="account">Connected as <b>{{ account }}</b> · FurnishedFinder</div>
+    </div>
+    <button id="refresh-btn" onclick="startRefresh()">Check now</button>
+  </header>
+
+  <main>
+    <div id="banner" class="banner">
+      <div class="spinner" id="spinner"></div>
+      <span id="banner-msg">Idle</span>
+      <form class="otp-row" id="otp-row" onsubmit="submitOtp(event)">
+        <input id="otp-input" inputmode="numeric" autocomplete="one-time-code"
+               placeholder="OTP code" />
+        <button type="submit">Submit OTP</button>
+      </form>
+    </div>
+
+    <section>
+      <h2>Leads <span class="count" id="leads-count"></span></h2>
+      {% if not has_api_key %}
+      <div class="apikey-note">Set <code>ANTHROPIC_API_KEY</code> in <code>.env</code> and fill <code>units.json</code> to enable auto-drafted replies.</div>
+      {% endif %}
+      <table>
+        <thead>
+          <tr><th class="nowrap">Received</th><th>Traveler</th><th>Property / Title</th><th>Reply</th><th class="nowrap">Link</th></tr>
+        </thead>
+        <tbody id="leads-body"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>Messages <span class="count" id="messages-count"></span></h2>
+      <table>
+        <thead>
+          <tr><th class="nowrap">Date</th><th>Sender</th><th>Preview</th><th class="nowrap">Link</th></tr>
+        </thead>
+        <tbody id="messages-body"></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script>
+    const esc = (s) => (s == null ? "" : String(s).replace(/[&<>"']/g,
+      c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])));
+
+    function preview(it) {
+      // Messages store the preview inside `title` as "Name (date): body".
+      const t = it.title || "";
+      const idx = t.indexOf("): ");
+      return idx >= 0 ? t.slice(idx + 3) : t;
+    }
+
+    function linkCell(url) {
+      return url ? `<a href="${esc(url)}" target="_blank" rel="noopener">open ↗</a>` : "";
+    }
+
+    function replyCell(it) {
+      const r = it.response;
+      const id = esc(it.id || "");
+      if (!r) {
+        return `<button class="mini" onclick="draftLead('${id}')">Draft reply</button>`;
+      }
+      if (r.status === "sent") {
+        return `<span class="badge ok">Sent ✓</span>`;
+      }
+      if (r.status === "dismissed") {
+        return `<span class="badge muted">Dismissed</span>
+                <button class="mini" onclick="draftLead('${id}')">Re-draft</button>`;
+      }
+      if (r.status === "skipped") {
+        return `<span class="badge muted">Skipped</span>
+                <div class="reason">${esc(r.reason || "")}</div>
+                <button class="mini" onclick="draftLead('${id}')">Re-draft</button>`;
+      }
+      // draft
+      const unit = r.unit_id ? `<span class="unit">${esc(r.unit_id)}</span>` : "";
+      const conf = r.confidence ? `<span class="conf">${esc(r.confidence)}</span>` : "";
+      return `
+        <div class="draft-head">${unit}${conf}<span class="reason">${esc(r.reason || "")}</span></div>
+        <textarea id="ta-${id}" class="draft-text">${esc(r.draft || "")}</textarea>
+        <div class="draft-actions">
+          <button class="mini primary" onclick="sendReply('${id}')">Send</button>
+          <button class="mini" onclick="draftLead('${id}')">Re-draft</button>
+          <button class="mini" onclick="dismissLead('${id}')">Dismiss</button>
+        </div>`;
+    }
+
+    function renderLeads(rows) {
+      document.getElementById("leads-count").textContent = `(${rows.length})`;
+      const body = document.getElementById("leads-body");
+      if (!rows.length) { body.innerHTML = `<tr><td colspan="5" class="empty">No leads yet — click “Check now”.</td></tr>`; return; }
+      body.innerHTML = rows.map(it => `
+        <tr>
+          <td class="nowrap">${esc(it.received || "")}</td>
+          <td>${esc(it.traveler || "")}</td>
+          <td>${esc(it.title || "")}</td>
+          <td class="reply-cell">${replyCell(it)}</td>
+          <td class="nowrap">${linkCell(it.url)}</td>
+        </tr>`).join("");
+    }
+
+    async function postForm(url, data) {
+      const fd = new FormData();
+      for (const [k, v] of Object.entries(data)) fd.append(k, v);
+      const r = await fetch(url, { method: "POST", body: fd });
+      return r.json();
+    }
+
+    async function draftLead(id) {
+      const res = await postForm("/responder/draft", { item_id: id });
+      if (!res.ok) { alert(res.error || "Draft failed"); return; }
+      loadData();
+    }
+
+    async function sendReply(id) {
+      const ta = document.getElementById("ta-" + id);
+      const text = ta ? ta.value.trim() : "";
+      if (!text) { alert("Reply is empty."); return; }
+      if (!confirm("Send this reply to the tenant on FurnishedFinder?")) return;
+      const res = await postForm("/responder/send", { item_id: id, text });
+      if (!res.ok) { alert(res.error || "Send failed"); return; }
+      if (!polling) polling = setInterval(pollStatus, 2000);
+      pollStatus();
+    }
+
+    async function dismissLead(id) {
+      await postForm("/responder/dismiss", { item_id: id });
+      loadData();
+    }
+
+    function renderMessages(rows) {
+      document.getElementById("messages-count").textContent = `(${rows.length})`;
+      const body = document.getElementById("messages-body");
+      if (!rows.length) { body.innerHTML = `<tr><td colspan="4" class="empty">No messages yet — click “Check now”.</td></tr>`; return; }
+      body.innerHTML = rows.map(it => `
+        <tr>
+          <td class="nowrap">${esc(it.date || "")}</td>
+          <td>${esc(it.sender || "")}</td>
+          <td>${esc(preview(it))}</td>
+          <td class="nowrap">${linkCell(it.url)}</td>
+        </tr>`).join("");
+    }
+
+    async function loadData() {
+      const r = await fetch("/api/data");
+      const d = await r.json();
+      renderLeads(d.leads || []);
+      renderMessages(d.messages || []);
+    }
+
+    const ACTIVE = ["launching", "checking", "waiting_for_otp"];
+    let polling = null;
+    let wasActive = false;
+
+    function applyState(s) {
+      const banner = document.getElementById("banner");
+      const msg = document.getElementById("banner-msg");
+      const otpRow = document.getElementById("otp-row");
+      const btn = document.getElementById("refresh-btn");
+      const spinner = document.getElementById("spinner");
+
+      const active = ACTIVE.includes(s.status);
+      banner.classList.toggle("show", s.status !== "idle");
+      banner.classList.toggle("error", s.status === "error");
+      spinner.style.display = active ? "block" : "none";
+      msg.textContent = s.message || s.status;
+      otpRow.classList.toggle("show", s.status === "waiting_for_otp");
+      btn.disabled = active;
+      btn.textContent = active ? "Checking…" : "Check now";
+
+      if (s.status === "waiting_for_otp") {
+        document.getElementById("otp-input").focus();
+      }
+      // When a run finishes, refresh the tables once.
+      if (wasActive && !active) loadData();
+      wasActive = active;
+      return active;
+    }
+
+    async function pollStatus() {
+      try {
+        const r = await fetch("/api/status");
+        const s = await r.json();
+        const active = applyState(s);
+        if (!active && polling) { clearInterval(polling); polling = null; }
+      } catch (e) { /* ignore transient errors */ }
+    }
+
+    async function startRefresh() {
+      await fetch("/refresh", { method: "POST" });
+      if (!polling) polling = setInterval(pollStatus, 2000);
+      pollStatus();
+    }
+
+    async function submitOtp(ev) {
+      ev.preventDefault();
+      const input = document.getElementById("otp-input");
+      const code = input.value.trim();
+      if (!code) return;
+      const fd = new FormData();
+      fd.append("code", code);
+      await fetch("/otp", { method: "POST", body: fd });
+      input.value = "";
+      pollStatus();
+    }
+
+    // Initial render uses server-provided state; start polling if a run is in flight.
+    loadData();
+    applyState({{ state | tojson }});
+    if (ACTIVE.includes({{ state.status | tojson }})) {
+      polling = setInterval(pollStatus, 2000);
+    }
+  </script>
+</body>
+</html>
