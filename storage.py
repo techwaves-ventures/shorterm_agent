@@ -63,21 +63,36 @@ def _parse_payload(s: str) -> dict:
 
 
 def filter_new(site: str, kind: str, items: Iterable[dict]) -> list[dict]:
-    """Return items whose item_id hasn't been recorded yet, and record them."""
+    """Record items and return only the ones not seen before.
+
+    Brand-new item_ids are inserted and returned (so they get notified/drafted).
+    Already-seen items are NOT returned, but their stored payload is refreshed
+    when the freshly-scraped payload differs — this lets a re-scrape backfill
+    richer data (e.g. the lead detail view) onto existing rows without
+    re-notifying. `first_seen` is preserved so ordering stays stable.
+    """
     new = []
     with _conn() as c:
         for it in items:
             iid = str(it["id"])
+            payload = json.dumps(it, ensure_ascii=False)
             cur = c.execute(
-                "SELECT 1 FROM seen WHERE site=? AND kind=? AND item_id=?",
+                "SELECT payload FROM seen WHERE site=? AND kind=? AND item_id=?",
                 (site, kind, iid),
             )
-            if cur.fetchone() is None:
+            row = cur.fetchone()
+            if row is None:
                 c.execute(
                     "INSERT INTO seen (site, kind, item_id, payload) VALUES (?,?,?,?)",
-                    (site, kind, iid, json.dumps(it, ensure_ascii=False)),
+                    (site, kind, iid, payload),
                 )
                 new.append(it)
+            elif row[0] != payload:
+                # Seen before but content changed (e.g. detail backfilled).
+                c.execute(
+                    "UPDATE seen SET payload=? WHERE site=? AND kind=? AND item_id=?",
+                    (payload, site, kind, iid),
+                )
     return new
 
 

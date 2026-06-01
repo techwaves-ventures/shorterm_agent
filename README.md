@@ -37,29 +37,38 @@ python dashboard.py               # then open http://localhost:5000
 
 ## Auto-responder agent
 
-The dashboard can draft personalized replies to new leads, pick the right unit, and skip poor fits. Drafts are reviewed by you — **nothing is sent without a click**.
+The dashboard can draft personalized replies for both leads and messages, pick the right unit, and skip poor fits. Drafts are reviewed by you — **nothing is sent without a click**.
+
+**Leads vs. Messages — they're different, and the agent treats them differently:**
+
+- A **lead** (📥) is someone who showed interest in your listing but **hasn't written to you**. The draft is a friendly **introduction** that opens the conversation ("Hi Krish, I'd love to welcome you to my place in NW DC…") — it never thanks them for a message they didn't send.
+- A **message** (💬) is a tenant who **did write** to you. The draft **responds** to what they actually said, referencing their dates, group size, and questions.
 
 Setup:
 
 1. Set `ANTHROPIC_API_KEY` in `.env`.
 2. Fill in `units.json` with your real units (price, occupancy, pets, stay length, area, notes). Each unit's `listing_match` is a substring that ties a lead's listing title to that unit (e.g. `"Unit 1"`).
-3. Optionally tune the voice in `response_template.md`.
+3. Optionally tune the voice in `response_template.md` — it has separate **Introductions (leads)** and **Replies (messages)** guidance.
 
 How it works:
 
-- On each **Check now**, every *new* lead is evaluated by Claude (`claude-sonnet-4-6`). It judges fit in priority order — **area → budget → occupancy/pets/lease-length** — picks the single best-fitting unit, and writes a draft. Poor fits are **Skipped** with a reason.
-- Each lead's **Reply** column shows the decision: a skip reason, or the chosen unit + an editable draft.
-- Edit the draft if you like, then click **Send**. After you confirm, a browser opens and automates FurnishedFinder's "Reply To Tenant"; the row flips to **Sent ✓**. **Re-draft** regenerates; **Dismiss** hides it.
+- On each **Check now**, every *new* lead **and** message is evaluated by Claude (`claude-sonnet-4-6`). It judges fit in priority order — **area → budget → occupancy/pets/lease-length** — picks the single best-fitting unit, and writes a draft (intro for leads, reply for messages). Poor fits (and non-tenant messages, e.g. another host replying) are **Skipped** with a reason.
+- For **leads**, the scrape opens each lead's **travel-dates detail view** (the FurnishedFinder panel behind a lead's date range) and captures the full inquiry — move-in/out, length of stay, occupants, pets, budget, reason for the trip, and contact info. This grounds both the review and the draft in the real inquiry rather than the thin table row. Parsed facts also show as quick-fact chips on the card. (Set `DETAIL_SCRAPE=0` to skip the per-lead clicks and fall back to row-only scraping.)
+- The dashboard shows two sections (**Leads** / **Messages**) as expandable cards. Each card has a kind badge, a status chip, a **Show full inquiry** toggle that reveals the complete message/lead detail, and — when a draft exists — the chosen unit, the AI's reason, and an editable draft.
+- Edit the draft if you like, then click **Send**. After you confirm, a browser opens and automates the platform reply; the card flips to **Sent ✓**. **Re-draft** regenerates; **Dismiss** hides it.
+- Filter chips (All / Needs action / Drafted / Sent) and a search box help you work through the list.
 - The agent only states facts present in `units.json` — it won't invent amenities, prices, or availability.
 
-> First live send: the reply-composer selectors are confirmed against the real page; if they miss, the error appears in the status banner and the selectors in `sites/furnishedfinder.py::send_reply` can be adjusted (same approach used to nail down the OTP login).
+> First live send: the platform reply-composer selectors are confirmed against the real page; if they miss, the error appears in the status banner and the selectors in `sites/furnishedfinder.py` (`send_reply` for leads, `send_message_reply` for messages) can be adjusted (same approach used to nail down the OTP login).
+>
+> First live scrape: the lead travel-dates trigger and detail-panel selectors (`_scrape_lead_detail` in `sites/furnishedfinder.py`) are likewise confirmed against the real page. If they miss, the run still completes with row-only lead data, logs which lead/selector failed, and the candidate selectors can be adjusted in the same defensive multi-selector loop.
 
 ### Reply channels (platform + email)
 
-`REPLY_CHANNELS` (default `platform,email`) controls what **Send** does:
+`REPLY_CHANNELS` (default `platform,email`) controls what **Send** does — for **both** leads and messages:
 
-- **platform** — automates FurnishedFinder's "Reply To Tenant" (the source of truth for `Sent ✓`).
-- **email** — also emails the tenant directly via SMTP. The tenant's address is extracted from the inquiry at draft time (it usually appears in message bodies, not lead rows). If no address was found or SMTP isn't configured, the platform reply still goes and the banner notes that email was skipped. A failed email is reported via notification but never blocks the platform reply.
+- **platform** — automates the on-platform reply (the source of truth for `Sent ✓`). Leads use the lead-row "Reply To Tenant" button; messages reply inside the message thread.
+- **email** — also emails the tenant directly via SMTP. The tenant's address is extracted from the inquiry at draft time (it usually appears in message bodies, not lead rows). If no address was found or SMTP isn't configured, the platform reply still goes and the card notes email was skipped. A failed email is reported via notification but never blocks the platform reply.
 
 Set `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASS`/`FROM_EMAIL` in `.env` to enable email (Gmail needs an **App Password**). Drop `email` from `REPLY_CHANNELS` to reply on-platform only.
 

@@ -54,17 +54,18 @@ def _status_cb(state: str, message: str = "") -> None:
     _set(status=state, message=message)
 
 
-def _draft_new_leads(site: str, kind: str, new_items: list[dict]) -> None:
-    """Auto-draft replies for newly-seen leads. Runs inside the scrape thread,
-    after the browser work — no network send, just stores draft/skipped."""
-    if kind != "lead":
-        return
+def _draft_new_items(site: str, kind: str, new_items: list[dict]) -> None:
+    """Auto-draft replies for newly-seen leads AND messages. Runs inside the
+    scrape thread, after the browser work — no network send, just stores
+    draft/skipped. Leads get an introduction; messages get a response (the
+    responder branches on item['kind'])."""
     try:
         units = responder.load_units()
     except Exception:
         log.exception("Could not load units; skipping auto-draft")
         return
     for it in new_items:
+        it.setdefault("kind", kind)  # ensure the responder sees the right mode
         try:
             d = responder.evaluate_lead(it, units=units)
             storage.save_response(
@@ -88,7 +89,7 @@ def _worker() -> None:
     furnishedfinder.STATUS_CB = _status_cb
     try:
         counts = check_leads.run_scrape(
-            status_cb=_status_cb, on_new_items=_draft_new_leads
+            status_cb=_status_cb, on_new_items=_draft_new_items
         )
         _set(status="done", message="Done.", counts=counts, running=False)
     except Exception as e:
@@ -128,20 +129,25 @@ def submit_otp(code: str) -> bool:
 _send_lock = threading.Lock()
 
 
-def _send_worker(site: str, lead: dict, text: str) -> None:
-    item_id = lead["id"]
-    who = lead.get("traveler") or lead.get("sender") or "tenant"
+def _send_worker(site: str, item: dict, text: str) -> None:
+    item_id = item["id"]
+    kind = item.get("kind", "lead")
+    who = item.get("traveler") or item.get("sender") or "tenant"
     channels = _channels()
     # The address the responder extracted at draft time, stored on the response.
     tenant_email = (storage.get_responses(site).get(item_id) or {}).get("tenant_email")
 
     furnishedfinder.STATUS_CB = _status_cb
     try:
-        # 1. Platform reply — the source of truth for status=sent.
+        # 1. Platform reply — the source of truth for status=sent. Leads use the
+        #    "Reply To Tenant" row action; messages reply inside the thread.
         if "platform" in channels:
             _set(status="checking", message=f"Sending platform reply to {who}…")
             with check_leads.browser_page() as page:
-                furnishedfinder.send_reply(page, lead, text)
+                if kind == "message":
+                    furnishedfinder.send_message_reply(page, item, text)
+                else:
+                    furnishedfinder.send_reply(page, item, text)
         now = datetime.now().isoformat(timespec="seconds")
         storage.update_response(site, item_id, status="sent", draft=text, sent_at=now)
 
@@ -182,9 +188,10 @@ def _send_worker(site: str, lead: dict, text: str) -> None:
             _state["running"] = False
 
 
-def send_reply(site: str, lead: dict, text: str) -> dict:
-    """Send an approved draft in a background thread. `lead` is the stored
-    payload (must include id + traveler/received for row matching)."""
+def send_reply(site: str, item: dict, text: str) -> dict:
+    """Send an approved draft in a background thread. `item` is the stored
+    payload (must include id + kind; traveler/received for leads or
+    sender/date for messages, used to locate the thread/row)."""
     with _lock:
         if _state["running"]:
             return dict(_state)
@@ -193,6 +200,6 @@ def send_reply(site: str, lead: dict, text: str) -> dict:
             updated_at=datetime.now().isoformat(timespec="seconds"),
         )
     threading.Thread(
-        target=_send_worker, args=(site, lead, text), daemon=True
+        target=_send_worker, args=(site, item, text), daemon=True
     ).start()
     return get_state()

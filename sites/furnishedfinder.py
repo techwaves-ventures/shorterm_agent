@@ -156,29 +156,223 @@ def _session_ok(page: Page) -> bool:
     return True
 
 
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_MONTHS = {
+    m: i
+    for i, m in enumerate(
+        ["jan", "feb", "mar", "apr", "may", "jun",
+         "jul", "aug", "sep", "oct", "nov", "dec"], 1
+    )
+}
+
+
+def _norm_date(s: str) -> str:
+    """Normalize 'Jun 13, 2026' -> '6/13/26' so detail dates match the row style."""
+    m = re.match(r"([A-Za-z]{3})[A-Za-z]*\.?\s+(\d{1,2}),?\s+(\d{4})", s.strip())
+    if not m:
+        return s.strip()
+    mon = _MONTHS.get(m.group(1).lower())
+    if not mon:
+        return s.strip()
+    return f"{mon}/{int(m.group(2))}/{m.group(3)[-2:]}"
+
+
+def _kv(detail: str, label: str) -> str:
+    """Pull a value from FurnishedFinder's label/value detail layout.
+
+    The detail page renders each field as a label line followed by its value on
+    the next non-empty line, e.g.  "Travelers:\n1".
+    """
+    target = label.lower().rstrip(":")
+    lines = [ln.strip() for ln in detail.splitlines()]
+    for i, ln in enumerate(lines):
+        if ln.lower().rstrip(":") == target:
+            for v in lines[i + 1:]:
+                if v:
+                    return v
+            return ""
+    return ""
+
+
+def _parse_lead_detail(detail: str) -> dict:
+    """Best-effort extraction of structured facts from a lead's detail page.
+
+    The detail page is a label/value list (Requested travel dates, Travelers,
+    Budget, Reason for travel, Traveling with pets, Occupation, Work location).
+    All fields are optional — only keys we actually find are returned, so older
+    data (or a layout we don't recognize) degrades gracefully.
+    """
+    facts: dict = {}
+    if not detail:
+        return facts
+
+    occ = _kv(detail, "Travelers")
+    if occ.isdigit():
+        facts["occupants"] = int(occ)
+
+    pets = _kv(detail, "Traveling with pets")
+    if pets:
+        facts["pets"] = pets.strip().lower() not in ("no", "false", "none", "0", "-")
+
+    budget = _kv(detail, "Budget")
+    if budget and budget != "-":
+        facts["budget"] = budget
+
+    for label, key in (
+        ("Reason for travel", "reason"),
+        ("Occupation", "occupation"),
+        ("Work location", "work_location"),
+    ):
+        val = _kv(detail, label)
+        if val and val != "-":
+            facts[key] = val
+
+    # Travel range on the detail page ("Jun 13, 2026 - Jul 13, 2026"); the row
+    # already carries M/D/YY dates, so these are a fallback (see _extract_leads).
+    rng = re.search(
+        r"([A-Za-z]{3}\.?\s+\d{1,2},?\s+\d{4})\s*-\s*([A-Za-z]{3}\.?\s+\d{1,2},?\s+\d{4})",
+        detail,
+    )
+    if rng:
+        facts["move_in"] = _norm_date(rng.group(1))
+        facts["move_out"] = _norm_date(rng.group(2))
+
+    phone = re.search(
+        r"(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}", detail
+    )
+    if phone:
+        facts["phone"] = phone.group(0).strip()
+
+    email = _EMAIL_RE.search(detail)
+    if email:
+        facts["email"] = email.group(0)
+
+    return facts
+
+
+# Labels that mark the lead inquiry block on the detail page. The block is found
+# by scoring visible containers on these and taking the tightest match.
+_INQUIRY_KEYS = [
+    "requested travel dates", "travelers", "budget", "reason for travel",
+    "traveling with pets", "date received", "occupation", "work location",
+    "number of bedrooms", "desired amenities",
+]
+
+
+def _find_inquiry_block(page: Page) -> str:
+    """Return the text of the lead-detail inquiry block on the current page.
+
+    Clicking a lead navigates to a full detail route (no modal). The inquiry is
+    one structured block among lots of nav chrome; we score visible containers
+    by how many known field labels they contain and return the tightest match,
+    so we get the inquiry without the surrounding page furniture.
+    """
+    js = """(keys) => {
+      let best = null;
+      for (const el of document.querySelectorAll('div,section,article')) {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 || r.height === 0) continue;
+        const t = (el.innerText || '').trim();
+        if (!t || t.length > 2500) continue;
+        const low = t.toLowerCase();
+        let score = 0;
+        for (const k of keys) if (low.includes(k)) score++;
+        if (score >= 4 && (best === null || t.length < best.len))
+          best = {text: t, len: t.length};
+      }
+      return best ? best.text : '';
+    }"""
+    try:
+        return (page.evaluate(js, _INQUIRY_KEYS) or "").strip()
+    except Exception:
+        return ""
+
+
+def _real_lead_rows(page: Page) -> list:
+    """Visible lead <tr> rows (header skipped) as (locator, text) pairs."""
+    out = []
+    for r in page.locator("table tr").all():
+        try:
+            t = (r.inner_text() or "").strip()
+        except Exception:
+            continue
+        if not t or len(t) < 20:
+            continue
+        low = t.lower()
+        if "property + traveler" in low or "travel dates" in low:
+            continue
+        out.append((r, t))
+    return out
+
+
+def _scrape_lead_detail(page: Page, row, move_in: str) -> str:
+    """Click a lead row open and return its detail-page inquiry text.
+
+    The travel-dates cell navigates to the lead's `?leadId=…` detail route (it
+    is NOT a modal). We click, wait for that route, capture the inquiry block,
+    and leave the caller to navigate back to the list. Returns "" on failure so
+    the caller falls back to the row text.
+    """
+    clicked = False
+    sels = []
+    if move_in:
+        sels = [
+            f'td:has-text("{move_in}")',
+            f'a:has-text("{move_in}")',
+            f'button:has-text("{move_in}")',
+        ]
+    for sel in sels:
+        try:
+            el = row.locator(sel).first
+            if el.is_visible(timeout=800):
+                el.click()
+                clicked = True
+                break
+        except Exception:
+            continue
+    if not clicked:
+        try:
+            row.click()
+            clicked = True
+        except Exception:
+            return ""
+
+    try:
+        page.wait_for_url("**leadId=**", timeout=5000)
+    except Exception:
+        pass  # capture whatever rendered even if the URL pattern shifts
+    page.wait_for_timeout(1500)
+    return _find_inquiry_block(page)
+
+
 def _extract_leads(page: Page) -> list[dict]:
-    """The leads page is a real <table>. Each <tr> is one lead."""
+    """The leads page is a real <table>. Each <tr> is one lead.
+
+    Phase 1 collects all rows (row text + ids). Phase 2 (when DETAIL_SCRAPE is
+    on) opens each lead's travel-dates detail view to capture the full inquiry
+    (move-in/out, occupants, pets, budget, reason, contact) for review + drafts.
+    """
     items: list[dict] = []
     try:
         page.wait_for_selector("table tr", timeout=10000)
     except PWTimeout:
         return items
 
-    rows = page.locator("table tr").all()
-    for r in rows:
+    # --- Phase 1: collect rows ------------------------------------------------
+    collected: list[dict] = []
+    for _r, text in _real_lead_rows(page):
         try:
-            text = (r.inner_text() or "").strip()
-            if not text or len(text) < 20:
-                continue
-            # Skip the header row (contains "Property + traveler", "Travel dates", etc.)
-            lower = text.lower()
-            if "property + traveler" in lower or "travel dates" in lower:
-                continue
-
-            # Pull date received (mm/dd/yy or mm/dd/yyyy) and traveler name for a
-            # stable, human-readable id.
-            date_match = re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", text)
-            received = date_match.group(0) if date_match else ""
+            # A lead row looks like:
+            #   <unit> <area> <traveler>  <move-in> - <move-out> (N nights)
+            #   $<price>  <date-received>  Reply To Tenant
+            # so multiple M/D/YY dates appear. The FIRST is the move-in date,
+            # the SECOND is the move-out date (the travel range), and the LAST
+            # standalone M/D/YY (after the price) is when the lead was RECEIVED.
+            all_dates = re.findall(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", text)
+            received = all_dates[-1] if all_dates else ""
+            move_in = all_dates[0] if all_dates else ""
+            move_out = all_dates[1] if len(all_dates) >= 3 else ""
+            nights_m = re.search(r"\((\d+)\s*nights?\)", text, re.I)
             # Traveler line typically looks like "Svetlana V." (first name + last initial).
             traveler = ""
             for line in text.splitlines():
@@ -187,7 +381,10 @@ def _extract_leads(page: Page) -> list[dict]:
                     traveler = line
                     break
 
-            iid = _hash(traveler, received, text[:120])
+            # Hash on the full row text (which already contains both dates) +
+            # traveler, so the id stays stable regardless of how we interpret
+            # the individual dates.
+            iid = _hash(traveler, text[:120])
             # Pull a short title.
             title_lines = [
                 ln.strip()
@@ -195,22 +392,70 @@ def _extract_leads(page: Page) -> list[dict]:
                 if ln.strip() and ln.strip() not in ("Reply To Tenant",)
             ]
             title = " | ".join(title_lines[:3])[:240]
-            items.append(
-                {
-                    "id": iid,
-                    "title": title,
-                    "url": LEADS_URL,
-                    "received": received,
-                    "traveler": traveler,
-                    # Full row text — the responder agent reads this for dates,
-                    # occupancy, budget, etc. Not part of the id hash, so adding
-                    # it doesn't change dedup.
-                    "raw": text,
-                }
-            )
+            item = {
+                "id": iid,
+                "title": title,
+                "url": LEADS_URL,
+                "received": received,
+                "move_in": move_in,
+                "traveler": traveler,
+                # Full row text — the responder agent reads this for dates,
+                # occupancy, budget, etc. Not part of the id hash, so adding
+                # it doesn't change dedup.
+                "raw": text,
+            }
+            if move_out:
+                item["move_out"] = move_out
+            if nights_m:
+                item["nights"] = int(nights_m.group(1))
+            collected.append(item)
         except Exception:
             continue
-    return items
+
+    # --- Phase 2: enrich with the detail page --------------------------------
+    # Clicking a lead navigates to its detail route, so the Phase-1 row handles
+    # go stale. We re-fetch the rows by index each iteration, match the item by
+    # its move_in date, scrape the detail, then navigate back to the list.
+    detail_on = os.getenv("DETAIL_SCRAPE", "1").strip().lower() not in ("0", "false", "no")
+    if not detail_on:
+        return collected
+
+    for item in collected:
+        move_in = item.get("move_in", "")
+        try:
+            # Locate this lead's current row (handles are stale after navigation).
+            row = None
+            for r, text in _real_lead_rows(page):
+                if _hash(item.get("traveler", ""), text[:120]) == item["id"]:
+                    row = r
+                    break
+            if row is None:
+                continue
+
+            detail = _scrape_lead_detail(page, row, move_in)
+            if detail:
+                item["detail"] = detail
+                facts = _parse_lead_detail(detail)
+                # Prefer row-derived dates; fill only what the row lacked.
+                for k, v in facts.items():
+                    if k in ("move_in", "move_out") and item.get(k):
+                        continue
+                    item[k] = v
+            else:
+                log.info("Lead detail empty for %r (selector miss)", item.get("traveler"))
+        except Exception:
+            log.exception("Lead detail scrape failed for %r", item.get("traveler"))
+        finally:
+            # Always return to the leads list for the next iteration.
+            try:
+                if "leadId=" in page.url:
+                    page.goto(LEADS_URL, wait_until="domcontentloaded")
+                    page.wait_for_timeout(1500)
+                    page.wait_for_selector("table tr", timeout=10000)
+            except Exception:
+                log.exception("Failed returning to leads list")
+
+    return collected
 
 
 def _extract_messages(page: Page) -> list[dict]:
@@ -390,3 +635,83 @@ def send_reply(page: Page, lead: dict, text: str) -> None:
         except PWTimeout:
             continue
     raise RuntimeError("Could not find a Send button to submit the reply.")
+
+
+def _fill_and_submit_composer(page: Page, text: str, who: str) -> None:
+    """Shared composer fill+submit, used by the message-thread reply flow."""
+    compose_sel = (
+        "textarea, "
+        '[contenteditable="true"], '
+        'input[name*="message" i], textarea[name*="message" i], '
+        'textarea[placeholder*="message" i], '
+        'textarea[placeholder*="reply" i], textarea[placeholder*="type" i]'
+    )
+    try:
+        page.wait_for_selector(compose_sel, timeout=10000)
+    except PWTimeout:
+        raise RuntimeError("Message composer textarea did not appear.")
+    box = page.locator(compose_sel).last  # the open thread's box is last in DOM
+    box.click()
+    box.fill(text)
+    page.wait_for_timeout(500)
+
+    for sel in (
+        'button:has-text("Send")',
+        'button:has-text("Send Message")',
+        'button:has-text("Reply")',
+        'button:has-text("Submit")',
+        'button[type="submit"]',
+    ):
+        try:
+            btn = page.locator(sel).last
+            if btn.is_visible(timeout=1500):
+                btn.click()
+                page.wait_for_timeout(2500)
+                log.info("Message reply sent to %s", who)
+                return
+        except PWTimeout:
+            continue
+    raise RuntimeError("Could not find a Send button to submit the message reply.")
+
+
+def send_message_reply(page: Page, item: dict, text: str) -> None:
+    """Reply inside an existing FurnishedFinder message thread.
+
+    The messages page is a SPA conversation list (no per-row anchors), so we
+    open the conversation by matching the sender name (and date when available)
+    in the list, then fill + submit the composer. Defensive multi-selector
+    candidates throughout — exact selectors are confirmed on the first live send,
+    same as the lead reply and OTP flows.
+    """
+    _ensure_session(page)
+    page.goto(MESSAGES_URL, wait_until="domcontentloaded")
+    page.wait_for_timeout(3000)
+
+    sender = (item.get("sender") or item.get("traveler") or "").strip()
+    if not sender:
+        raise RuntimeError("Message has no sender name to locate the conversation.")
+
+    # Open the conversation. Try a text match on the sender name across the
+    # common clickable containers the SPA uses for conversation rows.
+    opened = False
+    for sel in (
+        f'[role="listitem"]:has-text("{sender}")',
+        f'li:has-text("{sender}")',
+        f'div[class*="conversation" i]:has-text("{sender}")',
+        f'div[class*="thread" i]:has-text("{sender}")',
+        f'a:has-text("{sender}")',
+        f'*:has-text("{sender}")',
+    ):
+        try:
+            row = page.locator(sel).first
+            if row.is_visible(timeout=1500):
+                row.click()
+                page.wait_for_timeout(1500)
+                opened = True
+                break
+        except PWTimeout:
+            continue
+    if not opened:
+        raise RuntimeError(f"Could not find a message conversation for {sender!r}.")
+
+    _fill_and_submit_composer(page, text, sender)

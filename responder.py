@@ -21,7 +21,11 @@ _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
 def _find_email(item: dict) -> str | None:
     """Best-effort email scrape from the raw inquiry text (model fallback)."""
-    for key in ("body", "raw", "title"):
+    # The lead detail view often carries the address even when the row doesn't,
+    # so a parsed `email` and the full `detail` text are checked first.
+    if item.get("email"):
+        return item["email"]
+    for key in ("detail", "body", "raw", "title"):
         text = item.get(key)
         if text:
             m = _EMAIL_RE.search(text)
@@ -131,15 +135,44 @@ def _system_blocks(units: list[dict]) -> list[dict]:
     return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
 
 
+_LEAD_MODE = (
+    "MODE: INTRODUCTION (new lead).\n"
+    "This tenant has NOT messaged you yet — they only expressed interest in your "
+    "listing. Write a warm INTRODUCTION that opens the conversation: greet them, "
+    "introduce the place, and invite them to share their dates and details. "
+    "Do NOT thank them for a message — they haven't sent one. Avoid phrases like "
+    "\"thanks for reaching out\" or \"thanks for your message\"."
+)
+
+_MESSAGE_MODE = (
+    "MODE: REPLY (the tenant messaged you).\n"
+    "This tenant sent you the message shown below. Write a reply that responds "
+    "directly to what they actually said — answer their questions and reference "
+    "the specifics of their message."
+)
+
+
 def _lead_text(item: dict) -> str:
-    """The only per-lead (uncached) input — placed after the cached prefix."""
+    """The only per-item (uncached) input — placed after the cached prefix.
+
+    Carries the reply MODE so leads get an introduction and messages get a
+    response. Kept out of the cached system block so caching stays effective.
+    """
+    mode = _MESSAGE_MODE if item.get("kind") == "message" else _LEAD_MODE
     fields = {
         k: item.get(k)
-        for k in ("kind", "traveler", "sender", "received", "date", "title", "raw", "body")
-        if item.get(k)
+        for k in (
+            "kind", "traveler", "sender", "received", "date", "title",
+            # Lead detail-view facts (present when the detail scrape succeeds).
+            "move_in", "move_out", "nights", "occupants", "pets", "budget", "phone",
+            "raw", "body", "detail",
+        )
+        if item.get(k) is not None and item.get(k) != ""
     }
     return (
-        "Here is one tenant inquiry. Decide fit, pick the best unit, and draft a reply.\n\n"
+        mode
+        + "\n\nDecide fit, pick the best unit, and draft the reply for this "
+        "tenant inquiry:\n\n"
         + json.dumps(fields, indent=2)
     )
 
@@ -148,11 +181,18 @@ def evaluate_lead(item: dict, units: list[dict] | None = None, client=None) -> d
     """Return {fit, unit_id, reason, draft, confidence}. Raises on API/config error."""
     import anthropic
 
-    if not os.getenv("ANTHROPIC_API_KEY"):
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set in .env — cannot draft replies.")
 
     units = units if units is not None else load_units()
-    client = client or anthropic.Anthropic()
+    if client is None:
+        # Talk to Anthropic directly. Pass api_key + base_url explicitly so a
+        # host-shell ANTHROPIC_BASE_URL (e.g. a Claude Code proxy) can't
+        # redirect our key to the wrong endpoint. Override with
+        # ANTHROPIC_RESPONDER_BASE_URL only if you intend to use a proxy.
+        base_url = os.getenv("ANTHROPIC_RESPONDER_BASE_URL", "https://api.anthropic.com")
+        client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
 
     resp = client.messages.create(
         model=MODEL,

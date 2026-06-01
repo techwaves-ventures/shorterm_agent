@@ -6,19 +6,19 @@
   <title>STR Leads — FurnishedFinder</title>
   <style>
     :root {
-      --bg: #0f1115; --panel: #181b22; --border: #272b35; --text: #e6e8ec;
-      --muted: #9aa3b2; --accent: #4f8cff; --accent-hover: #3f76e0;
+      --bg: #0f1115; --panel: #181b22; --panel2: #1d212a; --border: #272b35;
+      --text: #e6e8ec; --muted: #9aa3b2; --accent: #4f8cff; --accent-hover: #3f76e0;
       --ok: #2ecc71; --warn: #f5a623; --err: #ff5c5c;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0; background: var(--bg); color: var(--text);
-      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     }
     header {
       display: flex; align-items: center; justify-content: space-between;
       gap: 16px; padding: 16px 24px; border-bottom: 1px solid var(--border);
-      background: var(--panel); position: sticky; top: 0; z-index: 10;
+      background: var(--panel); position: sticky; top: 0; z-index: 20;
     }
     header h1 { font-size: 18px; margin: 0; }
     .account { color: var(--muted); font-size: 13px; }
@@ -29,7 +29,8 @@
     }
     button:hover { background: var(--accent-hover); }
     button:disabled { opacity: .55; cursor: default; }
-    main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+    main { padding: 24px; max-width: 920px; margin: 0 auto; }
+
     .banner {
       display: none; align-items: center; gap: 12px; padding: 12px 16px;
       border: 1px solid var(--border); border-radius: 10px; margin-bottom: 20px;
@@ -48,42 +49,87 @@
     .otp-row.show { display: flex; }
     .otp-row input {
       background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-      color: var(--text); padding: 8px 12px; font-size: 14px; width: 140px;
-      letter-spacing: 2px;
+      color: var(--text); padding: 8px 12px; font-size: 14px; width: 140px; letter-spacing: 2px;
     }
+
     section { margin-bottom: 36px; }
-    h2 { font-size: 15px; color: var(--muted); text-transform: uppercase;
-         letter-spacing: .06em; margin: 0 0 12px; }
-    table { width: 100%; border-collapse: collapse; background: var(--panel);
-            border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
-    th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border);
-             vertical-align: top; }
-    th { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
-    tr:last-child td { border-bottom: 0; }
-    tr:hover td { background: #1d212a; }
-    td.nowrap { white-space: nowrap; color: var(--muted); }
-    a { color: var(--accent); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    .empty { color: var(--muted); padding: 20px; text-align: center; }
-    .count { color: var(--muted); font-weight: 400; }
+    .sec-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 6px; }
+    .sec-head h2 { font-size: 16px; margin: 0; }
+    .sec-sub { color: var(--muted); font-size: 13px; }
+    .count { color: var(--muted); font-weight: 400; font-size: 13px; }
+
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0 14px; }
+    .chip {
+      background: var(--panel); color: var(--muted); border: 1px solid var(--border);
+      border-radius: 999px; padding: 5px 12px; font-size: 12.5px; cursor: pointer; font-weight: 500;
+    }
+    .chip:hover { color: var(--text); }
+    .chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .search {
+      margin-left: auto; background: var(--panel); border: 1px solid var(--border);
+      border-radius: 8px; color: var(--text); padding: 7px 12px; font-size: 13px; min-width: 180px;
+    }
+
     .apikey-note { background: var(--panel); border: 1px solid var(--border);
-      border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; color: var(--muted); font-size: 13px; }
+      border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; color: var(--muted); font-size: 13px; }
     .apikey-note code { color: var(--text); }
-    .reply-cell { min-width: 280px; }
-    .mini { font-size: 12px; padding: 5px 10px; border-radius: 6px; background: #2a2f3a; }
+
+    .card {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+      padding: 14px 16px; margin-bottom: 12px;
+    }
+    .card-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .who { font-weight: 600; font-size: 15px; }
+    .when { color: var(--muted); font-size: 12.5px; }
+    .spacer { margin-left: auto; }
+
+    .kind { font-size: 11px; padding: 2px 9px; border-radius: 999px; font-weight: 600; }
+    .kind.lead { background: rgba(79,140,255,.16); color: #8fb6ff; }
+    .kind.message { background: rgba(245,166,35,.16); color: #f3c170; }
+
+    .status { font-size: 11.5px; padding: 2px 9px; border-radius: 999px; font-weight: 600; }
+    .status.draft { background: rgba(79,140,255,.16); color: #8fb6ff; }
+    .status.sent { background: rgba(46,204,113,.16); color: var(--ok); }
+    .status.skipped, .status.dismissed { background: #2a2f3a; color: var(--muted); }
+    .status.none { background: #2a2f3a; color: var(--warn); }
+
+    .prop { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
+    .email-tag { color: var(--accent); font-size: 12.5px; }
+    .facts { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }
+    .fact { font-size: 12px; background: var(--panel2); color: var(--text);
+            border: 1px solid var(--border); border-radius: 999px; padding: 2px 9px; }
+    .inquiry-toggle {
+      background: none; color: var(--accent); border: 0; padding: 6px 0 0; font-size: 12.5px;
+      font-weight: 500; cursor: pointer;
+    }
+    .inquiry-toggle:hover { background: none; text-decoration: underline; }
+    .inquiry {
+      display: none; white-space: pre-wrap; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; padding: 10px 12px; margin-top: 8px; color: var(--text);
+      font-size: 13px; max-height: 260px; overflow: auto;
+    }
+    .inquiry.show { display: block; }
+
+    .reply { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
+    .reply-head { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
+    .unit { font-size: 11px; background: var(--accent); color: #fff; padding: 1px 8px; border-radius: 6px; }
+    .conf { font-size: 11px; background: #2a2f3a; color: var(--muted); padding: 1px 8px; border-radius: 6px; }
+    .reason { color: var(--muted); font-size: 12.5px; }
+    .draft-text {
+      width: 100%; min-height: 120px; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; color: var(--text); padding: 10px 12px; font: inherit; font-size: 13.5px;
+      line-height: 1.5; resize: vertical;
+    }
+    .actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
+    .mini { font-size: 12.5px; padding: 6px 12px; border-radius: 7px; background: #2a2f3a; }
     .mini:hover { background: #333a47; }
     .mini.primary { background: var(--accent); }
     .mini.primary:hover { background: var(--accent-hover); }
-    .badge { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 6px; }
-    .badge.ok { background: rgba(46,204,113,.15); color: var(--ok); }
-    .badge.muted { background: #2a2f3a; color: var(--muted); }
-    .reason { color: var(--muted); font-size: 12px; margin: 4px 0; }
-    .draft-head { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
-    .unit { font-size: 11px; background: var(--accent); color: #fff; padding: 1px 7px; border-radius: 6px; }
-    .conf { font-size: 11px; background: #2a2f3a; color: var(--muted); padding: 1px 7px; border-radius: 6px; }
-    .draft-text { width: 100%; min-height: 96px; background: var(--bg); border: 1px solid var(--border);
-      border-radius: 8px; color: var(--text); padding: 8px; font: inherit; font-size: 13px; resize: vertical; }
-    .draft-actions { display: flex; gap: 6px; margin-top: 6px; }
+    .send-note { color: var(--muted); font-size: 12px; }
+    .empty { color: var(--muted); padding: 24px; text-align: center;
+      border: 1px dashed var(--border); border-radius: 12px; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -100,33 +146,43 @@
       <div class="spinner" id="spinner"></div>
       <span id="banner-msg">Idle</span>
       <form class="otp-row" id="otp-row" onsubmit="submitOtp(event)">
-        <input id="otp-input" inputmode="numeric" autocomplete="one-time-code"
-               placeholder="OTP code" />
+        <input id="otp-input" inputmode="numeric" autocomplete="one-time-code" placeholder="OTP code" />
         <button type="submit">Submit OTP</button>
       </form>
     </div>
 
+    {% if not has_api_key %}
+    <div class="apikey-note">Set <code>ANTHROPIC_API_KEY</code> in <code>.env</code> and fill <code>units.json</code> to enable auto-drafted replies.</div>
+    {% endif %}
+
     <section>
-      <h2>Leads <span class="count" id="leads-count"></span></h2>
-      {% if not has_api_key %}
-      <div class="apikey-note">Set <code>ANTHROPIC_API_KEY</code> in <code>.env</code> and fill <code>units.json</code> to enable auto-drafted replies.</div>
-      {% endif %}
-      <table>
-        <thead>
-          <tr><th class="nowrap">Received</th><th>Traveler</th><th>Property / Title</th><th>Reply</th><th class="nowrap">Link</th></tr>
-        </thead>
-        <tbody id="leads-body"></tbody>
-      </table>
+      <div class="sec-head">
+        <h2>📥 Leads <span class="count" id="leads-count"></span></h2>
+        <span class="sec-sub">interested but haven't messaged — replies introduce your place</span>
+      </div>
+      <div class="toolbar">
+        <span class="chip active" data-kind="lead" data-filter="all" onclick="setFilter('lead','all',this)">All</span>
+        <span class="chip" data-kind="lead" data-filter="action" onclick="setFilter('lead','action',this)">Needs action</span>
+        <span class="chip" data-kind="lead" data-filter="draft" onclick="setFilter('lead','draft',this)">Drafted</span>
+        <span class="chip" data-kind="lead" data-filter="sent" onclick="setFilter('lead','sent',this)">Sent</span>
+        <input class="search" id="lead-search" placeholder="Search leads…" oninput="rerender('lead')" />
+      </div>
+      <div id="leads-body"></div>
     </section>
 
     <section>
-      <h2>Messages <span class="count" id="messages-count"></span></h2>
-      <table>
-        <thead>
-          <tr><th class="nowrap">Date</th><th>Sender</th><th>Preview</th><th class="nowrap">Link</th></tr>
-        </thead>
-        <tbody id="messages-body"></tbody>
-      </table>
+      <div class="sec-head">
+        <h2>💬 Messages <span class="count" id="messages-count"></span></h2>
+        <span class="sec-sub">tenants who wrote to you — replies respond to their message</span>
+      </div>
+      <div class="toolbar">
+        <span class="chip active" data-kind="message" data-filter="all" onclick="setFilter('message','all',this)">All</span>
+        <span class="chip" data-kind="message" data-filter="action" onclick="setFilter('message','action',this)">Needs action</span>
+        <span class="chip" data-kind="message" data-filter="draft" onclick="setFilter('message','draft',this)">Drafted</span>
+        <span class="chip" data-kind="message" data-filter="sent" onclick="setFilter('message','sent',this)">Sent</span>
+        <input class="search" id="message-search" placeholder="Search messages…" oninput="rerender('message')" />
+      </div>
+      <div id="messages-body"></div>
     </section>
   </main>
 
@@ -134,109 +190,220 @@
     const esc = (s) => (s == null ? "" : String(s).replace(/[&<>"']/g,
       c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])));
 
-    function preview(it) {
-      // Messages store the preview inside `title` as "Name (date): body".
-      const t = it.title || "";
-      const idx = t.indexOf("): ");
-      return idx >= 0 ? t.slice(idx + 3) : t;
+    // Full inquiry text: prefer scraped body/raw; fall back to title (older data
+    // stored messages as "Name (date): body" and leads as the pipe-joined row).
+    function fullText(it) {
+      if (it.kind === "message") {
+        if (it.body) return it.body;
+        const t = it.title || "";
+        const idx = t.indexOf("): ");
+        return idx >= 0 ? t.slice(idx + 3) : t;
+      }
+      // Leads: the travel-dates detail view has the full inquiry; fall back to
+      // the table row text for older data scraped before detail capture.
+      return it.detail || it.raw || it.title || "";
     }
 
-    function linkCell(url) {
-      return url ? `<a href="${esc(url)}" target="_blank" rel="noopener">open ↗</a>` : "";
+    // Small quick-fact chips for a lead (parsed from the detail view). Returns
+    // "" when nothing is known, so old data renders unchanged.
+    function quickFacts(it) {
+      if (it.kind !== "lead") return "";
+      const chips = [];
+      if (it.move_in && it.move_out) chips.push(`📅 ${esc(it.move_in)} → ${esc(it.move_out)}`);
+      else if (it.move_in) chips.push(`📅 ${esc(it.move_in)}`);
+      if (it.nights) chips.push(`${it.nights} nights`);
+      if (it.occupants) chips.push(`👤 ${it.occupants}`);
+      if (it.pets === true) chips.push(`🐾 pets`);
+      if (it.budget) chips.push(`💲 ${esc(it.budget)}`);
+      if (!chips.length) return "";
+      return `<div class="facts">` + chips.map(c => `<span class="fact">${c}</span>`).join("") + `</div>`;
+    }
+    function shortLine(it) {
+      const t = fullText(it).replace(/\s+/g, " ").trim();
+      return t.length > 140 ? t.slice(0, 140) + "…" : t;
     }
 
-    function replyCell(it) {
+    // Sort key = the date the lead/message was RECEIVED.
+    //  - Leads carry `received` ("M/D/YY") — the last date in the row, i.e.
+    //    when the inquiry came in (NOT the tenant's move-in date).
+    //  - Messages carry `date` ("Mar. 26", no year).
+    // Falls back to first_seen (scrape timestamp) when unparseable.
+    const MONTHS = {jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
+    function sortKey(it) {
+      const r = (it.received || "").trim();
+      if (r) {                                    // lead: "5/27/26" / "5/27/2026"
+        const m = r.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+        if (m) { let y = +m[3]; if (y < 100) y += 2000;
+          return new Date(y, +m[1] - 1, +m[2]).getTime(); }
+      }
+      const d = (it.date || "").trim();
+      if (d) {                                    // message: "Apr. 15" (no year)
+        const m = d.match(/^([A-Za-z]{3})\.?\s+(\d{1,2})/);
+        if (m && m[1].toLowerCase() in MONTHS) {
+          const base = it.first_seen ? new Date(it.first_seen.replace(" ", "T")) : new Date(0);
+          const y = isNaN(base) ? 1970 : base.getFullYear();
+          return new Date(y, MONTHS[m[1].toLowerCase()], +m[2]).getTime();
+        }
+      }
+      const fs = it.first_seen ? new Date(it.first_seen.replace(" ", "T")).getTime() : 0;
+      return isNaN(fs) ? 0 : fs;
+    }
+
+    const data = { lead: [], message: [] };
+    const filters = { lead: "all", message: "all" };
+
+    function statusOf(it) {
+      const r = it.response;
+      if (!r) return "none";
+      return r.status || "none";
+    }
+    function needsAction(it) {
+      const s = statusOf(it);
+      return s === "none" || s === "draft";
+    }
+
+    function statusChip(it) {
+      const s = statusOf(it);
+      const label = { none: "Needs draft", draft: "Draft ready", sent: "Sent ✓",
+                      skipped: "Skipped", dismissed: "Dismissed" }[s] || s;
+      return `<span class="status ${s}">${label}</span>`;
+    }
+
+    function replyArea(it) {
       const r = it.response;
       const id = esc(it.id || "");
-      if (!r) {
-        return `<button class="mini" onclick="draftLead('${id}')">Draft reply</button>`;
+      if (!r || r.status === "none") {
+        return `<div class="reply"><button class="mini" onclick="draftItem('${id}')">✨ Draft reply</button></div>`;
       }
       if (r.status === "sent") {
-        return `<span class="badge ok">Sent ✓</span>`;
+        const em = r.emailed_at ? " · emailed" : "";
+        return `<div class="reply"><span class="reason">Sent ${esc(r.sent_at || "")}${em}.</span></div>`;
       }
-      if (r.status === "dismissed") {
-        return `<span class="badge muted">Dismissed</span>
-                <button class="mini" onclick="draftLead('${id}')">Re-draft</button>`;
-      }
-      if (r.status === "skipped") {
-        return `<span class="badge muted">Skipped</span>
-                <div class="reason">${esc(r.reason || "")}</div>
-                <button class="mini" onclick="draftLead('${id}')">Re-draft</button>`;
+      if (r.status === "skipped" || r.status === "dismissed") {
+        const verb = r.status === "skipped" ? "Skipped" : "Dismissed";
+        return `<div class="reply">
+          <div class="reply-head"><span class="reason">${verb}${r.reason ? " — " + esc(r.reason) : ""}</span></div>
+          <button class="mini" onclick="draftItem('${id}')">Re-draft</button>
+        </div>`;
       }
       // draft
       const unit = r.unit_id ? `<span class="unit">${esc(r.unit_id)}</span>` : "";
       const conf = r.confidence ? `<span class="conf">${esc(r.confidence)}</span>` : "";
-      return `
-        <div class="draft-head">${unit}${conf}<span class="reason">${esc(r.reason || "")}</span></div>
+      const hasEmail = !!r.tenant_email;
+      const sendNote = hasEmail
+        ? `<span class="send-note">→ platform + email (${esc(r.tenant_email)})</span>`
+        : `<span class="send-note">→ platform only (no email found)</span>`;
+      return `<div class="reply">
+        <div class="reply-head">${unit}${conf}<span class="reason">${esc(r.reason || "")}</span></div>
         <textarea id="ta-${id}" class="draft-text">${esc(r.draft || "")}</textarea>
-        <div class="draft-actions">
+        <div class="actions">
           <button class="mini primary" onclick="sendReply('${id}')">Send</button>
-          <button class="mini" onclick="draftLead('${id}')">Re-draft</button>
-          <button class="mini" onclick="dismissLead('${id}')">Dismiss</button>
-        </div>`;
+          <button class="mini" onclick="draftItem('${id}')">Re-draft</button>
+          <button class="mini" onclick="dismissItem('${id}')">Dismiss</button>
+          ${sendNote}
+        </div>
+      </div>`;
     }
 
-    function renderLeads(rows) {
-      document.getElementById("leads-count").textContent = `(${rows.length})`;
-      const body = document.getElementById("leads-body");
-      if (!rows.length) { body.innerHTML = `<tr><td colspan="5" class="empty">No leads yet — click “Check now”.</td></tr>`; return; }
-      body.innerHTML = rows.map(it => `
-        <tr>
-          <td class="nowrap">${esc(it.received || "")}</td>
-          <td>${esc(it.traveler || "")}</td>
-          <td>${esc(it.title || "")}</td>
-          <td class="reply-cell">${replyCell(it)}</td>
-          <td class="nowrap">${linkCell(it.url)}</td>
-        </tr>`).join("");
+    function card(it) {
+      const id = esc(it.id || "");
+      const who = esc(it.traveler || it.sender || "Unknown");
+      const when = esc(it.received || it.date || it.first_seen || "");
+      const prop = it.kind === "lead" ? esc(it.title || "") : "";
+      const email = it.response && it.response.tenant_email
+        ? ` · <span class="email-tag">${esc(it.response.tenant_email)}</span>` : "";
+      return `<div class="card">
+        <div class="card-top">
+          <span class="who">${who}</span>
+          <span class="kind ${it.kind}">${it.kind === "lead" ? "📥 New lead" : "💬 Message"}</span>
+          <span class="when">${when}</span>
+          <span class="spacer"></span>
+          ${statusChip(it)}
+        </div>
+        <div class="prop">${prop}${prop && email ? "" : ""}${shortLine(it) ? (prop ? " — " : "") + esc(shortLine(it)) : ""}${email}</div>
+        ${quickFacts(it)}
+        <button class="inquiry-toggle" onclick="toggleInquiry('${id}')">Show full inquiry ▾</button>
+        <div class="inquiry" id="inq-${id}">${esc(fullText(it))}</div>
+        ${replyArea(it)}
+      </div>`;
     }
 
-    async function postForm(url, data) {
+    function visibleRows(kind) {
+      const f = filters[kind];
+      const q = (document.getElementById(kind + "-search").value || "").toLowerCase().trim();
+      return data[kind].filter(it => {
+        if (f === "action" && !needsAction(it)) return false;
+        if (f === "draft" && statusOf(it) !== "draft") return false;
+        if (f === "sent" && statusOf(it) !== "sent") return false;
+        if (q) {
+          const hay = ((it.traveler || it.sender || "") + " " + fullText(it)).toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        return true;
+      }).sort((a, b) => sortKey(b) - sortKey(a));   // newest received first
+    }
+
+    function rerender(kind) {
+      const rows = visibleRows(kind);
+      const total = data[kind].length;
+      const action = data[kind].filter(needsAction).length;
+      document.getElementById(kind + "s-count").textContent =
+        `(${total} · ${action} need action)`;
+      const body = document.getElementById(kind + "s-body");
+      const noun = kind === "lead" ? "leads" : "messages";
+      if (!rows.length) {
+        body.innerHTML = `<div class="empty">${total ? "No " + noun + " match this filter." : "No " + noun + " yet — click “Check now”."}</div>`;
+        return;
+      }
+      body.innerHTML = rows.map(card).join("");
+    }
+
+    function setFilter(kind, f, el) {
+      filters[kind] = f;
+      document.querySelectorAll(`.chip[data-kind="${kind}"]`).forEach(c => c.classList.remove("active"));
+      el.classList.add("active");
+      rerender(kind);
+    }
+
+    function toggleInquiry(id) {
+      const el = document.getElementById("inq-" + id);
+      if (el) el.classList.toggle("show");
+    }
+
+    async function postForm(url, payload) {
       const fd = new FormData();
-      for (const [k, v] of Object.entries(data)) fd.append(k, v);
+      for (const [k, v] of Object.entries(payload)) fd.append(k, v);
       const r = await fetch(url, { method: "POST", body: fd });
       return r.json();
     }
 
-    async function draftLead(id) {
+    async function draftItem(id) {
       const res = await postForm("/responder/draft", { item_id: id });
       if (!res.ok) { alert(res.error || "Draft failed"); return; }
       loadData();
     }
-
     async function sendReply(id) {
       const ta = document.getElementById("ta-" + id);
       const text = ta ? ta.value.trim() : "";
       if (!text) { alert("Reply is empty."); return; }
-      if (!confirm("Send this reply to the tenant on FurnishedFinder?")) return;
+      if (!confirm("Send this reply to the tenant (platform + email)?")) return;
       const res = await postForm("/responder/send", { item_id: id, text });
       if (!res.ok) { alert(res.error || "Send failed"); return; }
       if (!polling) polling = setInterval(pollStatus, 2000);
       pollStatus();
     }
-
-    async function dismissLead(id) {
+    async function dismissItem(id) {
       await postForm("/responder/dismiss", { item_id: id });
       loadData();
-    }
-
-    function renderMessages(rows) {
-      document.getElementById("messages-count").textContent = `(${rows.length})`;
-      const body = document.getElementById("messages-body");
-      if (!rows.length) { body.innerHTML = `<tr><td colspan="4" class="empty">No messages yet — click “Check now”.</td></tr>`; return; }
-      body.innerHTML = rows.map(it => `
-        <tr>
-          <td class="nowrap">${esc(it.date || "")}</td>
-          <td>${esc(it.sender || "")}</td>
-          <td>${esc(preview(it))}</td>
-          <td class="nowrap">${linkCell(it.url)}</td>
-        </tr>`).join("");
     }
 
     async function loadData() {
       const r = await fetch("/api/data");
       const d = await r.json();
-      renderLeads(d.leads || []);
-      renderMessages(d.messages || []);
+      data.lead = d.leads || [];
+      data.message = d.messages || [];
+      rerender("lead");
+      rerender("message");
     }
 
     const ACTIVE = ["launching", "checking", "waiting_for_otp"];
@@ -258,11 +425,7 @@
       otpRow.classList.toggle("show", s.status === "waiting_for_otp");
       btn.disabled = active;
       btn.textContent = active ? "Checking…" : "Check now";
-
-      if (s.status === "waiting_for_otp") {
-        document.getElementById("otp-input").focus();
-      }
-      // When a run finishes, refresh the tables once.
+      if (s.status === "waiting_for_otp") document.getElementById("otp-input").focus();
       if (wasActive && !active) loadData();
       wasActive = active;
       return active;
@@ -295,7 +458,6 @@
       pollStatus();
     }
 
-    // Initial render uses server-provided state; start polling if a run is in flight.
     loadData();
     applyState({{ state | tojson }});
     if (ACTIVE.includes({{ state.status | tojson }})) {

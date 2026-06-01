@@ -26,18 +26,23 @@ app = Flask(__name__)
 def _recent():
     responses = storage.get_responses(SITE)
     leads = storage.get_recent(SITE, "lead", LIMIT)
-    for lead in leads:
-        lead["response"] = responses.get(lead.get("id"))
-    return {
-        "leads": leads,
-        "messages": storage.get_recent(SITE, "message", LIMIT),
-    }
+    messages = storage.get_recent(SITE, "message", LIMIT)
+    for it in leads:
+        it["kind"] = "lead"
+        it["response"] = responses.get(it.get("id"))
+    for it in messages:
+        it["kind"] = "message"
+        it["response"] = responses.get(it.get("id"))
+    return {"leads": leads, "messages": messages}
 
 
-def _lead_by_id(item_id: str) -> dict | None:
-    for lead in storage.get_recent(SITE, "lead", 200):
-        if lead.get("id") == item_id:
-            return lead
+def _item_by_id(item_id: str) -> dict | None:
+    """Find a lead or message by id, tagging it with its kind."""
+    for kind in ("lead", "message"):
+        for it in storage.get_recent(SITE, kind, 200):
+            if it.get("id") == item_id:
+                it["kind"] = kind
+                return it
     return None
 
 
@@ -83,34 +88,35 @@ def _form(*keys):
 
 @app.route("/responder/draft", methods=["POST"])
 def responder_draft():
-    """(Re-)draft a single lead on demand."""
+    """(Re-)draft a single lead or message on demand."""
     (item_id,) = _form("item_id")
-    lead = _lead_by_id(item_id)
-    if not lead:
-        return jsonify({"ok": False, "error": "lead not found"}), 404
+    item = _item_by_id(item_id)
+    if not item:
+        return jsonify({"ok": False, "error": "item not found"}), 404
     try:
-        d = responder.evaluate_lead(lead)
+        d = responder.evaluate_lead(item)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     storage.save_response(
-        SITE, "lead", item_id,
+        SITE, item["kind"], item_id,
         status="draft" if d.get("fit") else "skipped",
         unit_id=d.get("unit_id"), reason=d.get("reason"),
         draft=d.get("draft"), confidence=d.get("confidence"),
+        tenant_email=d.get("tenant_email"),
     )
     return jsonify({"ok": True, "response": storage.get_responses(SITE).get(item_id)})
 
 
 @app.route("/responder/send", methods=["POST"])
 def responder_send():
-    """One-click approve → send the (possibly edited) draft."""
+    """One-click approve → send the (possibly edited) draft (lead or message)."""
     item_id, text = _form("item_id", "text")
-    lead = _lead_by_id(item_id)
-    if not lead:
-        return jsonify({"ok": False, "error": "lead not found"}), 404
+    item = _item_by_id(item_id)
+    if not item:
+        return jsonify({"ok": False, "error": "item not found"}), 404
     if not (text or "").strip():
         return jsonify({"ok": False, "error": "empty reply"}), 400
-    state = runner.send_reply(SITE, lead, text)
+    state = runner.send_reply(SITE, item, text)
     return jsonify({"ok": True, "state": state})
 
 
