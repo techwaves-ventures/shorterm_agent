@@ -32,6 +32,8 @@
     .header-actions { display: flex; gap: 10px; align-items: center; }
     button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
     button.ghost:hover { background: var(--panel2); color: var(--text); }
+    .settings-link { color: var(--muted); font-size: 13px; font-weight: 500; }
+    .settings-link:hover { color: var(--text); text-decoration: none; }
     main { padding: 24px; max-width: 920px; margin: 0 auto; }
 
     .connect-card {
@@ -161,6 +163,7 @@
     </div>
     <div class="header-actions">
       {% if is_operator %}<button id="refresh-btn" onclick="startRefresh()">Check now</button>{% endif %}
+      <a href="{{ url_for('settings') }}" class="settings-link">Settings</a>
       <form method="post" action="{{ url_for('logout') }}" style="display:inline">
         <button type="submit" class="ghost">Log out</button>
       </form>

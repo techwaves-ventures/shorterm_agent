@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 
 import check_leads
+import config
 import mailer
 import responder
 import storage
@@ -23,9 +24,9 @@ log = logging.getLogger(__name__)
 OTP_PATH = Path(__file__).parent / "OTP_CODE"
 
 
-def _channels() -> set[str]:
-    """Which reply channels are enabled (REPLY_CHANNELS=platform,email)."""
-    raw = os.getenv("REPLY_CHANNELS", "platform,email")
+def _channels(tenant_id: str) -> set[str]:
+    """Which reply channels are enabled for this tenant (e.g. platform,email)."""
+    raw = config.get_settings(tenant_id)["reply_channels"]
     return {c.strip().lower() for c in raw.split(",") if c.strip()}
 
 _lock = threading.Lock()
@@ -60,14 +61,14 @@ def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]
     draft/skipped. Leads get an introduction; messages get a response (the
     responder branches on item['kind'])."""
     try:
-        units = responder.load_units()
+        units = responder.load_units(tenant_id)
     except Exception:
         log.exception("Could not load units; skipping auto-draft")
         return
     for it in new_items:
         it.setdefault("kind", kind)  # ensure the responder sees the right mode
         try:
-            d = responder.evaluate_lead(it, units=units)
+            d = responder.evaluate_lead(it, tenant_id, units=units)
             storage.save_response(
                 tenant_id, site, kind, it["id"],
                 status="draft" if d.get("fit") else "skipped",
@@ -136,7 +137,8 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
     item_id = item["id"]
     kind = item.get("kind", "lead")
     who = item.get("traveler") or item.get("sender") or "tenant"
-    channels = _channels()
+    channels = _channels(tenant_id)
+    from_email = config.get_settings(tenant_id)["from_email"]
     # The address the responder extracted at draft time, stored on the response.
     tenant_email = (storage.get_responses(tenant_id, site).get(item_id) or {}).get("tenant_email")
 
@@ -165,7 +167,8 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
                 try:
                     _set(status="checking", message=f"Emailing {tenant_email}…")
                     mailer.send_email(
-                        tenant_email, "Re: your FurnishedFinder inquiry", text
+                        tenant_email, "Re: your FurnishedFinder inquiry", text,
+                        from_email=from_email,
                     )
                     storage.update_response(
                         tenant_id, site, item_id,

@@ -14,6 +14,7 @@ import sqlite3
 from flask_login import UserMixin
 from werkzeug.security import check_password_hash, generate_password_hash
 
+import config
 from storage import DB_PATH
 
 OPERATOR_TENANT_ID = "1"
@@ -114,6 +115,8 @@ def create_user(email: str, password: str, tenant_name: str | None = None) -> Us
             "INSERT INTO users (tenant_id, email, password_hash) VALUES (?,?,?)",
             (tenant_id, email, pw_hash),
         )
+    # Seed fresh per-tenant config (empty units + default template).
+    config.seed_tenant(str(tenant_id))
     return get_user_by_email(email)
 
 
@@ -148,6 +151,9 @@ def ensure_operator() -> None:
                 "INSERT INTO tenants (id, name, is_operator) VALUES (?, ?, 1)",
                 (OPERATOR_TENANT_ID, name),
             )
+    # Seed the operator's config from the legacy global files/env (idempotent —
+    # won't clobber edits once a settings row exists).
+    config.seed_tenant(OPERATOR_TENANT_ID, from_legacy=True)
 
     email = (os.getenv("OPERATOR_EMAIL") or "").strip().lower()
     password = os.getenv("OPERATOR_PASSWORD") or ""

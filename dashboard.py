@@ -34,6 +34,7 @@ from flask_login import (
     logout_user,
 )
 
+import config
 import models
 import responder
 import runner
@@ -215,7 +216,7 @@ def responder_draft():
     if not item:
         return jsonify({"ok": False, "error": "item not found"}), 404
     try:
-        d = responder.evaluate_lead(item)
+        d = responder.evaluate_lead(item, tenant_id)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
     storage.save_response(
@@ -252,6 +253,50 @@ def responder_dismiss():
     (item_id,) = _form("item_id")
     storage.update_response(current_user.tenant_id, SITE, item_id, status="dismissed")
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Per-tenant settings (units, template, identity)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/settings", methods=["GET", "POST"])
+@login_required
+def settings():
+    tenant_id = current_user.tenant_id
+    if request.method == "POST":
+        units_text = request.form.get("units_json", "")
+        try:
+            config.validate_units(units_text)
+        except ValueError as e:
+            flash(str(e))
+            # Re-render with the user's unsaved edits so nothing is lost.
+            return render_template(
+                "settings.html",
+                account=current_user.email,
+                settings={
+                    "host_name": request.form.get("host_name", ""),
+                    "units_json": units_text,
+                    "template": request.form.get("template", ""),
+                    "from_email": request.form.get("from_email", ""),
+                    "reply_channels": request.form.get("reply_channels", ""),
+                },
+            )
+        config.save_settings(
+            tenant_id,
+            host_name=request.form.get("host_name", "").strip(),
+            units_json=units_text,
+            template=request.form.get("template", ""),
+            from_email=request.form.get("from_email", "").strip(),
+            reply_channels=request.form.get("reply_channels", "").strip() or "platform,email",
+        )
+        flash("Saved.")
+        return redirect(url_for("settings"))
+    return render_template(
+        "settings.html",
+        account=current_user.email,
+        settings=config.get_settings(tenant_id),
+    )
 
 
 if __name__ == "__main__":
