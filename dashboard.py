@@ -132,5 +132,5 @@ if __name__ == "__main__":
     # Host/port from env so the VM can bind 0.0.0.0 (behind an SSH tunnel — the
     # dashboard has no auth) without editing code. Defaults stay loopback-only.
     host = os.getenv("DASHBOARD_HOST", "127.0.0.1")
-    port = int(os.getenv("DASHBOARD_PORT", "5000"))
+    port = int(os.getenv("DASHBOARD_PORT", "5050"))
     app.run(host=host, port=port, threaded=True, debug=False)

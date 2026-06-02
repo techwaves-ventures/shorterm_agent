@@ -101,6 +101,10 @@ prices, or availability.
 If the inquiry text contains the tenant's email address, return it in tenant_email; \
 otherwise return null. Never guess an email.
 
+When a unit fits, write the draft in the FIRST PERSON as the host, {host_name}. \
+Always sign off the reply with the host's name, "{host_name}" — never a generic \
+placeholder like "Your host", "The host", or "[Your name]".
+
 You must call the record_decision tool with your decision.
 
 === UNIT CATALOG ===
@@ -126,9 +130,15 @@ def _load_guide() -> str:
         return ""
 
 
+def _host_name() -> str:
+    """The name auto-drafted replies sign off with (HOST_NAME in .env)."""
+    return (os.getenv("HOST_NAME") or "Sagiv").strip()
+
+
 def _system_blocks(units: list[dict]) -> list[dict]:
     """Stable system prompt (units + style guide), cached as a prefix."""
     text = SYSTEM_GUIDE.format(
+        host_name=_host_name(),
         units=json.dumps(units, indent=2),
         guide=_load_guide(),
     )

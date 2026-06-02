@@ -126,6 +126,16 @@
     .mini.primary { background: var(--accent); }
     .mini.primary:hover { background: var(--accent-hover); }
     .send-note { color: var(--muted); font-size: 12px; }
+    .spinner-sm {
+      display: inline-block; width: 12px; height: 12px; vertical-align: -2px;
+      margin-right: 6px; border: 2px solid rgba(255,255,255,.35);
+      border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite;
+    }
+    button.busy { opacity: .8; cursor: default; }
+    .reply-msg { font-size: 12.5px; margin-top: 8px; }
+    .reply-msg.err { color: var(--err); }
+    .reply-msg.ok { color: var(--ok); }
+    .draft-text:disabled { opacity: .6; }
     .empty { color: var(--muted); padding: 24px; text-align: center;
       border: 1px dashed var(--border); border-radius: 12px; }
     a { color: var(--accent); text-decoration: none; }
@@ -273,35 +283,40 @@
       const r = it.response;
       const id = esc(it.id || "");
       if (!r || r.status === "none") {
-        return `<div class="reply"><button class="mini" onclick="draftItem('${id}')">✨ Draft reply</button></div>`;
+        return `<div class="reply">
+          <button class="mini" id="draft-btn-${id}" onclick="draftItem('${id}')">✨ Draft reply</button>
+          <div class="reply-msg" id="msg-${id}"></div>
+        </div>`;
       }
       if (r.status === "sent") {
         const em = r.emailed_at ? " · emailed" : "";
         return `<div class="reply"><span class="reason">Sent ${esc(r.sent_at || "")}${em}.</span></div>`;
       }
-      if (r.status === "skipped" || r.status === "dismissed") {
-        const verb = r.status === "skipped" ? "Skipped" : "Dismissed";
-        return `<div class="reply">
-          <div class="reply-head"><span class="reason">${verb}${r.reason ? " — " + esc(r.reason) : ""}</span></div>
-          <button class="mini" onclick="draftItem('${id}')">Re-draft</button>
-        </div>`;
-      }
-      // draft
+      // draft / skipped / dismissed — all stay editable so a skip never blocks
+      // you. Skipped/dismissed just show why, then hand you an open textarea.
+      const skipped = r.status === "skipped" || r.status === "dismissed";
+      const verb = r.status === "skipped" ? "Skipped" : "Dismissed";
+      const note = skipped
+        ? `<div class="reply-head"><span class="status ${r.status}">${verb}</span><span class="reason">${esc(r.reason || "")} — edit below and send anyway.</span></div>`
+        : "";
       const unit = r.unit_id ? `<span class="unit">${esc(r.unit_id)}</span>` : "";
       const conf = r.confidence ? `<span class="conf">${esc(r.confidence)}</span>` : "";
+      const headLine = skipped ? "" :
+        `<div class="reply-head">${unit}${conf}<span class="reason">${esc(r.reason || "")}</span></div>`;
       const hasEmail = !!r.tenant_email;
       const sendNote = hasEmail
         ? `<span class="send-note">→ platform + email (${esc(r.tenant_email)})</span>`
         : `<span class="send-note">→ platform only (no email found)</span>`;
       return `<div class="reply">
-        <div class="reply-head">${unit}${conf}<span class="reason">${esc(r.reason || "")}</span></div>
-        <textarea id="ta-${id}" class="draft-text">${esc(r.draft || "")}</textarea>
+        ${note}${headLine}
+        <textarea id="ta-${id}" class="draft-text" placeholder="Write your reply…">${esc(r.draft || "")}</textarea>
         <div class="actions">
-          <button class="mini primary" onclick="sendReply('${id}')">Send</button>
-          <button class="mini" onclick="draftItem('${id}')">Re-draft</button>
+          <button class="mini primary" id="send-btn-${id}" onclick="sendReply('${id}')">Send</button>
+          <button class="mini" id="draft-btn-${id}" onclick="draftItem('${id}')">Re-draft</button>
           <button class="mini" onclick="dismissItem('${id}')">Dismiss</button>
           ${sendNote}
         </div>
+        <div class="reply-msg" id="msg-${id}"></div>
       </div>`;
     }
 
@@ -377,20 +392,63 @@
       return r.json();
     }
 
-    async function draftItem(id) {
-      const res = await postForm("/responder/draft", { item_id: id });
-      if (!res.ok) { alert(res.error || "Draft failed"); return; }
-      loadData();
+    // Inline per-card feedback helpers (replace blocking alert/confirm).
+    function setMsg(id, text, cls) {
+      const el = document.getElementById("msg-" + id);
+      if (el) { el.textContent = text || ""; el.className = "reply-msg" + (cls ? " " + cls : ""); }
     }
+    function setBusy(btn, on, busyLabel) {
+      if (!btn) return;
+      if (on) {
+        btn.dataset.label = btn.dataset.label || btn.innerHTML;
+        btn.classList.add("busy");
+        btn.disabled = true;
+        btn.innerHTML = `<span class="spinner-sm"></span>${busyLabel || "Working…"}`;
+      } else {
+        btn.classList.remove("busy");
+        btn.disabled = false;
+        if (btn.dataset.label) btn.innerHTML = btn.dataset.label;
+      }
+    }
+
+    async function draftItem(id) {
+      const btn = document.getElementById("draft-btn-" + id);
+      setBusy(btn, true, "Drafting…");
+      setMsg(id, "✨ Asking Claude to draft a reply…", "");
+      try {
+        const res = await postForm("/responder/draft", { item_id: id });
+        if (!res.ok) { setBusy(btn, false); setMsg(id, res.error || "Draft failed", "err"); return; }
+        // loadData() re-renders the card from scratch, so no need to reset btn.
+        await loadData();
+      } catch (e) {
+        setBusy(btn, false);
+        setMsg(id, "Draft failed: " + e, "err");
+      }
+    }
+
     async function sendReply(id) {
       const ta = document.getElementById("ta-" + id);
       const text = ta ? ta.value.trim() : "";
-      if (!text) { alert("Reply is empty."); return; }
-      if (!confirm("Send this reply to the tenant (platform + email)?")) return;
-      const res = await postForm("/responder/send", { item_id: id, text });
-      if (!res.ok) { alert(res.error || "Send failed"); return; }
-      if (!polling) polling = setInterval(pollStatus, 2000);
-      pollStatus();
+      if (!text) { setMsg(id, "Reply is empty — write something first.", "err"); if (ta) ta.focus(); return; }
+      const btn = document.getElementById("send-btn-" + id);
+      setBusy(btn, true, "Sending…");
+      if (ta) ta.disabled = true;
+      setMsg(id, "Sending reply… watch the bar up top for progress.", "");
+      try {
+        const res = await postForm("/responder/send", { item_id: id, text });
+        if (!res.ok) {
+          setBusy(btn, false); if (ta) ta.disabled = false;
+          setMsg(id, res.error || "Send failed", "err");
+          return;
+        }
+        // Send runs in a background thread; the status banner + poll report the
+        // outcome and loadData() (on completion) re-renders this card as "Sent".
+        if (!polling) polling = setInterval(pollStatus, 2000);
+        pollStatus();
+      } catch (e) {
+        setBusy(btn, false); if (ta) ta.disabled = false;
+        setMsg(id, "Send failed: " + e, "err");
+      }
     }
     async function dismissItem(id) {
       await postForm("/responder/dismiss", { item_id: id });

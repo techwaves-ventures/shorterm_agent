@@ -22,6 +22,6 @@ if [ ! -f .env ]; then
 fi
 
 host="${DASHBOARD_HOST:-127.0.0.1}"
-port="${DASHBOARD_PORT:-5000}"
+port="${DASHBOARD_PORT:-5050}"
 echo "Starting dashboard on http://${host}:${port}"
 exec "$PY" dashboard.py

@@ -373,11 +373,13 @@ def _extract_leads(page: Page) -> list[dict]:
             move_in = all_dates[0] if all_dates else ""
             move_out = all_dates[1] if len(all_dates) >= 3 else ""
             nights_m = re.search(r"\((\d+)\s*nights?\)", text, re.I)
-            # Traveler line typically looks like "Svetlana V." (first name + last initial).
+            # Traveler line is "<first name> <last initial>", e.g. "Svetlana V."
+            # or "FELICIEN P." — the first name may be all-caps, so match a
+            # letter run (not strictly Titlecase) followed by a single initial.
             traveler = ""
             for line in text.splitlines():
                 line = line.strip()
-                if re.match(r"^[A-Z][a-z]+ [A-Z]\.?$", line):
+                if re.match(r"^[A-Z][A-Za-z'’-]+ [A-Z]\.?$", line):
                     traveler = line
                     break
 
@@ -548,6 +550,55 @@ def _ensure_session(page: Page) -> None:
         _session_logged_in = True
 
 
+def _find_lead_row(page: Page, lead: dict, traveler: str, received: str):
+    """Locate the table row for a lead, tolerant of a missing traveler name.
+
+    The traveler is only captured when the row matches a "Firstname X." shape,
+    so some leads have traveler=''. Rather than fail, score every row on the
+    signals we *do* have — traveler, the received date, the travel range
+    (move_in/move_out), and distinctive tokens from the stored `raw` row text —
+    and take the best non-trivial match. This makes sending robust even when the
+    name wasn't parsed.
+    """
+    move_in = (lead.get("move_in") or "").strip()
+    move_out = (lead.get("move_out") or "").strip()
+    # Strip the boilerplate action label so it doesn't become a token shared by
+    # every row (which would defeat the score threshold below).
+    raw = (lead.get("raw") or "").replace("Reply To Tenant", "")
+    # Distinctive tokens from the original row: prices, dollar amounts, the unit
+    # name — anything that helps disambiguate when there's no name.
+    raw_tokens = set(re.findall(r"\$[\d,]+|\b[A-Z][a-zA-Z]{3,}\b|\d{1,2}/\d{1,2}/\d{2,4}", raw))
+
+    best = None
+    best_score = 0
+    for r in page.locator("table tr").all():
+        try:
+            rtext = r.inner_text() or ""
+        except Exception:
+            continue
+        if not rtext.strip() or "Reply To Tenant" not in rtext:
+            continue
+        score = 0
+        if traveler and traveler in rtext:
+            score += 5
+        if received and received in rtext:
+            score += 3
+        if move_in and move_in in rtext:
+            score += 2
+        if move_out and move_out in rtext:
+            score += 2
+        # Token overlap as a tie-breaker / fallback when names are absent.
+        if raw_tokens:
+            overlap = sum(1 for t in raw_tokens if t in rtext)
+            score += min(overlap, 4)
+        if score > best_score:
+            best_score, best = score, r
+
+    # Require a meaningful match (more than a single incidental token) so we
+    # never reply on the wrong lead.
+    return best if best_score >= 2 else None
+
+
 def send_reply(page: Page, lead: dict, text: str) -> None:
     """Open the lead's "Reply To Tenant" composer and send `text`.
 
@@ -563,19 +614,11 @@ def send_reply(page: Page, lead: dict, text: str) -> None:
     traveler = (lead.get("traveler") or lead.get("sender") or "").strip()
     received = (lead.get("received") or lead.get("date") or "").strip()
 
-    # Find the row whose text matches this lead, then click its reply action.
-    rows = page.locator("table tr").all()
-    target = None
-    for r in rows:
-        try:
-            rtext = (r.inner_text() or "")
-        except Exception:
-            continue
-        if traveler and traveler in rtext and (not received or received in rtext):
-            target = r
-            break
+    target = _find_lead_row(page, lead, traveler, received)
     if target is None:
-        raise RuntimeError(f"Could not find lead row for {traveler!r} ({received!r}).")
+        raise RuntimeError(
+            f"Could not find lead row for {traveler!r} ({received!r})."
+        )
 
     clicked = False
     for sel in (
