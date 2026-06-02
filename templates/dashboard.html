@@ -29,7 +29,18 @@
     }
     button:hover { background: var(--accent-hover); }
     button:disabled { opacity: .55; cursor: default; }
+    .header-actions { display: flex; gap: 10px; align-items: center; }
+    button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
+    button.ghost:hover { background: var(--panel2); color: var(--text); }
     main { padding: 24px; max-width: 920px; margin: 0 auto; }
+
+    .connect-card {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+      padding: 28px; margin-top: 8px; text-align: center;
+    }
+    .connect-card h2 { margin: 0 0 10px; font-size: 18px; }
+    .connect-card p { color: var(--text); margin: 0 0 8px; }
+    .connect-card .muted { color: var(--muted); font-size: 13px; }
 
     .banner {
       display: none; align-items: center; gap: 12px; padding: 12px 16px;
@@ -146,12 +157,25 @@
   <header>
     <div>
       <h1>STR Leads</h1>
-      <div class="account">Connected as <b>{{ account }}</b> · FurnishedFinder</div>
+      <div class="account">Signed in as <b>{{ account }}</b>{% if is_operator %} · FurnishedFinder{% endif %}</div>
     </div>
-    <button id="refresh-btn" onclick="startRefresh()">Check now</button>
+    <div class="header-actions">
+      {% if is_operator %}<button id="refresh-btn" onclick="startRefresh()">Check now</button>{% endif %}
+      <form method="post" action="{{ url_for('logout') }}" style="display:inline">
+        <button type="submit" class="ghost">Log out</button>
+      </form>
+    </div>
   </header>
 
   <main>
+  {% if not is_operator %}
+    <div class="connect-card">
+      <h2>Connect your FurnishedFinder account</h2>
+      <p>Your dashboard is ready. Linking your FurnishedFinder login so we can fetch
+         your leads and send replies on your behalf is <b>coming soon</b>.</p>
+      <p class="muted">Once connected, your new leads and messages will show up right here.</p>
+    </div>
+  {% else %}
     <div id="banner" class="banner">
       <div class="spinner" id="spinner"></div>
       <span id="banner-msg">Idle</span>
@@ -194,8 +218,10 @@
       </div>
       <div id="messages-body"></div>
     </section>
+  {% endif %}
   </main>
 
+  {% if is_operator %}
   <script>
     const esc = (s) => (s == null ? "" : String(s).replace(/[&<>"']/g,
       c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])));
@@ -522,5 +548,6 @@
       polling = setInterval(pollStatus, 2000);
     }
   </script>
+  {% endif %}
 </body>
 </html>

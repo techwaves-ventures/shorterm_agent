@@ -66,13 +66,14 @@ def browser_page():
             ctx.close()
 
 
-def run_scrape(status_cb=None, on_new_items=None) -> dict:
+def run_scrape(status_cb=None, on_new_items=None, tenant_id: str = "1") -> dict:
     """Launch a real browser, scrape every registered site, dedup + notify.
 
     `status_cb(state, message)` is invoked at key transitions so a UI (the Flask
     dashboard) can show progress. It is optional — the CLI passes nothing.
-    `on_new_items(site, kind, new_items)` is called for each batch of newly-seen
-    items (used by the dashboard to auto-draft replies).
+    `on_new_items(tenant_id, site, kind, new_items)` is called for each batch of
+    newly-seen items (used by the dashboard to auto-draft replies).
+    `tenant_id` scopes dedup + storage; the CLI defaults to the operator ('1').
 
     Returns a dict of new-item counts: {site: {kind: n}}.
     """
@@ -107,7 +108,7 @@ def run_scrape(status_cb=None, on_new_items=None) -> dict:
 
             any_new = False
             for kind, kind_items in by_kind.items():
-                new_items = filter_new(name, kind, kind_items)
+                new_items = filter_new(tenant_id, name, kind, kind_items)
                 if not new_items:
                     continue
                 any_new = True
@@ -119,7 +120,7 @@ def run_scrape(status_cb=None, on_new_items=None) -> dict:
                 notify(f"[{name}] {len(new_items)} new {kind}(s)", body)
                 if on_new_items:
                     try:
-                        on_new_items(name, kind, new_items)
+                        on_new_items(tenant_id, name, kind, new_items)
                     except Exception:
                         log.exception("on_new_items hook failed")
             if not any_new:

@@ -54,7 +54,7 @@ def _status_cb(state: str, message: str = "") -> None:
     _set(status=state, message=message)
 
 
-def _draft_new_items(site: str, kind: str, new_items: list[dict]) -> None:
+def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]) -> None:
     """Auto-draft replies for newly-seen leads AND messages. Runs inside the
     scrape thread, after the browser work — no network send, just stores
     draft/skipped. Leads get an introduction; messages get a response (the
@@ -69,7 +69,7 @@ def _draft_new_items(site: str, kind: str, new_items: list[dict]) -> None:
         try:
             d = responder.evaluate_lead(it, units=units)
             storage.save_response(
-                site, kind, it["id"],
+                tenant_id, site, kind, it["id"],
                 status="draft" if d.get("fit") else "skipped",
                 unit_id=d.get("unit_id"),
                 reason=d.get("reason"),
@@ -80,16 +80,16 @@ def _draft_new_items(site: str, kind: str, new_items: list[dict]) -> None:
         except Exception as e:
             log.exception("Auto-draft failed for %s", it.get("id"))
             storage.save_response(
-                site, kind, it["id"], status="skipped",
+                tenant_id, site, kind, it["id"], status="skipped",
                 reason=f"draft error: {e}",
             )
 
 
-def _worker() -> None:
+def _worker(tenant_id: str) -> None:
     furnishedfinder.STATUS_CB = _status_cb
     try:
         counts = check_leads.run_scrape(
-            status_cb=_status_cb, on_new_items=_draft_new_items
+            status_cb=_status_cb, on_new_items=_draft_new_items, tenant_id=tenant_id
         )
         _set(status="done", message="Done.", counts=counts, running=False)
     except Exception as e:
@@ -99,8 +99,11 @@ def _worker() -> None:
         furnishedfinder.STATUS_CB = None
 
 
-def start_scrape() -> dict:
-    """Kick off a scrape if one isn't already running. Returns current state."""
+def start_scrape(tenant_id: str = "1") -> dict:
+    """Kick off a scrape if one isn't already running. Returns current state.
+
+    Phase 1: only the operator tenant scrapes (single FF login / browser
+    profile), so `tenant_id` is the operator's and defaults to '1'."""
     with _lock:
         if _state["running"]:
             return dict(_state)
@@ -108,7 +111,7 @@ def start_scrape() -> dict:
             status="launching", message="Starting…", counts={}, running=True,
             updated_at=datetime.now().isoformat(timespec="seconds"),
         )
-    threading.Thread(target=_worker, daemon=True).start()
+    threading.Thread(target=_worker, args=(tenant_id,), daemon=True).start()
     return get_state()
 
 
@@ -129,13 +132,13 @@ def submit_otp(code: str) -> bool:
 _send_lock = threading.Lock()
 
 
-def _send_worker(site: str, item: dict, text: str) -> None:
+def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
     item_id = item["id"]
     kind = item.get("kind", "lead")
     who = item.get("traveler") or item.get("sender") or "tenant"
     channels = _channels()
     # The address the responder extracted at draft time, stored on the response.
-    tenant_email = (storage.get_responses(site).get(item_id) or {}).get("tenant_email")
+    tenant_email = (storage.get_responses(tenant_id, site).get(item_id) or {}).get("tenant_email")
 
     furnishedfinder.STATUS_CB = _status_cb
     try:
@@ -149,7 +152,7 @@ def _send_worker(site: str, item: dict, text: str) -> None:
                 else:
                     furnishedfinder.send_reply(page, item, text)
         now = datetime.now().isoformat(timespec="seconds")
-        storage.update_response(site, item_id, status="sent", draft=text, sent_at=now)
+        storage.update_response(tenant_id, site, item_id, status="sent", draft=text, sent_at=now)
 
         # 2. Email — best-effort; never fails the send if the platform reply went.
         email_note = ""
@@ -165,7 +168,7 @@ def _send_worker(site: str, item: dict, text: str) -> None:
                         tenant_email, "Re: your FurnishedFinder inquiry", text
                     )
                     storage.update_response(
-                        site, item_id,
+                        tenant_id, site, item_id,
                         emailed_at=datetime.now().isoformat(timespec="seconds"),
                     )
                     email_note = f" + emailed {tenant_email}"
@@ -188,7 +191,7 @@ def _send_worker(site: str, item: dict, text: str) -> None:
             _state["running"] = False
 
 
-def send_reply(site: str, item: dict, text: str) -> dict:
+def send_reply(tenant_id: str, site: str, item: dict, text: str) -> dict:
     """Send an approved draft in a background thread. `item` is the stored
     payload (must include id + kind; traveler/received for leads or
     sender/date for messages, used to locate the thread/row)."""
@@ -200,6 +203,6 @@ def send_reply(site: str, item: dict, text: str) -> dict:
             updated_at=datetime.now().isoformat(timespec="seconds"),
         )
     threading.Thread(
-        target=_send_worker, args=(site, item, text), daemon=True
+        target=_send_worker, args=(tenant_id, site, item, text), daemon=True
     ).start()
     return get_state()
