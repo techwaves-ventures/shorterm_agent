@@ -13,6 +13,7 @@ from pathlib import Path
 
 import check_leads
 import config
+import ff_account
 import mailer
 import responder
 import storage
@@ -22,6 +23,7 @@ from sites import furnishedfinder
 log = logging.getLogger(__name__)
 
 OTP_PATH = Path(__file__).parent / "OTP_CODE"
+_OTP_TIMEOUT = 600  # seconds a run waits for the tenant to submit their OTP
 
 
 def _channels(tenant_id: str) -> set[str]:
@@ -29,14 +31,30 @@ def _channels(tenant_id: str) -> set[str]:
     raw = config.get_settings(tenant_id)["reply_channels"]
     return {c.strip().lower() for c in raw.split(",") if c.strip()}
 
+
+def _ff_username(tenant_id: str) -> str:
+    """The FF email to log in as: the operator uses FF_USERNAME env; other
+    tenants use their connected (decrypted) account."""
+    if str(tenant_id) == "1":
+        return os.getenv("FF_USERNAME", "")
+    return ff_account.get_username(tenant_id) or ""
+
+
 _lock = threading.Lock()
 _state = {
     "status": "idle",   # idle | launching | checking | waiting_for_otp | done | error
     "message": "",
     "counts": {},
     "running": False,
+    "tenant_id": None,  # which tenant the current/last run belongs to
     "updated_at": None,
 }
+
+# Per-tenant OTP rendezvous: a running scrape registers a waiter, then blocks
+# until the matching tenant submits a code on their own dashboard. Keyed by
+# tenant_id so one tenant can never unblock another's run.
+_otp_lock = threading.Lock()
+_otp_waiters: dict[str, dict] = {}
 
 
 def _set(**kwargs) -> None:
@@ -45,9 +63,35 @@ def _set(**kwargs) -> None:
         _state["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
 
-def get_state() -> dict:
+def get_state(tenant_id: str | None = None) -> dict:
+    """Snapshot of the run state. If `tenant_id` is given and a run is active for
+    a *different* tenant, return an idle snapshot — status messages can contain
+    another tenant's traveler names, so they must not leak across tenants."""
     with _lock:
-        return dict(_state)
+        snap = dict(_state)
+    if tenant_id is not None and snap.get("tenant_id") not in (None, str(tenant_id)):
+        return {
+            "status": "idle", "message": "", "counts": {}, "running": False,
+            "tenant_id": None, "updated_at": snap.get("updated_at"),
+        }
+    return snap
+
+
+def _otp_provider(tenant_id: str):
+    """Return a callable that blocks until this tenant submits an OTP (or times
+    out), then returns the code. Registered as the FF context's otp_provider."""
+    tid = str(tenant_id)
+    ev = threading.Event()
+    with _otp_lock:
+        _otp_waiters[tid] = {"event": ev, "code": None}
+
+    def provider() -> str | None:
+        got = ev.wait(timeout=_OTP_TIMEOUT)
+        with _otp_lock:
+            entry = _otp_waiters.pop(tid, None)
+        return entry["code"] if (got and entry) else None
+
+    return provider
 
 
 def _status_cb(state: str, message: str = "") -> None:
@@ -87,7 +131,8 @@ def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]
 
 
 def _worker(tenant_id: str) -> None:
-    furnishedfinder.STATUS_CB = _status_cb
+    username = _ff_username(tenant_id)
+    furnishedfinder.set_context(username, _otp_provider(tenant_id), _status_cb)
     try:
         counts = check_leads.run_scrape(
             status_cb=_status_cb, on_new_items=_draft_new_items, tenant_id=tenant_id
@@ -97,31 +142,53 @@ def _worker(tenant_id: str) -> None:
         log.exception("Scrape failed")
         _set(status="error", message=str(e), running=False)
     finally:
-        furnishedfinder.STATUS_CB = None
+        furnishedfinder.clear_context()
 
 
 def start_scrape(tenant_id: str = "1") -> dict:
     """Kick off a scrape if one isn't already running. Returns current state.
 
-    Phase 1: only the operator tenant scrapes (single FF login / browser
-    profile), so `tenant_id` is the operator's and defaults to '1'."""
+    Runs are serialized by the global run-lock (one browser at a time); the
+    tenant's FF account + isolated profile are bound for the duration."""
+    tenant_id = str(tenant_id)
     with _lock:
         if _state["running"]:
             return dict(_state)
         _state.update(
             status="launching", message="Starting…", counts={}, running=True,
+            tenant_id=tenant_id,
             updated_at=datetime.now().isoformat(timespec="seconds"),
         )
     threading.Thread(target=_worker, args=(tenant_id,), daemon=True).start()
-    return get_state()
+    return get_state(tenant_id)
 
 
-def submit_otp(code: str) -> bool:
-    """Hand an OTP code to the running scraper via the ./OTP_CODE file."""
+def submit_otp(tenant_id: str, code: str) -> bool:
+    """Route an OTP code to this tenant's waiting run. Returns False if there is
+    no run waiting for that tenant — so a tenant can only unblock their own run.
+
+    Falls back to the ./OTP_CODE file when no in-process waiter exists (the
+    operator's CLI/file flow), preserving the original behavior."""
     code = (code or "").strip()
     if not code:
         return False
-    OTP_PATH.write_text(code)
+    tid = str(tenant_id)
+    with _otp_lock:
+        entry = _otp_waiters.get(tid)
+        if entry is not None:
+            entry["code"] = code
+            entry["event"].set()
+            routed = True
+        else:
+            routed = False
+    if not routed:
+        # No in-process waiter. The only path that polls the ./OTP_CODE file is
+        # the operator's (tenant '1') CLI/file login; every other tenant's run
+        # uses an in-process waiter, so a missing waiter there means "not for
+        # you" — reject rather than writing a file they'd never read.
+        if tid != "1":
+            return False
+        OTP_PATH.write_text(code)
     _set(status="checking", message="OTP submitted, verifying…")
     return True
 
@@ -142,13 +209,13 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
     # The address the responder extracted at draft time, stored on the response.
     tenant_email = (storage.get_responses(tenant_id, site).get(item_id) or {}).get("tenant_email")
 
-    furnishedfinder.STATUS_CB = _status_cb
+    furnishedfinder.set_context(_ff_username(tenant_id), _otp_provider(tenant_id), _status_cb)
     try:
         # 1. Platform reply — the source of truth for status=sent. Leads use the
         #    "Reply To Tenant" row action; messages reply inside the thread.
         if "platform" in channels:
             _set(status="checking", message=f"Sending platform reply to {who}…")
-            with check_leads.browser_page() as page:
+            with check_leads.browser_page(tenant_id) as page:
                 if kind == "message":
                     furnishedfinder.send_message_reply(page, item, text)
                 else:
@@ -189,7 +256,7 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
         log.exception("Send failed for %s", item_id)
         _set(status="error", message=f"Send failed: {e}", running=False)
     finally:
-        furnishedfinder.STATUS_CB = None
+        furnishedfinder.clear_context()
         with _send_lock:
             _state["running"] = False
 
@@ -198,14 +265,16 @@ def send_reply(tenant_id: str, site: str, item: dict, text: str) -> dict:
     """Send an approved draft in a background thread. `item` is the stored
     payload (must include id + kind; traveler/received for leads or
     sender/date for messages, used to locate the thread/row)."""
+    tenant_id = str(tenant_id)
     with _lock:
         if _state["running"]:
             return dict(_state)
         _state.update(
             status="launching", message="Starting…", running=True,
+            tenant_id=tenant_id,
             updated_at=datetime.now().isoformat(timespec="seconds"),
         )
     threading.Thread(
         target=_send_worker, args=(tenant_id, site, item, text), daemon=True
     ).start()
-    return get_state()
+    return get_state(tenant_id)

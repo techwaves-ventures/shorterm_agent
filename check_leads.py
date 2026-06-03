@@ -40,10 +40,25 @@ PROFILE_DIR.mkdir(exist_ok=True)
 SITES = [furnishedfinder]
 
 
+def _profile_dir(tenant_id: str = "1") -> Path:
+    """Per-tenant persistent browser profile (holds the logged-in FF session).
+
+    The operator (tenant '1') keeps the original ./browser_profile so their
+    existing session survives; other tenants get ./browser_profiles/{id}/. Each
+    profile is an isolated cookie/session store — no cross-tenant session bleed.
+    """
+    if str(tenant_id) == "1":
+        PROFILE_DIR.mkdir(exist_ok=True)
+        return PROFILE_DIR
+    d = Path(__file__).parent / "browser_profiles" / str(tenant_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 @contextmanager
-def browser_page():
-    """Launch a real (non-sandboxed) Chrome with the persistent profile and
-    yield a page. Shared by run_scrape and the dashboard's reply-send path."""
+def browser_page(tenant_id: str = "1"):
+    """Launch a real (non-sandboxed) Chrome with the tenant's persistent profile
+    and yield a page. Shared by run_scrape and the dashboard's reply-send path."""
     headless = os.getenv("HEADLESS", "0") == "1"
     launch_args = [
         "--no-sandbox",
@@ -52,7 +67,7 @@ def browser_page():
     ]
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
+            user_data_dir=str(_profile_dir(tenant_id)),
             headless=headless,
             args=launch_args,
             viewport=None,  # use real window size
@@ -88,7 +103,7 @@ def run_scrape(status_cb=None, on_new_items=None, tenant_id: str = "1") -> dict:
     counts: dict[str, dict] = {}
     emit("launching", "Launching browser…")
 
-    with browser_page() as page:
+    with browser_page(tenant_id) as page:
         for site in SITES:
             name = getattr(site, "SITE_NAME", site.__name__)
             log.info("Checking site: %s", name)

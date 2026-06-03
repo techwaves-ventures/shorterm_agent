@@ -35,6 +35,8 @@ from flask_login import (
 )
 
 import config
+import crypto
+import ff_account
 import models
 import responder
 import runner
@@ -62,13 +64,19 @@ def load_user(user_id):
     return models.get_user_by_id(user_id)
 
 
-def operator_required(fn):
-    """Block non-operator tenants from scrape/send routes (Phase 1 boundary)."""
+def _can_scrape() -> bool:
+    """A tenant may scrape/send once they've connected an FF account; the
+    operator is grandfathered in via the FF_USERNAME env."""
+    return current_user.is_operator or ff_account.is_connected(current_user.tenant_id)
+
+
+def scrape_allowed(fn):
+    """Gate scrape/send routes to tenants who've connected their FF account."""
 
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        if not current_user.is_operator:
-            abort(403, "FurnishedFinder connection coming soon for your account.")
+        if not _can_scrape():
+            abort(403, "Connect your FurnishedFinder account first.")
         return fn(*args, **kwargs)
 
     return wrapper
@@ -166,9 +174,12 @@ def index():
         "dashboard.html",
         account=current_user.email,
         is_operator=current_user.is_operator,
+        can_scrape=_can_scrape(),
+        ff_status=ff_account.status(current_user.tenant_id),
+        crypto_ready=crypto.available(),
         leads=data["leads"],
         messages=data["messages"],
-        state=runner.get_state(),
+        state=runner.get_state(current_user.tenant_id),
         has_api_key=bool(os.getenv("ANTHROPIC_API_KEY")),
     )
 
@@ -182,23 +193,23 @@ def api_data():
 @app.route("/api/status")
 @login_required
 def api_status():
-    return jsonify(runner.get_state())
+    return jsonify(runner.get_state(current_user.tenant_id))
 
 
 @app.route("/refresh", methods=["POST"])
 @login_required
-@operator_required
+@scrape_allowed
 def refresh():
     return jsonify(runner.start_scrape(current_user.tenant_id))
 
 
 @app.route("/otp", methods=["POST"])
 @login_required
-@operator_required
+@scrape_allowed
 def otp():
     code = request.form.get("code", "") or (request.json or {}).get("code", "")
-    ok = runner.submit_otp(code)
-    return jsonify({"ok": ok, "state": runner.get_state()})
+    ok = runner.submit_otp(current_user.tenant_id, code)
+    return jsonify({"ok": ok, "state": runner.get_state(current_user.tenant_id)})
 
 
 def _form(*keys):
@@ -233,7 +244,7 @@ def responder_draft():
 
 @app.route("/responder/send", methods=["POST"])
 @login_required
-@operator_required
+@scrape_allowed
 def responder_send():
     """One-click approve → send the (possibly edited) draft (lead or message)."""
     tenant_id = current_user.tenant_id
@@ -253,6 +264,36 @@ def responder_dismiss():
     (item_id,) = _form("item_id")
     storage.update_response(current_user.tenant_id, SITE, item_id, status="dismissed")
     return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# Connect a FurnishedFinder account
+# ---------------------------------------------------------------------------
+
+
+@app.route("/connect", methods=["POST"])
+@login_required
+def connect():
+    """Store the tenant's FF email (encrypted) + their consent to automated
+    access. FF login is passwordless (email + OTP), so only the email is kept."""
+    if not crypto.available():
+        flash("Account connection isn't available yet (encryption not configured).")
+        return redirect(url_for("index"))
+    ff_email = (request.form.get("ff_email") or "").strip()
+    consent = request.form.get("consent")
+    if not ff_email:
+        flash("Enter your FurnishedFinder email.")
+        return redirect(url_for("index"))
+    if not consent:
+        flash("Please confirm you authorize automated access to your FurnishedFinder account.")
+        return redirect(url_for("index"))
+    try:
+        ff_account.connect(current_user.tenant_id, ff_email)
+    except (ValueError, RuntimeError) as e:
+        flash(str(e))
+        return redirect(url_for("index"))
+    flash("FurnishedFinder account connected — click “Check now” to fetch your leads.")
+    return redirect(url_for("index"))
 
 
 # ---------------------------------------------------------------------------
