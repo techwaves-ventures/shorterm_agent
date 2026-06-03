@@ -17,13 +17,47 @@ MESSAGES_URL = "https://www.furnishedfinder.com/members/tenant-message"
 # When None (the CLI case) behavior is unchanged.
 STATUS_CB = None
 
+# Per-run account context, set by the runner before a scrape/send so this
+# single-account module can drive a specific tenant's FF login. Runs are
+# serialized by the runner's global lock, so a module-level context is safe.
+# When None (the CLI case) the FF_USERNAME env + ./OTP_CODE file flow is used.
+#   {"username": str, "otp_provider": callable|None}
+_CONTEXT: dict | None = None
+
+
+def set_context(username: str, otp_provider=None, status_cb=None) -> None:
+    """Bind the FF account for the next run. `otp_provider()` (if given) is called
+    to obtain an OTP code (blocking) instead of polling the global ./OTP_CODE.
+    Resets the per-page login flag so the new account/profile re-authenticates."""
+    global _CONTEXT, STATUS_CB, _session_logged_in
+    _CONTEXT = {"username": username or "", "otp_provider": otp_provider}
+    STATUS_CB = status_cb
+    _session_logged_in = False
+
+
+def clear_context() -> None:
+    global _CONTEXT, STATUS_CB, _session_logged_in
+    _CONTEXT = None
+    STATUS_CB = None
+    _session_logged_in = False
+
 
 def _username() -> str:
+    if _CONTEXT is not None:
+        return _CONTEXT.get("username", "")
     return os.getenv("FF_USERNAME", "")
 
 
 def _hash(*parts: str) -> str:
     return hashlib.sha1("||".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _mask_email(email: str) -> str:
+    """j***@example.com — keep FF emails out of logs in full."""
+    if not email or "@" not in email:
+        return "***"
+    local, _, domain = email.partition("@")
+    return f"{local[:1]}***@{domain}"
 
 
 def _prompt_for_otp() -> str:
@@ -44,6 +78,15 @@ def _prompt_for_otp() -> str:
             STATUS_CB("waiting_for_otp", "FurnishedFinder sent an OTP to your email — enter it below.")
         except Exception:
             pass
+
+    # Dashboard path: a per-tenant provider blocks until the tenant submits a
+    # code on their own dashboard (routes to the correct run; see runner).
+    if _CONTEXT is not None and _CONTEXT.get("otp_provider"):
+        code = _CONTEXT["otp_provider"]()
+        if not code:
+            raise RuntimeError("Timed out waiting for OTP.")
+        log.info("Got OTP code from dashboard provider")
+        return code
 
     # Ping the operator (webhook/desktop) so a scheduled headless run is
     # actionable: they open the dashboard over the network and paste the code
@@ -95,7 +138,7 @@ def _login(page: Page) -> None:
     if not _username():
         raise RuntimeError("FF_USERNAME not set in .env — cannot auto-login.")
 
-    log.info("Opening login modal for %s", _username())
+    log.info("Opening login modal for %s", _mask_email(_username()))
     _open_login_modal(page)
     page.fill("input#username", _username())
     page.locator('button[type="submit"]:has-text("Login")').first.click()

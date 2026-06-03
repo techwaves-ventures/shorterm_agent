@@ -6,6 +6,7 @@ __pycache__/
 .venv/
 venv/
 browser_profile/
+browser_profiles/
 
 # runtime / local
 OTP_CODE

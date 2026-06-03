@@ -43,6 +43,17 @@
     .connect-card h2 { margin: 0 0 10px; font-size: 18px; }
     .connect-card p { color: var(--text); margin: 0 0 8px; }
     .connect-card .muted { color: var(--muted); font-size: 13px; }
+    .connect-form { text-align: left; max-width: 420px; margin: 18px auto 0; }
+    .connect-form input[type="email"] {
+      width: 100%; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; color: var(--text); padding: 10px 12px; font-size: 14px;
+    }
+    .connect-form .consent {
+      display: flex; gap: 8px; align-items: flex-start; margin: 12px 0;
+      color: var(--muted); font-size: 12.5px; line-height: 1.4; text-align: left;
+    }
+    .connect-form .consent input { margin-top: 2px; flex: 0 0 auto; }
+    .connect-form button { width: 100%; }
 
     .banner {
       display: none; align-items: center; gap: 12px; padding: 12px 16px;
@@ -159,10 +170,10 @@
   <header>
     <div>
       <h1>STR Leads</h1>
-      <div class="account">Signed in as <b>{{ account }}</b>{% if is_operator %} · FurnishedFinder{% endif %}</div>
+      <div class="account">Signed in as <b>{{ account }}</b>{% if ff_status and ff_status.masked_email %} · FF: {{ ff_status.masked_email }}{% elif is_operator %} · FurnishedFinder{% endif %}</div>
     </div>
     <div class="header-actions">
-      {% if is_operator %}<button id="refresh-btn" onclick="startRefresh()">Check now</button>{% endif %}
+      {% if can_scrape %}<button id="refresh-btn" onclick="startRefresh()">Check now</button>{% endif %}
       <a href="{{ url_for('settings') }}" class="settings-link">Settings</a>
       <form method="post" action="{{ url_for('logout') }}" style="display:inline">
         <button type="submit" class="ghost">Log out</button>
@@ -171,12 +182,29 @@
   </header>
 
   <main>
-  {% if not is_operator %}
+    {% with messages = get_flashed_messages() %}
+      {% for m in messages %}<div class="apikey-note">{{ m }}</div>{% endfor %}
+    {% endwith %}
+  {% if not can_scrape %}
     <div class="connect-card">
       <h2>Connect your FurnishedFinder account</h2>
-      <p>Your dashboard is ready. Linking your FurnishedFinder login so we can fetch
-         your leads and send replies on your behalf is <b>coming soon</b>.</p>
-      <p class="muted">Once connected, your new leads and messages will show up right here.</p>
+      <p>Link your FurnishedFinder login so we can fetch your leads and send replies
+         on your behalf. Login uses the email code FurnishedFinder sends you — we never
+         ask for a password.</p>
+      {% if crypto_ready %}
+      <form method="post" action="{{ url_for('connect') }}" class="connect-form">
+        <input name="ff_email" type="email" required placeholder="Your FurnishedFinder email">
+        <label class="consent">
+          <input type="checkbox" name="consent" value="1" required>
+          I authorize automated access to my FurnishedFinder account to read leads and
+          send replies on my behalf.
+        </label>
+        <button type="submit">Connect account</button>
+      </form>
+      {% else %}
+      <p class="muted">Account connection isn't available yet — the operator needs to
+         configure encryption (FF_CRED_KEY).</p>
+      {% endif %}
     </div>
   {% else %}
     <div id="banner" class="banner">
@@ -224,7 +252,7 @@
   {% endif %}
   </main>
 
-  {% if is_operator %}
+  {% if can_scrape %}
   <script>
     const esc = (s) => (s == null ? "" : String(s).replace(/[&<>"']/g,
       c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])));

@@ -3,4 +3,5 @@ python-dotenv>=1.0.0
 requests>=2.31.0
 flask>=3.0
 flask-login>=0.6
+cryptography>=42
 anthropic>=0.40
