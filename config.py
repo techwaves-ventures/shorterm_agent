@@ -58,7 +58,16 @@ The tenant sent you a message; respond to it.
 - No emojis. No "Dear Sir/Madam". No pressure tactics.
 """
 
-_FIELDS = ("host_name", "units_json", "template", "from_email", "reply_channels")
+# Editable per-tenant fields. Order defines the SELECT/INSERT column order below.
+# `onboarded` ('0'/'1') gates the first-run wizard; `notify_webhook` is a
+# per-tenant Slack/Discord-style URL (falls back to the global NOTIFY_WEBHOOK_URL).
+_FIELDS = (
+    "host_name", "units_json", "template", "from_email", "reply_channels",
+    "notify_webhook", "onboarded",
+)
+
+# Columns added after the original schema — created idempotently on older DBs.
+_ADDED_COLUMNS = {"notify_webhook": "TEXT", "onboarded": "TEXT DEFAULT '0'"}
 
 
 def _conn() -> sqlite3.Connection:
@@ -71,9 +80,16 @@ def _conn() -> sqlite3.Connection:
             template TEXT,
             from_email TEXT,
             reply_channels TEXT,
+            notify_webhook TEXT,
+            onboarded TEXT DEFAULT '0',
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )"""
     )
+    # Idempotent migration for DBs created before these columns existed.
+    have = {row[1] for row in c.execute("PRAGMA table_info(tenant_settings)")}
+    for col, decl in _ADDED_COLUMNS.items():
+        if col not in have:
+            c.execute(f"ALTER TABLE tenant_settings ADD COLUMN {col} {decl}")
     return c
 
 
@@ -85,29 +101,40 @@ def _defaults(tenant_id: str) -> dict:
         "template": DEFAULT_TEMPLATE,
         "from_email": "",
         "reply_channels": "platform,email",
+        "notify_webhook": "",
+        "onboarded": "0",
     }
+
+
+def _read_row(c, tenant_id: str):
+    return c.execute(
+        f"SELECT {', '.join(_FIELDS)} FROM tenant_settings WHERE tenant_id=?",
+        (tenant_id,),
+    ).fetchone()
+
+
+def _row_to_dict(tenant_id: str, row) -> dict:
+    """Overlay a DB row onto the defaults, keeping the default for NULL columns."""
+    out = _defaults(tenant_id)
+    for key, val in zip(_FIELDS, row):
+        if val is not None:
+            out[key] = val
+    if not out["units_json"]:
+        out["units_json"] = "[]"
+    if not out["reply_channels"]:
+        out["reply_channels"] = "platform,email"
+    return out
 
 
 def get_settings(tenant_id: str) -> dict:
     """Return this tenant's settings as a dict, seeding defaults if absent."""
     with _conn() as c:
-        row = c.execute(
-            "SELECT host_name, units_json, template, from_email, reply_channels "
-            "FROM tenant_settings WHERE tenant_id=?",
-            (tenant_id,),
-        ).fetchone()
+        row = _read_row(c, tenant_id)
     if row is None:
         seed_tenant(tenant_id)
-        return get_settings(tenant_id)
-    out = _defaults(tenant_id)
-    out.update(
-        host_name=row[0] or "",
-        units_json=row[1] or "[]",
-        template=row[2] or "",
-        from_email=row[3] or "",
-        reply_channels=row[4] or "platform,email",
-    )
-    return out
+        with _conn() as c:
+            row = _read_row(c, tenant_id)
+    return _row_to_dict(tenant_id, row)
 
 
 def save_settings(tenant_id: str, **fields) -> None:
@@ -119,39 +146,31 @@ def save_settings(tenant_id: str, **fields) -> None:
     sets = {k: v for k, v in fields.items() if k in _FIELDS}
     if not sets:
         return
-    current = _defaults(tenant_id)
     with _conn() as c:
-        row = c.execute(
-            "SELECT host_name, units_json, template, from_email, reply_channels "
-            "FROM tenant_settings WHERE tenant_id=?",
-            (tenant_id,),
-        ).fetchone()
-    if row is not None:
-        current.update(
-            host_name=row[0] or "", units_json=row[1] or "[]",
-            template=row[2] or "", from_email=row[3] or "",
-            reply_channels=row[4] or "platform,email",
-        )
+        row = _read_row(c, tenant_id)
+    current = _row_to_dict(tenant_id, row) if row is not None else _defaults(tenant_id)
     current.update(sets)
     now = datetime.now().isoformat(timespec="seconds")
+    cols = list(_FIELDS)
+    placeholders = ",".join(["?"] * (len(cols) + 2))  # tenant_id + fields + updated_at
+    assignments = ", ".join(f"{c2}=excluded.{c2}" for c2 in cols + ["updated_at"])
+    vals = [tenant_id] + [current[k] for k in cols] + [now]
     with _conn() as c:
         c.execute(
-            """INSERT INTO tenant_settings
-                 (tenant_id, host_name, units_json, template, from_email, reply_channels, updated_at)
-               VALUES (?,?,?,?,?,?,?)
-               ON CONFLICT(tenant_id) DO UPDATE SET
-                 host_name=excluded.host_name,
-                 units_json=excluded.units_json,
-                 template=excluded.template,
-                 from_email=excluded.from_email,
-                 reply_channels=excluded.reply_channels,
-                 updated_at=excluded.updated_at""",
-            (
-                tenant_id, current["host_name"], current["units_json"],
-                current["template"], current["from_email"],
-                current["reply_channels"], now,
-            ),
+            f"""INSERT INTO tenant_settings (tenant_id, {", ".join(cols)}, updated_at)
+                VALUES ({placeholders})
+                ON CONFLICT(tenant_id) DO UPDATE SET {assignments}""",
+            vals,
         )
+
+
+def is_onboarded(tenant_id: str) -> bool:
+    """Whether this tenant has completed the first-run onboarding wizard."""
+    return str(get_settings(tenant_id).get("onboarded")) in ("1", "true", "True")
+
+
+def mark_onboarded(tenant_id: str) -> None:
+    save_settings(tenant_id, onboarded="1")
 
 
 def get_units(tenant_id: str) -> list[dict]:
@@ -202,6 +221,8 @@ def seed_tenant(tenant_id: str, *, from_legacy: bool = False) -> None:
 
     vals = _defaults(tenant_id)
     if from_legacy:
+        # The operator predates onboarding — grandfather them past the wizard.
+        vals["onboarded"] = "1"
         try:
             vals["units_json"] = (_BASE / "units.json").read_text().strip() or "[]"
         except OSError:

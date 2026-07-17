@@ -1,11 +1,18 @@
-"""SQLite-backed dedup store. Returns only items not seen before."""
+"""SQLite-backed dedup store. Returns only items not seen before.
+
+The DB file location is configurable via the SQLITE_PATH env var so a hosted
+deployment can point it at a mounted persistent disk (SQLite on an ephemeral
+container filesystem loses data between deploys). See DEPLOY.md for the managed
+Postgres migration path (DATABASE_URL) that supersedes this for scale.
+"""
 import ast
 import json
+import os
 import sqlite3
 from pathlib import Path
 from typing import Iterable
 
-DB_PATH = Path(__file__).parent / "leads.db"
+DB_PATH = Path(os.getenv("SQLITE_PATH") or (Path(__file__).parent / "leads.db"))
 
 
 def _conn():

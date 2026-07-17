@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Get started — Shorterm Agent</title>
+  <style>
+    :root {
+      --bg: #0f1115; --panel: #181b22; --panel2: #1d212a; --border: #272b35;
+      --text: #e6e8ec; --muted: #9aa3b2; --accent: #4f8cff; --accent-hover: #3f76e0;
+      --ok: #2ecc71; --err: #ff5c5c;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text);
+      font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    header { padding: 16px 24px; border-bottom: 1px solid var(--border); background: var(--panel); }
+    header h1 { font-size: 18px; margin: 0; }
+    header .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+    main { padding: 28px 24px; max-width: 760px; margin: 0 auto; }
+    a { color: var(--accent); text-decoration: none; }
+    .flash { border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 16px;
+      background: rgba(255,92,92,.12); border: 1px solid var(--err); color: #ffb4b4; }
+    .step { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+      padding: 20px 22px; margin-bottom: 18px; }
+    .step .n { display: inline-flex; align-items: center; justify-content: center;
+      width: 24px; height: 24px; border-radius: 999px; background: var(--accent); color: #fff;
+      font-size: 13px; font-weight: 700; margin-right: 10px; }
+    .step h2 { font-size: 15px; margin: 0 0 4px; display: flex; align-items: center; }
+    .step .hint { color: var(--muted); font-size: 12.5px; margin: 0 0 14px 34px; }
+    .fields { margin-left: 34px; }
+    label { display: block; font-size: 12.5px; color: var(--muted); margin: 12px 0 5px; }
+    input, textarea, select { width: 100%; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; color: var(--text); padding: 10px 12px; font-size: 13.5px; font-family: inherit; }
+    textarea { resize: vertical; line-height: 1.5; }
+    .row { display: flex; gap: 14px; flex-wrap: wrap; }
+    .row > div { flex: 1 1 160px; }
+    .consent { display: flex; gap: 8px; align-items: flex-start; margin-top: 12px; font-size: 12.5px; color: var(--muted); }
+    .consent input { width: auto; margin-top: 2px; }
+    .bar { display: flex; align-items: center; gap: 14px; margin-top: 6px; }
+    button { background: var(--accent); color: #fff; border: 0; border-radius: 8px;
+      padding: 12px 24px; font-size: 14px; font-weight: 600; cursor: pointer; }
+    button:hover { background: var(--accent-hover); }
+    .skip { color: var(--muted); font-size: 12.5px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Welcome to Shorterm Agent</h1>
+    <div class="sub">A few quick steps and your leasing assistant is ready. Signed in as <b>{{ account }}</b>.</div>
+  </header>
+  <main>
+    {% with messages = get_flashed_messages() %}
+      {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
+    {% endwith %}
+
+    <form method="post" action="{{ url_for('onboarding') }}">
+      <div class="step">
+        <h2><span class="n">1</span> Your host profile</h2>
+        <p class="hint">How replies sign off, and the email address replies are sent from.</p>
+        <div class="fields row">
+          <div>
+            <label for="host_name">Sign-off name</label>
+            <input id="host_name" name="host_name" value="{{ f.host_name }}" placeholder="e.g. Jamie" required>
+          </div>
+          <div>
+            <label for="from_email">From email (optional)</label>
+            <input id="from_email" name="from_email" type="email" value="{{ f.from_email }}" placeholder="you@example.com">
+          </div>
+        </div>
+      </div>
+
+      <div class="step">
+        <h2><span class="n">2</span> Your first unit</h2>
+        <p class="hint">The agent only states facts you enter here — it never invents amenities or prices.
+          You can add more units later in Settings.</p>
+        <div class="fields">
+          <div class="row">
+            <div>
+              <label for="unit_name">Unit name</label>
+              <input id="unit_name" name="unit_name" value="{{ f.unit_name }}" placeholder="e.g. Sunny 1BR near Metro">
+            </div>
+            <div>
+              <label for="unit_area">Area / neighborhood</label>
+              <input id="unit_area" name="unit_area" value="{{ f.unit_area }}" placeholder="e.g. Washington DC NW">
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label for="unit_price">Monthly price ($)</label>
+              <input id="unit_price" name="unit_price" type="number" min="0" value="{{ f.unit_price }}" placeholder="2400">
+            </div>
+            <div>
+              <label for="unit_occupancy">Max occupancy</label>
+              <input id="unit_occupancy" name="unit_occupancy" type="number" min="0" value="{{ f.unit_occupancy }}" placeholder="2">
+            </div>
+            <div>
+              <label for="unit_min_nights">Min nights</label>
+              <input id="unit_min_nights" name="unit_min_nights" type="number" min="0" value="{{ f.unit_min_nights }}" placeholder="30">
+            </div>
+            <div>
+              <label for="unit_pets">Pets allowed?</label>
+              <select id="unit_pets" name="unit_pets">
+                <option value="" {{ 'selected' if f.unit_pets == '' }}>—</option>
+                <option value="yes" {{ 'selected' if f.unit_pets == 'yes' }}>Yes</option>
+                <option value="no" {{ 'selected' if f.unit_pets == 'no' }}>No</option>
+              </select>
+            </div>
+          </div>
+          <label for="unit_notes">Notes (optional)</label>
+          <input id="unit_notes" name="unit_notes" value="{{ f.unit_notes }}" placeholder="e.g. Furnished, utilities included, no smoking">
+        </div>
+      </div>
+
+      <div class="step">
+        <h2><span class="n">3</span> Reply tone</h2>
+        <p class="hint">The voice guide the agent personalizes around. The default works great — tweak if you like.</p>
+        <div class="fields">
+          <textarea name="template" rows="8">{{ f.template }}</textarea>
+        </div>
+      </div>
+
+      <div class="step">
+        <h2><span class="n">4</span> Connect FurnishedFinder <span class="skip">&nbsp;— optional, you can do this later</span></h2>
+        <p class="hint">Link your FurnishedFinder login so the agent can fetch leads and send replies you approve.
+          Login uses the email code FurnishedFinder sends you — we never ask for a password, and your email
+          is stored encrypted.{% if not crypto_ready %} <b>(Encryption isn't configured yet — skip for now.)</b>{% endif %}</p>
+        <div class="fields">
+          <label for="ff_email">FurnishedFinder email</label>
+          <input id="ff_email" name="ff_email" type="email" value="{{ f.ff_email }}" placeholder="Your FurnishedFinder email"
+                 {{ 'disabled' if not crypto_ready }}>
+          <label class="consent">
+            <input type="checkbox" name="ff_consent" value="1" {{ 'disabled' if not crypto_ready }}>
+            I authorize automated access to my FurnishedFinder account to read leads and send replies I approve.
+          </label>
+        </div>
+      </div>
+
+      <div class="step">
+        <h2><span class="n">5</span> First lead check</h2>
+        <p class="hint">After you finish, click <b>Check now</b> on your dashboard (or wait for the twice-daily
+          run) to fetch your first leads. Every reply waits for your one-click approval — nothing sends on its own.</p>
+      </div>
+
+      <div class="bar">
+        <button type="submit">Finish setup →</button>
+        <a class="skip" href="{{ url_for('onboarding') }}?skip=1">Skip for now</a>
+      </div>
+    </form>
+  </main>
+</body>
+</html>

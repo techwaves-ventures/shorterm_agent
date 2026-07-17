@@ -4,6 +4,7 @@
     python manage.py set-password <email>      # set/reset a user's password (prompts)
     python manage.py create-user <email>       # create a new tenant + user (prompts)
     python manage.py list-users                # show all users and their tenants
+    python manage.py seed-demo                 # create/refresh the demo tenant + sample data
 """
 import getpass
 import sys
@@ -91,6 +92,12 @@ def main() -> None:
         cmd_create_user(rest[0].strip().lower())
     elif cmd == "list-users":
         cmd_list_users()
+    elif cmd == "seed-demo":
+        import seed_demo
+
+        email, tid = seed_demo.seed_demo()
+        print(f"Demo tenant ready: {email} (tenant {tid}).")
+        print(f"Password: {seed_demo.DEMO_PASSWORD}")
     else:
         sys.exit(__doc__)
 

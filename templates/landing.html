@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Shorterm Agent — Faster, on-brand replies for FurnishedFinder hosts</title>
+  <meta name="description" content="Shorterm Agent drafts personalized, fact-grounded replies to your FurnishedFinder leads and messages. You approve; it sends. Close mid-term bookings without living in your inbox.">
+  <style>
+    :root {
+      --bg: #0f1115; --panel: #181b22; --panel2: #1d212a; --border: #272b35;
+      --text: #e6e8ec; --muted: #9aa3b2; --accent: #4f8cff; --accent-hover: #3f76e0; --ok: #2ecc71;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text);
+      font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .wrap { max-width: 1000px; margin: 0 auto; padding: 0 24px; }
+    nav { display: flex; align-items: center; justify-content: space-between; padding: 18px 24px;
+      max-width: 1000px; margin: 0 auto; }
+    nav .brand { font-weight: 700; font-size: 17px; }
+    nav .links a { color: var(--muted); font-size: 14px; margin-left: 20px; }
+    nav .links a.cta { color: #fff; background: var(--accent); padding: 8px 16px; border-radius: 8px; }
+    .btn { display: inline-block; background: var(--accent); color: #fff; padding: 13px 24px;
+      border-radius: 9px; font-weight: 600; font-size: 15px; border: 0; cursor: pointer; }
+    .btn:hover { background: var(--accent-hover); text-decoration: none; }
+    .btn.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+    section { padding: 56px 0; border-bottom: 1px solid var(--border); }
+    .eyebrow { color: var(--accent); font-size: 13px; font-weight: 600; letter-spacing: .04em;
+      text-transform: uppercase; }
+    h1 { font-size: 42px; line-height: 1.12; margin: 12px 0 16px; max-width: 760px; }
+    h2 { font-size: 28px; margin: 0 0 12px; }
+    .lead { font-size: 18px; color: var(--muted); max-width: 680px; }
+    .hero-ctas { display: flex; gap: 14px; margin: 28px 0 16px; flex-wrap: wrap; }
+    .trust { color: var(--muted); font-size: 13.5px; }
+    .trust b { color: var(--text); font-weight: 600; }
+    .tiles, .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; margin-top: 28px; }
+    .tile, .card { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 20px 22px; }
+    .tile h3, .card h3 { margin: 0 0 6px; font-size: 16px; }
+    .tile p, .card p { margin: 0; color: var(--muted); font-size: 14px; }
+    .steps { counter-reset: step; margin-top: 28px; display: grid; gap: 14px; }
+    .steps .s { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px 18px 60px; position: relative; }
+    .steps .s::before { counter-increment: step; content: counter(step); position: absolute; left: 18px; top: 18px;
+      width: 28px; height: 28px; border-radius: 999px; background: var(--accent); color: #fff; font-weight: 700;
+      display: flex; align-items: center; justify-content: center; font-size: 14px; }
+    .steps .s h3 { margin: 0 0 4px; font-size: 16px; }
+    .steps .s p { margin: 0; color: var(--muted); font-size: 14px; }
+    .pricing { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; margin-top: 28px; }
+    .plan { background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 22px 20px; }
+    .plan.hot { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+    .plan h3 { margin: 0 0 2px; }
+    .plan .price { font-size: 26px; font-weight: 700; margin: 6px 0; }
+    .plan .price small { font-size: 13px; color: var(--muted); font-weight: 500; }
+    .plan p { color: var(--muted); font-size: 13.5px; margin: 0; }
+    details { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 18px; margin-bottom: 10px; }
+    details summary { cursor: pointer; font-weight: 600; }
+    details p { color: var(--muted); margin: 10px 0 0; font-size: 14px; }
+    .waitlist { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 22px; max-width: 620px; }
+    .waitlist input { flex: 1 1 200px; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 9px; color: var(--text); padding: 12px 14px; font-size: 15px; }
+    .flash { background: rgba(46,204,113,.14); border: 1px solid rgba(46,204,113,.5); color: #7ee2a8;
+      border-radius: 9px; padding: 12px 16px; margin-top: 18px; max-width: 620px; }
+    footer { padding: 32px 0; color: var(--muted); font-size: 13px; }
+    @media (max-width: 620px) { h1 { font-size: 32px; } }
+  </style>
+</head>
+<body>
+  <nav>
+    <div class="brand">Shorterm Agent</div>
+    <div class="links">
+      <a href="#how">How it works</a>
+      <a href="#pricing">Pricing</a>
+      <a href="{{ url_for('login') }}">Log in</a>
+      <a class="cta" href="{{ url_for('signup') }}">Get started</a>
+    </div>
+  </nav>
+
+  <div class="wrap">
+    {% with messages = get_flashed_messages() %}
+      {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
+    {% endwith %}
+
+    <!-- Hero -->
+    <section style="border-bottom:none">
+      <div class="eyebrow">For FurnishedFinder hosts &amp; mid-term-rental operators</div>
+      <h1>Reply to every lead in seconds — in your voice, with your facts.</h1>
+      <p class="lead">Shorterm Agent reads each FurnishedFinder inquiry, matches it to the right unit, and
+        drafts a personalized reply grounded only in the details you provide. You review and click send.
+        Nothing goes out without you.</p>
+      <div class="hero-ctas">
+        <a class="btn" href="{{ url_for('signup') }}">Request pilot access</a>
+        <a class="btn ghost" href="#how">See how it works</a>
+      </div>
+      <div class="trust"><b>Human-in-the-loop</b> • Uses only your listed facts • Your credentials stay yours</div>
+    </section>
+
+    <!-- Problem -->
+    <section>
+      <h2>On FurnishedFinder, the fastest good reply wins the tenant.</h2>
+      <p class="lead">Leads come in while you're working, sleeping, or mid-turnover. By the time you write back,
+        a nurse with a 13-week contract has already toured someone else's place. Generic templates read as spam;
+        hand-writing every reply doesn't scale.</p>
+      <div class="tiles">
+        <div class="tile"><h3>Every inquiry = triage + draft</h3><p>Is it a lead or a message? Does it fit my dates, budget, pets? Which unit?</p></div>
+        <div class="tile"><h3>Replies at 8am and 6pm</h3><p>Drafts are waiting when you open the dashboard — automatically.</p></div>
+        <div class="tile"><h3>Zero invented facts</h3><p>It only says what's in your unit catalog. No made-up amenities or prices.</p></div>
+      </div>
+    </section>
+
+    <!-- How it works -->
+    <section id="how">
+      <h2>Drafted for you. Approved by you.</h2>
+      <div class="steps">
+        <div class="s"><h3>Connect your listings</h3><p>Add your units — area, price, occupancy, pet policy, stay length, notes. This is the only source of facts the agent may use.</p></div>
+        <div class="s"><h3>It checks for new leads</h3><p>Twice a day (or on demand), it logs into FurnishedFinder in a real browser, finds only what's new, and reads each inquiry's real dates, occupants, budget, and reason for travel.</p></div>
+        <div class="s"><h3>It drafts the right reply</h3><p>A warm intro for a new lead; a contextual answer for a message. Best-fit unit chosen automatically; poor fits flagged and skipped with a reason.</p></div>
+        <div class="s"><h3>You click send</h3><p>Review or edit the draft, then send on-platform (and by email if you like). Nothing is ever sent without your click.</p></div>
+      </div>
+    </section>
+
+    <!-- Why different -->
+    <section>
+      <h2>Not a template bot.</h2>
+      <div class="cards">
+        <div class="card"><h3>Reads the real inquiry</h3><p>Opens the travel-dates detail — dates, occupants, pets, budget, reason — and drafts from that, not a thin table row.</p></div>
+        <div class="card"><h3>Can't make things up</h3><p>Grounded in your unit catalog. It won't promise an amenity you don't have or quote a price you didn't set.</p></div>
+        <div class="card"><h3>You stay in control</h3><p>Editable drafts, one-click send, skip/dismiss. Your account, your voice, your approval.</p></div>
+      </div>
+    </section>
+
+    <!-- Pricing -->
+    <section id="pricing">
+      <h2>Simple, unit-based pricing.</h2>
+      <p class="lead">Human approval is included in every tier — never a paid add-on. Founding pilots get
+        white-glove setup and pricing locked for 12 months.</p>
+      <div class="pricing">
+        <div class="plan"><h3>Starter</h3><div class="price">$39<small>/mo</small></div><p>Solo host, up to 2 units. Twice-daily checks, AI drafts, one-click send, human approval.</p></div>
+        <div class="plan hot"><h3>Pro</h3><div class="price">$99<small>/mo</small></div><p>Multi-unit host / small PM, up to 10 units. Everything in Starter plus more frequent checks and priority support.</p></div>
+        <div class="plan"><h3>Portfolio</h3><div class="price">Custom</div><p>10+ units / property manager. Multiple hosts, white-glove onboarding, SLA.</p></div>
+      </div>
+      <div class="hero-ctas"><a class="btn" href="{{ url_for('signup') }}">Start free — request pilot access</a></div>
+    </section>
+
+    <!-- FAQ -->
+    <section>
+      <h2>Questions hosts ask.</h2>
+      <details><summary>Will this get my account banned?</summary><p>Shorterm Agent operates your account the way you would — it drafts replies, and a human approves and clicks send on every message. No mass, unattended blasting. It replies only to your real inquiries, personalized, and skips poor fits. Human-in-the-loop is the core design, precisely to stay account-safe.</p></details>
+      <details><summary>Is this automated sending?</summary><p>Checking for new leads is automated (twice daily); sending is not — it's one click by you, per message. You can also send by email in the same click if you choose.</p></details>
+      <details><summary>Will it say something wrong to my guest?</summary><p>It drafts only from the facts you enter in your unit catalog. It won't invent amenities, promise availability, or quote a price you didn't set. You see and can edit every draft before it goes.</p></details>
+      <details><summary>What about my credentials and my guests' data?</summary><p>The hosted version stores your FurnishedFinder email in an encrypted per-tenant vault, isolates tenants, and processes inquiry text only to draft your replies. FurnishedFinder login is passwordless (email + one-time code) — we never store a password.</p></details>
+      <details><summary>Which platforms?</summary><p>FurnishedFinder today. The adapter model is built to add platforms based on pilot demand.</p></details>
+    </section>
+
+    <!-- Final CTA + waitlist -->
+    <section style="border-bottom:none" id="pilot">
+      <h2>Stop losing mid-term bookings to a slow inbox.</h2>
+      <p class="lead">Request pilot access — founding pilots get white-glove setup and pricing locked for 12 months.</p>
+      <form class="waitlist" method="post" action="{{ url_for('pilot') }}">
+        <input name="email" type="email" required placeholder="you@example.com">
+        <input name="market" placeholder="Your market (e.g. DC)">
+        <input name="units" type="number" min="0" placeholder="# units" style="flex:0 1 120px">
+        <button class="btn" type="submit">Request access</button>
+      </form>
+      <div class="hero-ctas"><a class="btn ghost" href="{{ url_for('signup') }}">Or create an account now →</a></div>
+    </section>
+  </div>
+
+  <footer><div class="wrap">© Shorterm Agent — a real-browser leasing assistant for FurnishedFinder hosts. Human approves every send.</div></footer>
+</body>
+</html>

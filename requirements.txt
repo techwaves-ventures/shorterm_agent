@@ -5,3 +5,5 @@ flask>=3.0
 flask-login>=0.6
 cryptography>=42
 anthropic>=0.40
+stripe>=9.0
+gunicorn>=21.0
