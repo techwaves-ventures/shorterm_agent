@@ -1,4 +1,63 @@
-# Deploying on an Ubuntu VM
+# Deploying the demo SaaS (Render / Fly / any web host)
+
+The web app is a standard WSGI Flask app (`dashboard:app`) served by gunicorn.
+A `Procfile` and `render.yaml` blueprint are included.
+
+## Required environment variables
+
+| Var | Required | Purpose |
+|---|---|---|
+| `SECRET_KEY` | **yes** | Signs login session cookies. App won't start without it. |
+| `FF_CRED_KEY` | **yes** | Fernet key encrypting tenants' FurnishedFinder email at rest. |
+| `OPERATOR_EMAIL` / `OPERATOR_PASSWORD` | recommended | First admin login, created on boot. |
+| `ANTHROPIC_API_KEY` | for drafting | Enables the auto-responder. |
+| `SQLITE_PATH` | for persistence | Point at a mounted disk (e.g. `/var/data/leads.db`) so data survives deploys. |
+| `PUBLIC_BASE_URL` | for Stripe | Public URL used in Stripe redirect callbacks. |
+| `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_STARTER`, `STRIPE_PRICE_PRO` | optional | Enable live billing. **Omit all to run billing in safe demo mode.** |
+| `DASHBOARD_HOST=0.0.0.0` | on a host | Bind all interfaces (platform terminates TLS in front). |
+
+Generate the two keys:
+
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"                                  # SECRET_KEY
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"  # FF_CRED_KEY
+```
+
+Never commit secrets. `.env` is gitignored; on a host set them in the dashboard.
+
+## Deploy on Render (blueprint)
+
+1. Push this repo to GitHub.
+2. In Render: **New + → Blueprint**, select the repo. `render.yaml` provisions a
+   web service with a 1 GB persistent disk mounted at `/var/data` and
+   `SQLITE_PATH=/var/data/leads.db`.
+3. Fill the `sync: false` secrets (SECRET_KEY, FF_CRED_KEY, operator creds, etc.)
+   in the Render dashboard.
+4. Health check is wired to **`/healthz`**.
+5. First boot creates the operator. To seed a demo tenant, open a shell and run
+   `python manage.py seed-demo`.
+6. **Stripe (optional):** add the `STRIPE_*` vars, then point a Stripe webhook at
+   `https://<your-app>/billing/webhook` (events: `checkout.session.completed`,
+   `customer.subscription.updated`, `customer.subscription.deleted`).
+
+The start command runs **one** gunicorn worker (`--workers 1 --threads 8`): the
+scrape runner keeps per-tenant browser/OTP state in-process, so multiple workers
+would break the OTP rendezvous. Scale by running more units, not more workers.
+
+## Storage: SQLite now, Postgres later
+
+The demo uses SQLite (`SQLITE_PATH`) on a persistent disk — simple and adequate
+for a pilot/demo. **This is not a full ORM swap.** For multi-instance scale,
+migrate to managed Postgres: the schema is small and centralized (`storage.py`,
+`models.py`, `config.py`, `ff_account.py`, `billing.py`, `waitlist.py` each own
+their `CREATE TABLE`), and all access goes through per-module `_conn()` helpers,
+so the migration is: (1) add a `DATABASE_URL` branch in each `_conn()` that
+returns a `psycopg` connection, (2) swap `?` placeholders for `%s`, (3) run the
+same `CREATE TABLE` DDL on Postgres. Tracked as a follow-up — see the PR notes.
+
+---
+
+# Deploying on an Ubuntu VM (self-hosted, single-tenant)
 
 Runs the dashboard as a systemd service and checks for new leads/messages
 twice a day (08:00 & 18:00) via a systemd timer. New leads are auto-drafted on

@@ -12,7 +12,6 @@ sample data each time and never touches other tenants or the operator.
 """
 import json
 import os
-import sqlite3
 
 from dotenv import load_dotenv
 
@@ -20,6 +19,8 @@ load_dotenv()
 
 import billing
 import config
+import crypto
+import ff_account
 import models
 import storage
 
@@ -72,8 +73,11 @@ DEMO_MESSAGES = [
 
 
 def _reset_sample_data(tenant_id: str) -> None:
-    """Clear this tenant's seen/response rows so re-seeding is idempotent."""
-    with sqlite3.connect(storage.DB_PATH) as c:
+    """Clear this tenant's seen/response rows so re-seeding is idempotent.
+
+    Uses storage._conn so the tables are created/migrated if they don't exist yet.
+    """
+    with storage._conn() as c:
         c.execute("DELETE FROM seen WHERE tenant_id=? AND site=?", (tenant_id, SITE))
         c.execute("DELETE FROM responses WHERE tenant_id=? AND site=?", (tenant_id, SITE))
 
@@ -133,6 +137,15 @@ def seed_demo() -> tuple[str, str]:
     )
     config.mark_onboarded(tenant_id)
     billing.set_subscription(tenant_id, plan="pro", status="active", demo=1)
+
+    # Connect a fake FF account so the seeded leads/drafts are visible on the
+    # dashboard (the leads view unlocks once an account is connected). Requires
+    # FF_CRED_KEY — skipped gracefully if encryption isn't configured.
+    if crypto.available() and not ff_account.is_connected(tenant_id):
+        try:
+            ff_account.connect(tenant_id, "demo-host@example.test")
+        except (ValueError, RuntimeError):
+            pass
 
     _reset_sample_data(tenant_id)
     _seed_items(tenant_id)

@@ -76,6 +76,46 @@ Set `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASS`/`FROM_EMAIL` in `.env` to en
 
 For a hands-off twice-daily check (drafts ready when you open the dashboard), run the dashboard as a service and trigger `/refresh` on a timer — the scrape then runs inside the dashboard process, which auto-drafts new leads and handles OTP. See **[DEPLOY.md](DEPLOY.md)** for the Ubuntu VM setup (systemd service + timer at 08:00 & 18:00). When a check needs an OTP you'll get a notification; open the dashboard and paste the code into the still-waiting run.
 
+## Demo SaaS (multi-tenant web app)
+
+The dashboard now ships as a small multi-tenant SaaS so it can be shown as a
+product, not just a local script. Surfaces:
+
+- **Public landing page** (`/`) — marketing page with pricing and a pilot-access
+  waitlist (`/pilot`). Authenticated users are redirected to their dashboard.
+- **Auth** (`/login`, `/signup`) — email/password login; each host sees only
+  their own tenant's data. The **operator** (tenant 1) owns the pre-existing data.
+- **Onboarding** (`/onboarding`) — a guided first-run wizard: host profile → first
+  unit → reply tone → optional FurnishedFinder connection → first lead check. New
+  tenants are routed here until they finish (or skip).
+- **Settings** (`/settings`) — editable units, reply template/tone, sign-off,
+  reply channels, notification webhook, FurnishedFinder connect/disconnect, and
+  plan status. Sending stays **human-in-the-loop** — the agent drafts, you approve.
+- **Billing** (`/billing`) — Stripe subscription plans (Starter/Pro/Portfolio),
+  Checkout, and the customer portal. Runs in a safe **demo mode** when no Stripe
+  keys are set: "subscribing" marks the tenant as *Pilot (demo)* with no charge.
+- **Health check** (`/healthz`) — JSON liveness/readiness probe (checks the DB).
+
+### Quickstart
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+cp .env.example .env
+# Minimum for the web app to boot:
+#   SECRET_KEY   -> python -c "import secrets; print(secrets.token_hex(32))"
+#   FF_CRED_KEY  -> python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+.venv/bin/python manage.py bootstrap      # create the operator from OPERATOR_EMAIL/PASSWORD
+.venv/bin/python manage.py seed-demo      # optional: demo tenant + sample leads/drafts (no real PII)
+.venv/bin/python dashboard.py             # http://127.0.0.1:5050
+```
+
+`manage.py seed-demo` prints a demo login (`demo@shorterm.test` by default) with
+two sample units and a populated inbox of drafted replies waiting for approval —
+so you can walk landing → login → dashboard → settings → billing without any real
+tenant data. All keys/secrets come from env; missing Stripe/FF secrets fail
+gracefully (demo mode / skipped connection). See **[DEPLOY.md](DEPLOY.md)** for
+hosted deployment (Render/Fly + persistent storage) and the Postgres path.
+
 ## Adding a site
 
 1. Copy `sites/example_site.py` to `sites/<your_site>.py`.
