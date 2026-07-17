@@ -1,0 +1,52 @@
+# Render blueprint for the Shorterm Agent demo SaaS.
+# Deploy: push this repo to GitHub, then "New + → Blueprint" in Render and point
+# it here. Fill the `sync: false` secrets in the Render dashboard (never commit
+# them). See DEPLOY.md for the full walkthrough and the managed-Postgres path.
+services:
+  - type: web
+    name: shorterm-agent
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt && python -m playwright install --with-deps chromium
+    startCommand: gunicorn dashboard:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
+    healthCheckPath: /healthz
+    # Persistent disk so the SQLite DB (leads.db) survives deploys. For scale,
+    # switch to managed Postgres via DATABASE_URL (see DEPLOY.md) and drop this.
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: SQLITE_PATH
+        value: /var/data/leads.db
+      - key: DASHBOARD_HOST
+        value: 0.0.0.0
+      - key: PYTHON_VERSION
+        value: "3.12"
+      # --- Secrets: set these in the Render dashboard, do not commit ---
+      - key: SECRET_KEY          # python -c "import secrets; print(secrets.token_hex(32))"
+        sync: false
+      - key: FF_CRED_KEY         # python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+        sync: false
+      - key: OPERATOR_EMAIL
+        sync: false
+      - key: OPERATOR_PASSWORD
+        sync: false
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: PUBLIC_BASE_URL     # e.g. https://shorterm-agent.onrender.com
+        sync: false
+      # --- Stripe (optional — omit for demo mode) ---
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_STARTER
+        sync: false
+      - key: STRIPE_PRICE_PRO
+        sync: false
+
+# Managed Postgres for scale (uncomment + wire DATABASE_URL per DEPLOY.md):
+# databases:
+#   - name: shorterm-db
+#     plan: starter

@@ -9,6 +9,7 @@ Run:
     .venv/bin/python dashboard.py
     open http://localhost:5050
 """
+import json
 import os
 from functools import wraps
 
@@ -34,6 +35,7 @@ from flask_login import (
     logout_user,
 )
 
+import billing
 import config
 import crypto
 import ff_account
@@ -41,6 +43,7 @@ import models
 import responder
 import runner
 import storage
+import waitlist
 
 SITE = "furnishedfinder"
 LIMIT = 20
@@ -57,6 +60,9 @@ models.ensure_operator()
 
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
+
+# Stripe billing routes (demo-safe when no keys are set — see billing.py).
+app.register_blueprint(billing.billing_bp)
 
 
 @login_manager.user_loader
@@ -103,6 +109,52 @@ def _item_by_id(tenant_id: str, item_id: str) -> dict | None:
                 it["kind"] = kind
                 return it
     return None
+
+
+# ---------------------------------------------------------------------------
+# Public pages (landing, health, pilot waitlist)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/")
+def landing():
+    """Public marketing landing page. Authenticated users go to their dashboard."""
+    if current_user.is_authenticated:
+        return redirect(url_for("index"))
+    return render_template("landing.html")
+
+
+@app.route("/healthz")
+def healthz():
+    """Liveness/readiness probe for the hosting platform. Checks DB reachability."""
+    db_ok = True
+    try:
+        models.get_user_by_id(0)  # cheap query; opens + initializes the DB
+    except Exception:
+        db_ok = False
+    payload = {
+        "status": "ok" if db_ok else "degraded",
+        "service": "shorterm-agent",
+        "db": db_ok,
+        "crypto_configured": crypto.available(),
+        "billing_mode": "demo" if billing.demo_mode() else "live",
+    }
+    return jsonify(payload), (200 if db_ok else 503)
+
+
+@app.route("/pilot", methods=["POST"])
+def pilot():
+    """Public pilot-access request from the landing page."""
+    try:
+        waitlist.add(
+            request.form.get("email", ""),
+            request.form.get("market", ""),
+            request.form.get("units", ""),
+        )
+        flash("Thanks — you're on the pilot list. We'll be in touch shortly.")
+    except ValueError as e:
+        flash(str(e))
+    return redirect(url_for("landing") + "#pilot")
 
 
 # ---------------------------------------------------------------------------
@@ -166,9 +218,12 @@ def logout():
 # ---------------------------------------------------------------------------
 
 
-@app.route("/")
+@app.route("/dashboard")
 @login_required
 def index():
+    # First-run tenants are guided through onboarding before the dashboard.
+    if not current_user.is_operator and not config.is_onboarded(current_user.tenant_id):
+        return redirect(url_for("onboarding"))
     data = _recent(current_user.tenant_id)
     return render_template(
         "dashboard.html",
@@ -181,6 +236,7 @@ def index():
         messages=data["messages"],
         state=runner.get_state(current_user.tenant_id),
         has_api_key=bool(os.getenv("ANTHROPIC_API_KEY")),
+        billing_label=billing.status_label(billing.get_subscription(current_user.tenant_id)),
     )
 
 
@@ -297,8 +353,111 @@ def connect():
 
 
 # ---------------------------------------------------------------------------
+# Onboarding (guided first run)
+# ---------------------------------------------------------------------------
+
+
+def _unit_from_onboarding(form) -> list[dict] | None:
+    """Build a one-unit catalog from the onboarding form, or None if left blank."""
+    name = (form.get("unit_name") or "").strip()
+    area = (form.get("unit_area") or "").strip()
+    if not name and not area:
+        return None
+    unit: dict = {"id": "unit-1", "name": name or "Unit 1"}
+    if area:
+        unit["area"] = area
+    for field, key in (("unit_price", "monthly_price"),
+                       ("unit_occupancy", "max_occupancy"),
+                       ("unit_min_nights", "min_nights")):
+        val = (form.get(field) or "").strip()
+        if val.isdigit():
+            unit[key] = int(val)
+    pets = form.get("unit_pets", "")
+    if pets == "yes":
+        unit["pets_allowed"] = True
+    elif pets == "no":
+        unit["pets_allowed"] = False
+    notes = (form.get("unit_notes") or "").strip()
+    if notes:
+        unit["notes"] = notes
+    return [unit]
+
+
+@app.route("/onboarding", methods=["GET", "POST"])
+@login_required
+def onboarding():
+    tenant_id = current_user.tenant_id
+    current = config.get_settings(tenant_id)
+
+    # "Skip for now" (a GET link) — mark done and go to the dashboard.
+    if request.method == "GET" and request.args.get("skip"):
+        config.mark_onboarded(tenant_id)
+        flash("You can finish setup anytime in Settings.")
+        return redirect(url_for("index"))
+
+    if request.method == "POST":
+        units = _unit_from_onboarding(request.form)
+        units_json = json.dumps(units) if units else current["units_json"]
+        config.save_settings(
+            tenant_id,
+            host_name=(request.form.get("host_name") or "").strip(),
+            from_email=(request.form.get("from_email") or "").strip(),
+            template=request.form.get("template") or current["template"],
+            units_json=units_json,
+        )
+        # Optional FurnishedFinder connection (email + explicit consent).
+        ff_email = (request.form.get("ff_email") or "").strip()
+        if ff_email and request.form.get("ff_consent"):
+            if not crypto.available():
+                flash("FurnishedFinder not connected — encryption isn't configured yet.")
+            else:
+                try:
+                    ff_account.connect(tenant_id, ff_email)
+                except (ValueError, RuntimeError) as e:
+                    flash(f"FurnishedFinder not connected: {e}")
+        config.mark_onboarded(tenant_id)
+        flash("You're all set. Click “Check now” to fetch your first leads.")
+        return redirect(url_for("index"))
+
+    f = {
+        "host_name": current["host_name"],
+        "from_email": current["from_email"],
+        "template": current["template"],
+        "unit_name": "", "unit_area": "", "unit_price": "", "unit_occupancy": "",
+        "unit_min_nights": "", "unit_pets": "", "unit_notes": "", "ff_email": "",
+    }
+    return render_template(
+        "onboarding.html",
+        account=current_user.email,
+        crypto_ready=crypto.available(),
+        f=f,
+    )
+
+
+@app.route("/disconnect", methods=["POST"])
+@login_required
+def disconnect():
+    """Remove the tenant's connected FurnishedFinder account."""
+    ff_account.disconnect(current_user.tenant_id)
+    flash("FurnishedFinder account disconnected.")
+    return redirect(url_for("settings"))
+
+
+# ---------------------------------------------------------------------------
 # Per-tenant settings (units, template, identity)
 # ---------------------------------------------------------------------------
+
+
+def _settings_context(tenant_id: str, settings: dict) -> dict:
+    """Shared template context for the settings page."""
+    return {
+        "account": current_user.email,
+        "settings": settings,
+        "ff_status": ff_account.status(tenant_id),
+        "crypto_ready": crypto.available(),
+        "billing_label": billing.status_label(billing.get_subscription(tenant_id)),
+        "auto_send": False,  # human-in-the-loop is enforced; no auto-send in this build
+    }
 
 
 @app.route("/settings", methods=["GET", "POST"])
@@ -312,17 +471,15 @@ def settings():
         except ValueError as e:
             flash(str(e))
             # Re-render with the user's unsaved edits so nothing is lost.
-            return render_template(
-                "settings.html",
-                account=current_user.email,
-                settings={
-                    "host_name": request.form.get("host_name", ""),
-                    "units_json": units_text,
-                    "template": request.form.get("template", ""),
-                    "from_email": request.form.get("from_email", ""),
-                    "reply_channels": request.form.get("reply_channels", ""),
-                },
-            )
+            edits = {
+                "host_name": request.form.get("host_name", ""),
+                "units_json": units_text,
+                "template": request.form.get("template", ""),
+                "from_email": request.form.get("from_email", ""),
+                "reply_channels": request.form.get("reply_channels", ""),
+                "notify_webhook": request.form.get("notify_webhook", ""),
+            }
+            return render_template("settings.html", **_settings_context(tenant_id, edits))
         config.save_settings(
             tenant_id,
             host_name=request.form.get("host_name", "").strip(),
@@ -330,13 +487,13 @@ def settings():
             template=request.form.get("template", ""),
             from_email=request.form.get("from_email", "").strip(),
             reply_channels=request.form.get("reply_channels", "").strip() or "platform,email",
+            notify_webhook=request.form.get("notify_webhook", "").strip(),
         )
         flash("Saved.")
         return redirect(url_for("settings"))
     return render_template(
         "settings.html",
-        account=current_user.email,
-        settings=config.get_settings(tenant_id),
+        **_settings_context(tenant_id, config.get_settings(tenant_id)),
     )
 
 

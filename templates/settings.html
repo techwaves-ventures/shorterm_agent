@@ -60,7 +60,10 @@
       <h1>Settings</h1>
       <div class="account">Signed in as <b>{{ account }}</b></div>
     </div>
-    <a href="{{ url_for('index') }}">← Back to dashboard</a>
+    <div style="display:flex;gap:16px;align-items:center">
+      <a href="{{ url_for('billing.billing_home') }}">Billing</a>
+      <a href="{{ url_for('index') }}">← Back to dashboard</a>
+    </div>
   </header>
 
   <main>
@@ -104,12 +107,49 @@
                    placeholder="platform,email">
           </div>
         </div>
+        <label for="notify_webhook">Notification webhook (optional)</label>
+        <input id="notify_webhook" name="notify_webhook" value="{{ settings.notify_webhook }}"
+               placeholder="https://hooks.slack.com/… — pinged when an OTP is needed">
+        <p class="hint" style="margin-top:12px">
+          <b>Sending is human-in-the-loop.</b> Every reply waits for your one-click approval — the agent
+          drafts, but never sends on its own. This is the account-safety posture and can't be bypassed in this build.</p>
       </div>
 
       <div class="bar">
         <button type="submit">Save settings</button>
       </div>
     </form>
+
+    <div class="card">
+      <h2>FurnishedFinder account</h2>
+      {% if ff_status and ff_status.connected %}
+        <p class="hint">Connected{% if ff_status.masked_email %} as <b>{{ ff_status.masked_email }}</b>{% endif %}.
+          Login is passwordless (email + one-time code); your email is stored encrypted.</p>
+        <form method="post" action="{{ url_for('disconnect') }}">
+          <button type="submit" style="background:transparent;border:1px solid var(--err);color:#ffb4b4">Disconnect</button>
+        </form>
+      {% elif crypto_ready %}
+        <p class="hint">Link your FurnishedFinder login so the agent can fetch leads and send replies you approve.
+          We never ask for a password.</p>
+        <form method="post" action="{{ url_for('connect') }}">
+          <label for="ff_email">FurnishedFinder email</label>
+          <input id="ff_email" name="ff_email" type="email" required placeholder="Your FurnishedFinder email">
+          <label style="display:flex;gap:8px;align-items:flex-start;margin-top:12px">
+            <input type="checkbox" name="consent" value="1" required style="width:auto;margin-top:3px">
+            <span>I authorize automated access to my FurnishedFinder account to read leads and send replies I approve.</span>
+          </label>
+          <div class="bar" style="margin-top:14px"><button type="submit">Connect</button></div>
+        </form>
+      {% else %}
+        <p class="hint">Account connection isn't available yet — encryption (<code>FF_CRED_KEY</code>) isn't configured.</p>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <h2>Plan</h2>
+      <p class="hint">Current plan: <b>{{ billing_label }}</b>.
+        <a href="{{ url_for('billing.billing_home') }}">Manage billing →</a></p>
+    </div>
   </main>
 </body>
 </html>
