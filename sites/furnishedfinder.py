@@ -3,7 +3,19 @@ import hashlib
 import logging
 import os
 import re
-from playwright.sync_api import Page, TimeoutError as PWTimeout
+
+# Optional at import time so the web app (which imports this adapter via runner)
+# boots on hosts without Playwright, e.g. Vercel serverless. Actual scraping
+# only runs where Playwright + Chromium are installed. `Page` is used solely as
+# a type hint; PWTimeout only in except-clauses reached during a live scrape.
+try:
+    from playwright.sync_api import Page, TimeoutError as PWTimeout
+except ImportError:  # pragma: no cover - depends on deploy target
+    Page = "Page"
+
+    class PWTimeout(Exception):
+        pass
+
 
 log = logging.getLogger(__name__)
 

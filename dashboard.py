@@ -55,8 +55,30 @@ if not app.secret_key:
     # insecure default — set SECRET_KEY in .env (see .env.example).
     raise RuntimeError("SECRET_KEY not set in .env — required for login sessions.")
 
-# Provision the operator tenant + login (from OPERATOR_EMAIL/PASSWORD) on boot.
-models.ensure_operator()
+def _bootstrap_on_boot() -> None:
+    """Provision the operator (and optionally seed demo data) at startup.
+
+    Wrapped in try/except so a transient DB outage at a serverless cold start
+    doesn't crash the whole function — the app still boots and /healthz reports
+    `db: false` (503) until the DB recovers, instead of failing to import.
+    Provisioning is idempotent and can also be run explicitly via
+    `python manage.py init`.
+    """
+    try:
+        models.ensure_operator()
+        # Opt-in one-time demo seed for hosted instances (e.g. Vercel), where
+        # running a CLI is awkward. Set SEED_DEMO_ON_BOOT=1. Idempotent: only
+        # seeds when the demo tenant doesn't exist yet.
+        if os.getenv("SEED_DEMO_ON_BOOT", "").strip().lower() in ("1", "true", "yes"):
+            import seed_demo
+
+            if not models.get_user_by_email(seed_demo.DEMO_EMAIL):
+                seed_demo.seed_demo()
+    except Exception:
+        app.logger.exception("Boot bootstrap failed (DB unreachable?); continuing.")
+
+
+_bootstrap_on_boot()
 
 login_manager = LoginManager(app)
 login_manager.login_view = "login"

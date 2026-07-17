@@ -4,14 +4,13 @@ Stores pilot-access requests (email + market + unit count) in the shared
 leads.db so the landing CTA is functional in the demo without a CRM. No auth —
 it's a public form — so inputs are treated as untrusted and length-capped.
 """
-import sqlite3
 from datetime import datetime
 
-from storage import DB_PATH
+import db
 
 
-def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_PATH)
+def _conn() -> db.Conn:
+    c = db.connect()
     c.execute(
         """CREATE TABLE IF NOT EXISTS waitlist (
             id INTEGER PRIMARY KEY AUTOINCREMENT,

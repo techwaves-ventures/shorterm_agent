@@ -94,7 +94,16 @@ product, not just a local script. Surfaces:
 - **Billing** (`/billing`) — Stripe subscription plans (Starter/Pro/Portfolio),
   Checkout, and the customer portal. Runs in a safe **demo mode** when no Stripe
   keys are set: "subscribing" marks the tenant as *Pilot (demo)* with no charge.
-- **Health check** (`/healthz`) — JSON liveness/readiness probe (checks the DB).
+- **Health check** (`/healthz`) — JSON liveness/readiness probe (reports whether
+  the configured DB — SQLite or hosted Postgres — is reachable).
+
+### Database backend
+
+Storage auto-selects at runtime (`db.py`): set `DATABASE_URL` for **hosted
+Postgres** (Neon / Vercel Postgres / Supabase), or leave it blank to use
+**SQLite** (`SQLITE_PATH`, default `./leads.db`) for local dev. The app speaks a
+single SQL dialect and translates for Postgres transparently — same schema, same
+per-tenant isolation on both. Postgres is required for serverless (Vercel).
 
 ### Quickstart
 
@@ -114,7 +123,10 @@ two sample units and a populated inbox of drafted replies waiting for approval �
 so you can walk landing → login → dashboard → settings → billing without any real
 tenant data. All keys/secrets come from env; missing Stripe/FF secrets fail
 gracefully (demo mode / skipped connection). See **[DEPLOY.md](DEPLOY.md)** for
-hosted deployment (Render/Fly + persistent storage) and the Postgres path.
+hosted deployment: **Vercel + hosted Postgres** (fastest demo path), Render/Fly
+with a persistent disk, or a self-hosted VM. On a hosted Postgres instance, run
+`python manage.py init` once (or set `SEED_DEMO_ON_BOOT=1`) to provision the
+operator + demo data.
 
 ## Adding a site
 

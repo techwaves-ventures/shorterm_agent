@@ -1,0 +1,23 @@
+# Keep the Vercel upload lean and free of local runtime state.
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Local browser sessions + scraper artifacts (scraping doesn't run on Vercel).
+browser_profile/
+browser_profiles/
+OTP_CODE
+check_leads.log
+
+# Local SQLite databases — hosted deploys use DATABASE_URL (Postgres).
+*.db
+leads.db
+
+# Non-Vercel deploy configs / process managers.
+deploy/
+render.yaml
+Procfile
+start.sh
+
+.git/

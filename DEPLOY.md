@@ -1,7 +1,15 @@
-# Deploying the demo SaaS (Render / Fly / any web host)
+# Deploying the demo SaaS
 
-The web app is a standard WSGI Flask app (`dashboard:app`) served by gunicorn.
-A `Procfile` and `render.yaml` blueprint are included.
+The web app is a standard WSGI Flask app (`dashboard:app`). It runs two ways:
+
+- **Vercel serverless** (fastest hosted demo) — `api/index.py` + `vercel.json`,
+  with a hosted Postgres `DATABASE_URL`. See **[Deploy on Vercel](#deploy-on-vercel-hosted-postgres)** below.
+- **Disk-based host** (Render / Fly / a VM) — gunicorn via `Procfile` /
+  `render.yaml`, using SQLite on a persistent disk *or* the same hosted Postgres.
+
+The database backend is auto-selected: set `DATABASE_URL` → Postgres; otherwise
+SQLite at `SQLITE_PATH`. Tenant isolation is identical on both (every row is
+scoped by `tenant_id`).
 
 ## Required environment variables
 
@@ -9,12 +17,14 @@ A `Procfile` and `render.yaml` blueprint are included.
 |---|---|---|
 | `SECRET_KEY` | **yes** | Signs login session cookies. App won't start without it. |
 | `FF_CRED_KEY` | **yes** | Fernet key encrypting tenants' FurnishedFinder email at rest. |
+| `DATABASE_URL` | **yes on serverless** | Hosted Postgres (Neon / Vercel Postgres / Supabase). Required on Vercel — SQLite can't persist there. Omit to use SQLite. |
 | `OPERATOR_EMAIL` / `OPERATOR_PASSWORD` | recommended | First admin login, created on boot. |
 | `ANTHROPIC_API_KEY` | for drafting | Enables the auto-responder. |
-| `SQLITE_PATH` | for persistence | Point at a mounted disk (e.g. `/var/data/leads.db`) so data survives deploys. |
-| `PUBLIC_BASE_URL` | for Stripe | Public URL used in Stripe redirect callbacks. |
+| `SQLITE_PATH` | SQLite hosts only | Point at a mounted disk (e.g. `/var/data/leads.db`). Ignored when `DATABASE_URL` is set. |
+| `SEED_DEMO_ON_BOOT=1` | optional | Auto-seed the demo tenant on first boot (handy on Vercel). Idempotent. |
+| `PUBLIC_BASE_URL` | for Stripe | Public URL used in Stripe redirect callbacks (e.g. `https://<app>.vercel.app`). |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_STARTER`, `STRIPE_PRICE_PRO` | optional | Enable live billing. **Omit all to run billing in safe demo mode.** |
-| `DASHBOARD_HOST=0.0.0.0` | on a host | Bind all interfaces (platform terminates TLS in front). |
+| `DASHBOARD_HOST=0.0.0.0` | disk hosts only | Bind all interfaces (not used on Vercel). |
 
 Generate the two keys:
 
@@ -24,6 +34,91 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ```
 
 Never commit secrets. `.env` is gitignored; on a host set them in the dashboard.
+
+## Deploy on Vercel (hosted Postgres)
+
+Vercel runs the Flask app as a Python serverless function (`api/index.py`,
+wired by `vercel.json`). Because serverless has **no persistent filesystem**, it
+needs a hosted Postgres database — do that first.
+
+### 1. Create a hosted Postgres instance
+
+Pick one (all have free tiers). You need the connection string.
+
+- **Vercel Postgres** — in your Vercel project: **Storage → Create Database →
+  Postgres**. Vercel auto-adds `POSTGRES_URL` / `DATABASE_URL` to the project's
+  env. Copy the pooled connection string.
+- **Neon** ([neon.tech](https://neon.tech)) — create a project, copy the
+  connection string from the dashboard (use the **pooled** one). It looks like
+  `postgresql://user:pass@ep-xxx-pooler.region.aws.neon.tech/neondb?sslmode=require`.
+- **Supabase** ([supabase.com](https://supabase.com)) — **Project Settings →
+  Database → Connection string → URI** (use the connection **pooler** URI, port
+  6543). Add `?sslmode=require`.
+
+Keep `sslmode=require` in the URL for all three.
+
+### 2. Create the Vercel project
+
+1. Push this repo/branch to GitHub.
+2. In Vercel: **Add New… → Project**, import the repo. Framework preset: **Other**
+   (the included `vercel.json` handles the build). No build/output overrides needed.
+3. **Environment Variables** — add:
+   - `DATABASE_URL` = your Postgres URL from step 1 (if you used Vercel Postgres
+     it may already be present).
+   - `SECRET_KEY` = `python -c "import secrets; print(secrets.token_hex(32))"`
+   - `FF_CRED_KEY` = `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+   - `OPERATOR_EMAIL`, `OPERATOR_PASSWORD` — your first admin login.
+   - `SEED_DEMO_ON_BOOT=1` — to populate the demo tenant automatically on first boot.
+   - *(optional)* `ANTHROPIC_API_KEY`, `PUBLIC_BASE_URL=https://<app>.vercel.app`,
+     `STRIPE_*`. Omit Stripe to stay in demo billing mode.
+4. **Deploy.** Vercel installs the slim `api/requirements.txt` (no Playwright)
+   and serves every route through `api/index.py`.
+
+### 3. Seed operator + demo data
+
+- With `SEED_DEMO_ON_BOOT=1`, the first request provisions the operator tenant
+  and the demo tenant automatically (idempotent).
+- Or run the one-shot bootstrap locally against the hosted DB:
+
+  ```bash
+  DATABASE_URL='postgres://…?sslmode=require' \
+  SECRET_KEY=x FF_CRED_KEY=$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())") \
+  OPERATOR_EMAIL=you@example.com OPERATOR_PASSWORD=… \
+  python manage.py init
+  ```
+
+  `manage.py init` prints the demo login (`demo@shorterm.test` /
+  `demo-shorterm-2026` by default).
+
+### 4. Verify
+
+- `GET https://<app>.vercel.app/healthz` → `{"status":"ok","db":true,...}` (200).
+  `db:false` (503) means the app booted but can't reach Postgres — check
+  `DATABASE_URL` / `sslmode`.
+- Demo path: landing `/` → **Log in** → demo dashboard with seeded leads/drafts →
+  Settings / Billing (demo mode).
+
+### ⚠️ Vercel limitation: no live scraping / browser automation
+
+Live FurnishedFinder scraping and platform sends use Playwright + a real Chrome,
+which **cannot run on Vercel serverless** (no browser, read-only FS, short
+execution limits). On Vercel the app boots fine and the whole demo SaaS surface
+works (landing/auth/onboarding/settings/billing/demo data), but the scrape/send
+routes return a clear "Playwright not available" error instead of running.
+
+**Recommended follow-up for real scraping:** run the scraper off Vercel on a
+worker/host that has Playwright + Chromium and shares the same `DATABASE_URL`:
+
+- A small always-on worker (Render/Fly/VM) running `python check_leads.py --loop
+  300`, or the systemd timer in this repo (`deploy/str-leads-check.timer`), or a
+  scheduled job — all writing leads into the shared Postgres so the Vercel
+  dashboard renders them.
+- Email sends (SMTP) already work anywhere; only the *platform*-channel send
+  needs the browser. Human-in-the-loop send posture is unchanged — nothing
+  auto-sends.
+
+This split (Vercel = dashboard/UI, worker = browser jobs, shared Postgres) is
+tracked as the recommended production topology.
 
 ## Deploy on Render (blueprint)
 
@@ -44,16 +139,23 @@ The start command runs **one** gunicorn worker (`--workers 1 --threads 8`): the
 scrape runner keeps per-tenant browser/OTP state in-process, so multiple workers
 would break the OTP rendezvous. Scale by running more units, not more workers.
 
-## Storage: SQLite now, Postgres later
+## Storage: SQLite or hosted Postgres
 
-The demo uses SQLite (`SQLITE_PATH`) on a persistent disk — simple and adequate
-for a pilot/demo. **This is not a full ORM swap.** For multi-instance scale,
-migrate to managed Postgres: the schema is small and centralized (`storage.py`,
-`models.py`, `config.py`, `ff_account.py`, `billing.py`, `waitlist.py` each own
-their `CREATE TABLE`), and all access goes through per-module `_conn()` helpers,
-so the migration is: (1) add a `DATABASE_URL` branch in each `_conn()` that
-returns a `psycopg` connection, (2) swap `?` placeholders for `%s`, (3) run the
-same `CREATE TABLE` DDL on Postgres. Tracked as a follow-up — see the PR notes.
+The backend is chosen at runtime by `db.py`:
+
+- **`DATABASE_URL` set** → hosted Postgres (via `psycopg`). Required on serverless
+  (Vercel), recommended for any multi-instance host.
+- **`DATABASE_URL` blank** → SQLite at `SQLITE_PATH` (or `./leads.db`). Great for
+  local dev and single-instance disk hosts.
+
+Every module speaks one SQLite-flavoured SQL dialect and opens connections
+through `db.connect()`; when `DATABASE_URL` points at Postgres, `db.py`
+translates statements (placeholders + a few DDL tokens) and provides the handful
+of cross-dialect helpers that genuinely differ (`table_columns`,
+`insert_returning_id`, `sync_serial`). Schema and tenant isolation are identical
+on both engines — no separate migration files to run; `CREATE TABLE IF NOT
+EXISTS` bootstraps a fresh Postgres database on first connect. Point a worker and
+the web app at the **same** `DATABASE_URL` to share data.
 
 ---
 

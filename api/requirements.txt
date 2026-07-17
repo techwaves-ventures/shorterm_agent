@@ -1,0 +1,18 @@
+# Serverless (Vercel) dependency set — deliberately SLIM.
+#
+# The @vercel/python builder installs from this file (next to the entrypoint)
+# instead of the root requirements.txt. Playwright + Chromium are intentionally
+# omitted: live scraping can't run on Vercel serverless (no browser, read-only
+# FS), and its import is optional (see check_leads.py / sites/furnishedfinder.py),
+# so the app boots without it. This keeps the function bundle well under limits.
+#
+# For a host that DOES scrape (a worker, Render, Fly, or local dev), use the
+# root requirements.txt, which additionally pins playwright + gunicorn.
+flask>=3.0
+flask-login>=0.6
+cryptography>=42
+requests>=2.31.0
+python-dotenv>=1.0.0
+psycopg[binary]>=3.1
+anthropic>=0.40
+stripe>=9.0

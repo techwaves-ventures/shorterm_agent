@@ -17,7 +17,15 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
+
+# Playwright is optional at import time: the web app imports this module (via
+# runner) just to expose the scrape entrypoints, but a serverless host like
+# Vercel neither installs the browser nor can run it. Importing must not fail
+# there; run_scrape/browser_page raise a clear error if invoked without it.
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:  # pragma: no cover - depends on deploy target
+    sync_playwright = None
 
 load_dotenv()
 
@@ -25,16 +33,32 @@ from notify import notify
 from storage import filter_new
 from sites import furnishedfinder
 
+# File logging is best-effort: a read-only serverless filesystem (Vercel) can't
+# create the log file, so fall back to stdout-only rather than crashing import.
+_handlers = [logging.StreamHandler(sys.stdout)]
 LOG_PATH = Path(__file__).parent / "check_leads.log"
+try:
+    _handlers.insert(0, logging.FileHandler(LOG_PATH))
+except OSError:  # pragma: no cover - read-only FS
+    pass
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    handlers=[logging.FileHandler(LOG_PATH), logging.StreamHandler(sys.stdout)],
+    handlers=_handlers,
 )
 log = logging.getLogger("check_leads")
 
 PROFILE_DIR = Path(__file__).parent / "browser_profile"
-PROFILE_DIR.mkdir(exist_ok=True)
+
+
+def _require_playwright():
+    """Raise a clear error when a scrape is attempted without Playwright."""
+    if sync_playwright is None:
+        raise RuntimeError(
+            "Playwright is not available in this environment — live scraping is "
+            "disabled (e.g. on Vercel serverless). Run scraping from a worker/host "
+            "that has Playwright + Chromium installed. See DEPLOY.md."
+        )
 
 # Register site adapters here.
 SITES = [furnishedfinder]
@@ -59,6 +83,7 @@ def _profile_dir(tenant_id: str = "1") -> Path:
 def browser_page(tenant_id: str = "1"):
     """Launch a real (non-sandboxed) Chrome with the tenant's persistent profile
     and yield a page. Shared by run_scrape and the dashboard's reply-send path."""
+    _require_playwright()
     headless = os.getenv("HEADLESS", "0") == "1"
     launch_args = [
         "--no-sandbox",
@@ -92,6 +117,7 @@ def run_scrape(status_cb=None, on_new_items=None, tenant_id: str = "1") -> dict:
 
     Returns a dict of new-item counts: {site: {kind: n}}.
     """
+    _require_playwright()
 
     def emit(state: str, message: str = "") -> None:
         if status_cb:
