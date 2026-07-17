@@ -38,8 +38,13 @@ def is_configured() -> bool:
     return bool(cfg["host"] and cfg["user"] and cfg["password"] and cfg["from_addr"])
 
 
-def send_email(to_addr: str, subject: str, body: str) -> None:
-    """Send a plain-text email. Raises RuntimeError if SMTP isn't configured."""
+def send_email(to_addr: str, subject: str, body: str, from_email: str = "") -> None:
+    """Send a plain-text email via the shared SMTP relay.
+
+    `from_email` sets the per-tenant From: address; it falls back to the global
+    relay default (SMTP_USER / FROM_EMAIL / FF_USERNAME). SMTP host/user/pass are
+    always the shared relay's. Raises RuntimeError if SMTP isn't configured.
+    """
     if not to_addr:
         raise RuntimeError("No recipient address for email send.")
     cfg = _config()
@@ -50,7 +55,7 @@ def send_email(to_addr: str, subject: str, body: str) -> None:
         )
 
     msg = EmailMessage()
-    msg["From"] = cfg["from_addr"]
+    msg["From"] = (from_email or "").strip() or cfg["from_addr"]
     msg["To"] = to_addr
     msg["Subject"] = subject
     msg.set_content(body)

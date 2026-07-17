@@ -40,10 +40,25 @@ PROFILE_DIR.mkdir(exist_ok=True)
 SITES = [furnishedfinder]
 
 
+def _profile_dir(tenant_id: str = "1") -> Path:
+    """Per-tenant persistent browser profile (holds the logged-in FF session).
+
+    The operator (tenant '1') keeps the original ./browser_profile so their
+    existing session survives; other tenants get ./browser_profiles/{id}/. Each
+    profile is an isolated cookie/session store — no cross-tenant session bleed.
+    """
+    if str(tenant_id) == "1":
+        PROFILE_DIR.mkdir(exist_ok=True)
+        return PROFILE_DIR
+    d = Path(__file__).parent / "browser_profiles" / str(tenant_id)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 @contextmanager
-def browser_page():
-    """Launch a real (non-sandboxed) Chrome with the persistent profile and
-    yield a page. Shared by run_scrape and the dashboard's reply-send path."""
+def browser_page(tenant_id: str = "1"):
+    """Launch a real (non-sandboxed) Chrome with the tenant's persistent profile
+    and yield a page. Shared by run_scrape and the dashboard's reply-send path."""
     headless = os.getenv("HEADLESS", "0") == "1"
     launch_args = [
         "--no-sandbox",
@@ -52,7 +67,7 @@ def browser_page():
     ]
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
-            user_data_dir=str(PROFILE_DIR),
+            user_data_dir=str(_profile_dir(tenant_id)),
             headless=headless,
             args=launch_args,
             viewport=None,  # use real window size
@@ -66,13 +81,14 @@ def browser_page():
             ctx.close()
 
 
-def run_scrape(status_cb=None, on_new_items=None) -> dict:
+def run_scrape(status_cb=None, on_new_items=None, tenant_id: str = "1") -> dict:
     """Launch a real browser, scrape every registered site, dedup + notify.
 
     `status_cb(state, message)` is invoked at key transitions so a UI (the Flask
     dashboard) can show progress. It is optional — the CLI passes nothing.
-    `on_new_items(site, kind, new_items)` is called for each batch of newly-seen
-    items (used by the dashboard to auto-draft replies).
+    `on_new_items(tenant_id, site, kind, new_items)` is called for each batch of
+    newly-seen items (used by the dashboard to auto-draft replies).
+    `tenant_id` scopes dedup + storage; the CLI defaults to the operator ('1').
 
     Returns a dict of new-item counts: {site: {kind: n}}.
     """
@@ -87,7 +103,7 @@ def run_scrape(status_cb=None, on_new_items=None) -> dict:
     counts: dict[str, dict] = {}
     emit("launching", "Launching browser…")
 
-    with browser_page() as page:
+    with browser_page(tenant_id) as page:
         for site in SITES:
             name = getattr(site, "SITE_NAME", site.__name__)
             log.info("Checking site: %s", name)
@@ -107,7 +123,7 @@ def run_scrape(status_cb=None, on_new_items=None) -> dict:
 
             any_new = False
             for kind, kind_items in by_kind.items():
-                new_items = filter_new(name, kind, kind_items)
+                new_items = filter_new(tenant_id, name, kind, kind_items)
                 if not new_items:
                     continue
                 any_new = True
@@ -119,7 +135,7 @@ def run_scrape(status_cb=None, on_new_items=None) -> dict:
                 notify(f"[{name}] {len(new_items)} new {kind}(s)", body)
                 if on_new_items:
                     try:
-                        on_new_items(name, kind, new_items)
+                        on_new_items(tenant_id, name, kind, new_items)
                     except Exception:
                         log.exception("on_new_items hook failed")
             if not any_new:

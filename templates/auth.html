@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} — STR Leads</title>
+  <style>
+    :root {
+      --bg: #0f1115; --panel: #181b22; --border: #272b35;
+      --text: #e6e8ec; --muted: #9aa3b2; --accent: #4f8cff; --accent-hover: #3f76e0;
+      --err: #ff5c5c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: flex; align-items: center;
+      justify-content: center; background: var(--bg); color: var(--text);
+      font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+    .box {
+      background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+      padding: 32px; width: 100%; max-width: 360px;
+    }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    .sub { color: var(--muted); font-size: 13px; margin: 0 0 22px; }
+    label { display: block; font-size: 12.5px; color: var(--muted); margin: 14px 0 5px; }
+    input {
+      width: 100%; background: var(--bg); border: 1px solid var(--border);
+      border-radius: 8px; color: var(--text); padding: 10px 12px; font-size: 14px;
+    }
+    button {
+      width: 100%; margin-top: 22px; background: var(--accent); color: #fff; border: 0;
+      border-radius: 8px; padding: 11px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
+    }
+    button:hover { background: var(--accent-hover); }
+    .alt { margin-top: 18px; text-align: center; color: var(--muted); font-size: 13px; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .flash {
+      background: rgba(255,92,92,.12); border: 1px solid var(--err); color: #ffb4b4;
+      border-radius: 8px; padding: 9px 12px; font-size: 13px; margin-bottom: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>STR Leads</h1>
+    <p class="sub">{{ subtitle }}</p>
+    {% with messages = get_flashed_messages() %}
+      {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
+    {% endwith %}
+    <form method="post" action="{{ action }}">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="email" required autofocus>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password"
+             autocomplete="{{ 'new-password' if title == 'Sign up' else 'current-password' }}" required>
+      <button type="submit">{{ title }}</button>
+    </form>
+    <div class="alt">{{ alt_text|safe }}</div>
+  </div>
+</body>
+</html>

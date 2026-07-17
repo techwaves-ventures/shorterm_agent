@@ -12,7 +12,8 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
+
+import config
 
 log = logging.getLogger(__name__)
 
@@ -34,9 +35,6 @@ def _find_email(item: dict) -> str | None:
     return None
 
 MODEL = "claude-sonnet-4-6"
-_BASE = Path(__file__).parent
-UNITS_PATH = _BASE / "units.json"
-TEMPLATE_PATH = _BASE / "response_template.md"
 
 # Forced-tool schema. strict=True guarantees a valid, parseable decision.
 DECISION_TOOL = {
@@ -115,32 +113,21 @@ You must call the record_decision tool with your decision.
 """
 
 
-def load_units() -> list[dict]:
-    try:
-        return json.loads(UNITS_PATH.read_text())
-    except (OSError, ValueError):
-        log.warning("Could not read %s", UNITS_PATH)
-        return []
+def load_units(tenant_id: str) -> list[dict]:
+    """This tenant's unit catalog (from per-tenant config)."""
+    return config.get_units(tenant_id)
 
 
-def _load_guide() -> str:
-    try:
-        return TEMPLATE_PATH.read_text()
-    except OSError:
-        return ""
+def _system_blocks(units: list[dict], guide: str, host_name: str) -> list[dict]:
+    """Stable system prompt (units + style guide), cached as a prefix.
 
-
-def _host_name() -> str:
-    """The name auto-drafted replies sign off with (HOST_NAME in .env)."""
-    return (os.getenv("HOST_NAME") or "Sagiv").strip()
-
-
-def _system_blocks(units: list[dict]) -> list[dict]:
-    """Stable system prompt (units + style guide), cached as a prefix."""
+    The prefix is per-tenant now (units/guide/host differ), so caching is
+    effective across a tenant's repeated drafts rather than across tenants.
+    """
     text = SYSTEM_GUIDE.format(
-        host_name=_host_name(),
+        host_name=host_name or "your host",
         units=json.dumps(units, indent=2),
-        guide=_load_guide(),
+        guide=guide or "",
     )
     return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
 
@@ -187,15 +174,20 @@ def _lead_text(item: dict) -> str:
     )
 
 
-def evaluate_lead(item: dict, units: list[dict] | None = None, client=None) -> dict:
-    """Return {fit, unit_id, reason, draft, confidence}. Raises on API/config error."""
+def evaluate_lead(item: dict, tenant_id: str, units: list[dict] | None = None,
+                  client=None) -> dict:
+    """Return {fit, unit_id, reason, draft, confidence}. Raises on API/config error.
+
+    `tenant_id` selects which host's units, template, and sign-off name to use.
+    """
     import anthropic
 
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set in .env — cannot draft replies.")
 
-    units = units if units is not None else load_units()
+    settings = config.get_settings(tenant_id)
+    units = units if units is not None else config.get_units(tenant_id)
     if client is None:
         # Talk to Anthropic directly. Pass api_key + base_url explicitly so a
         # host-shell ANTHROPIC_BASE_URL (e.g. a Claude Code proxy) can't
@@ -207,7 +199,7 @@ def evaluate_lead(item: dict, units: list[dict] | None = None, client=None) -> d
     resp = client.messages.create(
         model=MODEL,
         max_tokens=1024,
-        system=_system_blocks(units),
+        system=_system_blocks(units, settings["template"], settings["host_name"]),
         tools=[DECISION_TOOL],
         tool_choice={"type": "tool", "name": "record_decision"},
         messages=[{"role": "user", "content": _lead_text(item)}],
