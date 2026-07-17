@@ -71,7 +71,7 @@
       <a href="#how">How it works</a>
       <a href="#pricing">Pricing</a>
       <a href="{{ url_for('login') }}">Log in</a>
-      <a class="cta" href="{{ url_for('signup') }}">Get started</a>
+      <a class="cta" href="#pilot">Contact us</a>
     </div>
   </nav>
 
@@ -88,7 +88,7 @@
         drafts a personalized reply grounded only in the details you provide. You review and click send.
         Nothing goes out without you.</p>
       <div class="hero-ctas">
-        <a class="btn" href="{{ url_for('signup') }}">Request pilot access</a>
+        <a class="btn" href="#pilot">Request access</a>
         <a class="btn ghost" href="#how">See how it works</a>
       </div>
       <div class="trust"><b>Human-in-the-loop</b> • Uses only your listed facts • Your credentials stay yours</div>
@@ -138,7 +138,7 @@
         <div class="plan hot"><h3>Pro</h3><div class="price">$99<small>/mo</small></div><p>Multi-unit host / small PM, up to 10 units. Everything in Starter plus more frequent checks and priority support.</p></div>
         <div class="plan"><h3>Portfolio</h3><div class="price">Custom</div><p>10+ units / property manager. Multiple hosts, white-glove onboarding, SLA.</p></div>
       </div>
-      <div class="hero-ctas"><a class="btn" href="{{ url_for('signup') }}">Start free — request pilot access</a></div>
+      <div class="hero-ctas"><a class="btn" href="#pilot">Request pilot access</a></div>
     </section>
 
     <!-- FAQ -->
@@ -161,7 +161,7 @@
         <input name="units" type="number" min="0" placeholder="# units" style="flex:0 1 120px">
         <button class="btn" type="submit">Request access</button>
       </form>
-      <div class="hero-ctas"><a class="btn ghost" href="{{ url_for('signup') }}">Or create an account now →</a></div>
+      <div class="hero-ctas"><a class="btn ghost" href="{{ url_for('login') }}">Already have access? Log in</a></div>
     </section>
   </div>
 

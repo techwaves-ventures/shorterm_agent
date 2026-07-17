@@ -55,6 +55,10 @@ if not app.secret_key:
     # insecure default — set SECRET_KEY in .env (see .env.example).
     raise RuntimeError("SECRET_KEY not set in .env — required for login sessions.")
 
+
+def public_signup_enabled() -> bool:
+    return os.getenv("PUBLIC_SIGNUP_ENABLED", "").strip().lower() in ("1", "true", "yes")
+
 def _bootstrap_on_boot() -> None:
     """Provision the operator (and optionally seed demo data) at startup.
 
@@ -201,7 +205,7 @@ def login():
         title="Log in",
         subtitle="Sign in to your dashboard.",
         action=url_for("login"),
-        alt_text='No account? <a href="%s">Sign up</a>' % url_for("signup"),
+        alt_text='Need access? <a href="%s">Contact us</a>' % (url_for("landing") + "#pilot"),
     )
 
 
@@ -209,6 +213,9 @@ def login():
 def signup():
     if current_user.is_authenticated:
         return redirect(url_for("index"))
+    if not public_signup_enabled():
+        flash("Public signup is closed for now. Request access and we'll set you up.")
+        return redirect(url_for("landing") + "#pilot")
     if request.method == "POST":
         email = (request.form.get("email") or "").strip().lower()
         password = request.form.get("password") or ""
