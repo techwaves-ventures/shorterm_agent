@@ -1,0 +1,179 @@
+<style>
+  /* ===================================================================
+     Shorterm — shared design system
+     One source of truth for tokens, typography, and core components.
+     Included into every page <head>. Server-rendered (no static route),
+     so it works identically locally and on Vercel.
+     =================================================================== */
+  :root {
+    /* Surfaces (dark, layered) */
+    --bg:          #0b0d12;
+    --bg-2:        #0e1117;
+    --surface:     #14171f;
+    --surface-2:   #1a1e28;
+    --surface-3:   #212632;
+    --border:      #262b37;
+    --border-2:    #333a49;
+
+    /* Text */
+    --text:        #eceef2;
+    --muted:       #99a3b3;
+    --faint:       #6b7484;
+
+    /* Brand + status */
+    --brand:       #5b8cff;
+    --brand-2:     #7aa2ff;
+    --brand-strong:#4571e6;
+    --brand-soft:  rgba(91,140,255,.14);
+    --brand-line:  rgba(91,140,255,.45);
+    --ok:          #2ecc71;
+    --ok-soft:     rgba(46,204,113,.15);
+    --warn:        #f5a623;
+    --warn-soft:   rgba(245,166,35,.15);
+    --err:         #ff5c5c;
+    --err-soft:    rgba(255,92,92,.13);
+
+    /* Shape + depth */
+    --radius:      10px;
+    --radius-lg:   16px;
+    --radius-pill: 999px;
+    --shadow-sm:   0 1px 2px rgba(0,0,0,.4);
+    --shadow-md:   0 6px 24px -8px rgba(0,0,0,.55);
+    --shadow-lg:   0 24px 60px -20px rgba(0,0,0,.7);
+    --ring:        0 0 0 3px var(--brand-soft);
+
+    --grad-brand:  linear-gradient(135deg, #6d9bff 0%, #5b8cff 55%, #4571e6 100%);
+    --maxw:        1040px;
+    --font:        -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono:        ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  ::selection { background: var(--brand-soft); }
+
+  a { color: var(--brand-2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  h1, h2, h3, h4 { margin: 0; font-weight: 700; letter-spacing: -.01em; color: var(--text); }
+  h1 { font-size: 2.05rem; line-height: 1.14; letter-spacing: -.022em; }
+  h2 { font-size: 1.5rem; line-height: 1.2; letter-spacing: -.018em; }
+  h3 { font-size: 1.05rem; }
+  p  { margin: 0; }
+  code { font-family: var(--mono); font-size: .86em; color: var(--text);
+    background: var(--surface-3); padding: 1px 6px; border-radius: 6px; }
+
+  .container { max-width: var(--maxw); margin: 0 auto; padding: 0 24px; }
+  .muted { color: var(--muted); }
+  .faint { color: var(--faint); }
+
+  /* ---- Brand mark ---------------------------------------------------- */
+  .brandmark { display: inline-flex; align-items: center; gap: 10px; font-weight: 700;
+    font-size: 1.05rem; color: var(--text); letter-spacing: -.02em; }
+  .brandmark:hover { text-decoration: none; }
+  .brandmark svg { display: block; border-radius: 9px; box-shadow: var(--shadow-sm); }
+  .brandmark .wm { line-height: 1; }
+  .brandmark .wm span { color: var(--muted); font-weight: 600; }
+
+  /* ---- Buttons ------------------------------------------------------- */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    background: var(--surface-3); color: var(--text); border: 1px solid var(--border-2);
+    border-radius: var(--radius); padding: 11px 18px; font-size: .95rem; font-weight: 600;
+    font-family: inherit; cursor: pointer; transition: background .15s, border-color .15s,
+      transform .05s, box-shadow .15s; text-decoration: none; white-space: nowrap;
+  }
+  .btn:hover { text-decoration: none; border-color: var(--border-2); background: var(--surface-2); }
+  .btn:active { transform: translateY(1px); }
+  .btn:focus-visible { outline: none; box-shadow: var(--ring); }
+  .btn:disabled { opacity: .55; cursor: default; }
+  .btn--primary { background: var(--grad-brand); color: #fff; border-color: transparent;
+    box-shadow: 0 2px 12px -3px rgba(91,140,255,.5); }
+  .btn--primary:hover { filter: brightness(1.06); background: var(--grad-brand); }
+  .btn--ghost { background: transparent; color: var(--text); border-color: var(--border-2); }
+  .btn--ghost:hover { background: var(--surface-2); }
+  .btn--danger { background: transparent; color: #ffb4b4; border-color: rgba(255,92,92,.5); }
+  .btn--danger:hover { background: var(--err-soft); }
+  .btn--sm { padding: 7px 13px; font-size: .85rem; border-radius: 8px; }
+  .btn--block { width: 100%; }
+
+  /* ---- Forms --------------------------------------------------------- */
+  label { display: block; font-size: .8rem; font-weight: 500; color: var(--muted);
+    margin: 0 0 6px; }
+  input, textarea, select {
+    width: 100%; background: var(--bg-2); border: 1px solid var(--border);
+    border-radius: var(--radius); color: var(--text); padding: 10px 13px;
+    font-size: .95rem; font-family: inherit; transition: border-color .15s, box-shadow .15s;
+  }
+  input::placeholder, textarea::placeholder { color: var(--faint); }
+  input:focus, textarea:focus, select:focus { outline: none; border-color: var(--brand-line);
+    box-shadow: var(--ring); }
+  textarea { resize: vertical; line-height: 1.55; }
+  textarea.code { font-family: var(--mono); font-size: .82rem; }
+  .field { margin-bottom: 14px; }
+  .field-row { display: flex; gap: 14px; flex-wrap: wrap; }
+  .field-row > * { flex: 1 1 200px; }
+  .consent { display: flex; gap: 9px; align-items: flex-start; font-size: .82rem;
+    color: var(--muted); line-height: 1.45; }
+  .consent input { width: auto; margin-top: 3px; flex: 0 0 auto; }
+
+  /* ---- Surfaces ------------------------------------------------------ */
+  .card { background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-lg); padding: 22px; }
+
+  /* ---- Badges -------------------------------------------------------- */
+  .badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px;
+    border-radius: var(--radius-pill); font-size: .74rem; font-weight: 600;
+    border: 1px solid var(--border-2); color: var(--muted); background: var(--surface-3); }
+  .badge--ok    { background: var(--ok-soft);   color: #7ee2a8; border-color: rgba(46,204,113,.4); }
+  .badge--warn  { background: var(--warn-soft);  color: #f3c170; border-color: rgba(245,166,35,.4); }
+  .badge--brand { background: var(--brand-soft); color: var(--brand-2); border-color: var(--brand-line); }
+  .badge-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+
+  /* ---- Flash / alerts ------------------------------------------------ */
+  .flash { border-radius: var(--radius); padding: 11px 15px; font-size: .9rem;
+    margin-bottom: 12px; border: 1px solid var(--brand-line); background: var(--brand-soft);
+    color: #cdddff; display: flex; gap: 9px; align-items: flex-start; }
+  .flash::before { content: "ℹ"; opacity: .8; }
+
+  /* ---- App top bar (authenticated shell) ----------------------------- */
+  .appbar { position: sticky; top: 0; z-index: 30; background: rgba(14,17,23,.86);
+    backdrop-filter: blur(10px); border-bottom: 1px solid var(--border); }
+  .appbar__inner { max-width: var(--maxw); margin: 0 auto; padding: 12px 24px;
+    display: flex; align-items: center; gap: 20px; }
+  .appbar__nav { display: flex; gap: 4px; margin-left: 8px; }
+  .appbar__nav a { color: var(--muted); font-size: .9rem; font-weight: 500;
+    padding: 7px 12px; border-radius: 8px; }
+  .appbar__nav a:hover { color: var(--text); background: var(--surface-2); text-decoration: none; }
+  .appbar__nav a.active { color: var(--text); background: var(--surface-3); }
+  .appbar__right { margin-left: auto; display: flex; align-items: center; gap: 14px; }
+  .appbar__acct { color: var(--muted); font-size: .82rem; text-align: right; line-height: 1.3;
+    max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .appbar__acct b { color: var(--text); font-weight: 600; }
+
+  .app-main { max-width: var(--maxw); margin: 0 auto; padding: 28px 24px 64px; }
+  .page-head { margin-bottom: 20px; }
+  .page-head h1 { font-size: 1.6rem; }
+  .page-head p { color: var(--muted); margin-top: 4px; font-size: .95rem; }
+
+  @media (max-width: 680px) {
+    h1 { font-size: 1.72rem; }
+    h2 { font-size: 1.3rem; }
+    .container { padding: 0 18px; }
+    .appbar__inner { padding: 10px 16px; gap: 10px; flex-wrap: wrap; }
+    .appbar__nav { margin-left: 0; order: 3; width: 100%; overflow-x: auto; }
+    .appbar__right { gap: 10px; }
+    .appbar__acct { display: none; }
+    .app-main { padding: 20px 16px 48px; }
+  }
+</style>

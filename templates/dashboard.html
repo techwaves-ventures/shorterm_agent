@@ -3,188 +3,126 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>STR Leads — FurnishedFinder</title>
+  <title>Dashboard — Shorterm</title>
+  {% include "_theme.html" %}
   <style>
-    :root {
-      --bg: #0f1115; --panel: #181b22; --panel2: #1d212a; --border: #272b35;
-      --text: #e6e8ec; --muted: #9aa3b2; --accent: #4f8cff; --accent-hover: #3f76e0;
-      --ok: #2ecc71; --warn: #f5a623; --err: #ff5c5c;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0; background: var(--bg); color: var(--text);
-      font: 14px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    }
-    header {
-      display: flex; align-items: center; justify-content: space-between;
-      gap: 16px; padding: 16px 24px; border-bottom: 1px solid var(--border);
-      background: var(--panel); position: sticky; top: 0; z-index: 20;
-    }
-    header h1 { font-size: 18px; margin: 0; }
-    .account { color: var(--muted); font-size: 13px; }
-    .account b { color: var(--text); }
-    button {
-      background: var(--accent); color: #fff; border: 0; border-radius: 8px;
-      padding: 9px 16px; font-size: 14px; font-weight: 600; cursor: pointer;
-    }
-    button:hover { background: var(--accent-hover); }
-    button:disabled { opacity: .55; cursor: default; }
-    .header-actions { display: flex; gap: 10px; align-items: center; }
-    button.ghost { background: transparent; border: 1px solid var(--border); color: var(--muted); }
-    button.ghost:hover { background: var(--panel2); color: var(--text); }
-    .settings-link { color: var(--muted); font-size: 13px; font-weight: 500; }
-    .settings-link:hover { color: var(--text); text-decoration: none; }
-    main { padding: 24px; max-width: 920px; margin: 0 auto; }
+    /* Dashboard-specific components. Class names are referenced by the inline
+       script below (JS-generated cards), so they are preserved verbatim. */
+    .connect-card { background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); padding: 32px; margin-top: 8px; text-align: center;
+      max-width: 520px; margin-left: auto; margin-right: auto; box-shadow: var(--shadow-md); }
+    .connect-card h2 { font-size: 1.25rem; margin-bottom: 10px; }
+    .connect-card p { color: var(--muted); margin: 0 auto 8px; max-width: 400px; }
+    .connect-card .muted { color: var(--faint); font-size: .85rem; }
+    .connect-form { text-align: left; max-width: 400px; margin: 20px auto 0; }
+    .connect-form .consent { margin: 12px 0 16px; }
 
-    .connect-card {
-      background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
-      padding: 28px; margin-top: 8px; text-align: center;
-    }
-    .connect-card h2 { margin: 0 0 10px; font-size: 18px; }
-    .connect-card p { color: var(--text); margin: 0 0 8px; }
-    .connect-card .muted { color: var(--muted); font-size: 13px; }
-    .connect-form { text-align: left; max-width: 420px; margin: 18px auto 0; }
-    .connect-form input[type="email"] {
-      width: 100%; background: var(--bg); border: 1px solid var(--border);
-      border-radius: 8px; color: var(--text); padding: 10px 12px; font-size: 14px;
-    }
-    .connect-form .consent {
-      display: flex; gap: 8px; align-items: flex-start; margin: 12px 0;
-      color: var(--muted); font-size: 12.5px; line-height: 1.4; text-align: left;
-    }
-    .connect-form .consent input { margin-top: 2px; flex: 0 0 auto; }
-    .connect-form button { width: 100%; }
-
-    .banner {
-      display: none; align-items: center; gap: 12px; padding: 12px 16px;
-      border: 1px solid var(--border); border-radius: 10px; margin-bottom: 20px;
-      background: var(--panel);
-    }
+    .banner { display: none; align-items: center; gap: 12px; padding: 12px 16px;
+      border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 22px;
+      background: var(--surface); }
     .banner.show { display: flex; }
-    .spinner {
-      width: 16px; height: 16px; border: 2px solid var(--muted);
-      border-top-color: var(--accent); border-radius: 50%;
-      animation: spin .8s linear infinite; flex: 0 0 auto;
-    }
+    .spinner { width: 16px; height: 16px; border: 2px solid var(--border-2);
+      border-top-color: var(--brand); border-radius: 50%; animation: spin .8s linear infinite; flex: 0 0 auto; }
     @keyframes spin { to { transform: rotate(360deg); } }
-    .banner.error { border-color: var(--err); }
+    .banner.error { border-color: var(--err); background: var(--err-soft); }
     .banner.error .spinner { display: none; }
     .otp-row { display: none; gap: 8px; margin-left: auto; }
     .otp-row.show { display: flex; }
-    .otp-row input {
-      background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
-      color: var(--text); padding: 8px 12px; font-size: 14px; width: 140px; letter-spacing: 2px;
-    }
+    .otp-row input { width: 140px; letter-spacing: 3px; padding: 8px 12px; }
 
-    section { margin-bottom: 36px; }
-    .sec-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 6px; }
-    .sec-head h2 { font-size: 16px; margin: 0; }
-    .sec-sub { color: var(--muted); font-size: 13px; }
-    .count { color: var(--muted); font-weight: 400; font-size: 13px; }
+    section { margin-bottom: 38px; }
+    .sec-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 4px; flex-wrap: wrap; }
+    .sec-head h2 { font-size: 1.15rem; }
+    .sec-sub { color: var(--muted); font-size: .86rem; }
+    .count { color: var(--faint); font-weight: 400; font-size: .85rem; }
 
-    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0 14px; }
-    .chip {
-      background: var(--panel); color: var(--muted); border: 1px solid var(--border);
-      border-radius: 999px; padding: 5px 12px; font-size: 12.5px; cursor: pointer; font-weight: 500;
-    }
-    .chip:hover { color: var(--text); }
-    .chip.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-    .search {
-      margin-left: auto; background: var(--panel); border: 1px solid var(--border);
-      border-radius: 8px; color: var(--text); padding: 7px 12px; font-size: 13px; min-width: 180px;
-    }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 14px 0 16px; }
+    .chip { background: var(--surface); color: var(--muted); border: 1px solid var(--border);
+      border-radius: var(--radius-pill); padding: 6px 13px; font-size: .82rem; cursor: pointer; font-weight: 500; }
+    .chip:hover { color: var(--text); border-color: var(--border-2); }
+    .chip.active { background: var(--brand-soft); color: var(--brand-2); border-color: var(--brand-line); }
+    .search { margin-left: auto; width: auto; min-width: 190px; padding: 8px 13px; font-size: .87rem; }
 
-    .apikey-note { background: var(--panel); border: 1px solid var(--border);
-      border-radius: 8px; padding: 10px 14px; margin-bottom: 14px; color: var(--muted); font-size: 13px; }
-    .apikey-note code { color: var(--text); }
+    .apikey-note { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 11px 15px; margin-bottom: 16px; color: var(--muted); font-size: .87rem; }
+    .apikey-note code { font-size: .82em; }
 
-    .card {
-      background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
-      padding: 14px 16px; margin-bottom: 12px;
-    }
+    /* Lead/message card — overrides the theme .card for the tighter list look. */
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+      padding: 16px 18px; margin-bottom: 12px; transition: border-color .15s; }
+    .card:hover { border-color: var(--border-2); }
     .card-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .who { font-weight: 600; font-size: 15px; }
-    .when { color: var(--muted); font-size: 12.5px; }
+    .who { font-weight: 600; font-size: 1rem; }
+    .when { color: var(--faint); font-size: .8rem; }
     .spacer { margin-left: auto; }
 
-    .kind { font-size: 11px; padding: 2px 9px; border-radius: 999px; font-weight: 600; }
-    .kind.lead { background: rgba(79,140,255,.16); color: #8fb6ff; }
-    .kind.message { background: rgba(245,166,35,.16); color: #f3c170; }
+    .kind { font-size: .7rem; padding: 3px 9px; border-radius: var(--radius-pill); font-weight: 600; }
+    .kind.lead { background: var(--brand-soft); color: var(--brand-2); }
+    .kind.message { background: var(--warn-soft); color: #f3c170; }
 
-    .status { font-size: 11.5px; padding: 2px 9px; border-radius: 999px; font-weight: 600; }
-    .status.draft { background: rgba(79,140,255,.16); color: #8fb6ff; }
-    .status.sent { background: rgba(46,204,113,.16); color: var(--ok); }
-    .status.skipped, .status.dismissed { background: #2a2f3a; color: var(--muted); }
-    .status.none { background: #2a2f3a; color: var(--warn); }
+    .status { font-size: .72rem; padding: 3px 10px; border-radius: var(--radius-pill); font-weight: 600; }
+    .status.draft { background: var(--brand-soft); color: var(--brand-2); }
+    .status.sent { background: var(--ok-soft); color: #7ee2a8; }
+    .status.skipped, .status.dismissed { background: var(--surface-3); color: var(--muted); }
+    .status.none { background: var(--warn-soft); color: var(--warn); }
 
-    .prop { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
-    .email-tag { color: var(--accent); font-size: 12.5px; }
-    .facts { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }
-    .fact { font-size: 12px; background: var(--panel2); color: var(--text);
-            border: 1px solid var(--border); border-radius: 999px; padding: 2px 9px; }
-    .inquiry-toggle {
-      background: none; color: var(--accent); border: 0; padding: 6px 0 0; font-size: 12.5px;
-      font-weight: 500; cursor: pointer;
-    }
-    .inquiry-toggle:hover { background: none; text-decoration: underline; }
-    .inquiry {
-      display: none; white-space: pre-wrap; background: var(--bg); border: 1px solid var(--border);
-      border-radius: 8px; padding: 10px 12px; margin-top: 8px; color: var(--text);
-      font-size: 13px; max-height: 260px; overflow: auto;
-    }
+    .prop { color: var(--muted); font-size: .87rem; margin-top: 8px; }
+    .email-tag { color: var(--brand-2); font-size: .82rem; }
+    .facts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+    .fact { font-size: .76rem; background: var(--surface-3); color: var(--text);
+      border: 1px solid var(--border); border-radius: var(--radius-pill); padding: 3px 10px; }
+    .inquiry-toggle { background: none; color: var(--brand-2); border: 0; padding: 8px 0 0;
+      font-size: .82rem; font-weight: 500; cursor: pointer; font-family: inherit; }
+    .inquiry-toggle:hover { text-decoration: underline; }
+    .inquiry { display: none; white-space: pre-wrap; background: var(--bg-2); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 11px 13px; margin-top: 8px; color: var(--text);
+      font-size: .86rem; max-height: 260px; overflow: auto; }
     .inquiry.show { display: block; }
 
-    .reply { margin-top: 12px; border-top: 1px solid var(--border); padding-top: 12px; }
-    .reply-head { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
-    .unit { font-size: 11px; background: var(--accent); color: #fff; padding: 1px 8px; border-radius: 6px; }
-    .conf { font-size: 11px; background: #2a2f3a; color: var(--muted); padding: 1px 8px; border-radius: 6px; }
-    .reason { color: var(--muted); font-size: 12.5px; }
-    .draft-text {
-      width: 100%; min-height: 120px; background: var(--bg); border: 1px solid var(--border);
-      border-radius: 8px; color: var(--text); padding: 10px 12px; font: inherit; font-size: 13.5px;
-      line-height: 1.5; resize: vertical;
-    }
-    .actions { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
-    .mini { font-size: 12.5px; padding: 6px 12px; border-radius: 7px; background: #2a2f3a; }
-    .mini:hover { background: #333a47; }
-    .mini.primary { background: var(--accent); }
-    .mini.primary:hover { background: var(--accent-hover); }
-    .send-note { color: var(--muted); font-size: 12px; }
-    .spinner-sm {
-      display: inline-block; width: 12px; height: 12px; vertical-align: -2px;
-      margin-right: 6px; border: 2px solid rgba(255,255,255,.35);
-      border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite;
-    }
+    .reply { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 14px; }
+    .reply-head { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+    .unit { font-size: .7rem; background: var(--grad-brand); color: #fff; padding: 2px 9px; border-radius: 6px; font-weight: 600; }
+    .conf { font-size: .7rem; background: var(--surface-3); color: var(--muted); padding: 2px 9px; border-radius: 6px; }
+    .reason { color: var(--muted); font-size: .82rem; }
+    .draft-text { width: 100%; min-height: 120px; background: var(--bg-2); border: 1px solid var(--border);
+      border-radius: var(--radius); color: var(--text); padding: 11px 13px; font: inherit; font-size: .9rem;
+      line-height: 1.55; resize: vertical; }
+    .actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
+    .mini { display: inline-flex; align-items: center; gap: 6px; background: var(--surface-3); color: var(--text);
+      border: 1px solid var(--border-2); border-radius: 8px; padding: 7px 13px; font-size: .83rem;
+      font-weight: 600; cursor: pointer; font-family: inherit; transition: background .15s; }
+    .mini:hover { background: var(--surface-2); }
+    .mini.primary { background: var(--grad-brand); color: #fff; border-color: transparent; }
+    .mini.primary:hover { filter: brightness(1.06); }
+    .mini:disabled { opacity: .55; cursor: default; }
+    .send-note { color: var(--faint); font-size: .78rem; }
+    .spinner-sm { display: inline-block; width: 12px; height: 12px; vertical-align: -2px; margin-right: 4px;
+      border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite; }
     button.busy { opacity: .8; cursor: default; }
-    .reply-msg { font-size: 12.5px; margin-top: 8px; }
+    .reply-msg { font-size: .82rem; margin-top: 8px; }
     .reply-msg.err { color: var(--err); }
     .reply-msg.ok { color: var(--ok); }
     .draft-text:disabled { opacity: .6; }
-    .empty { color: var(--muted); padding: 24px; text-align: center;
-      border: 1px dashed var(--border); border-radius: 12px; }
-    a { color: var(--accent); text-decoration: none; }
-    a:hover { text-decoration: underline; }
+    .empty { color: var(--muted); padding: 32px; text-align: center; border: 1px dashed var(--border);
+      border-radius: var(--radius-lg); font-size: .9rem; }
   </style>
 </head>
 <body>
-  <header>
-    <div>
-      <h1>STR Leads</h1>
-      <div class="account">Signed in as <b>{{ account }}</b>{% if ff_status and ff_status.masked_email %} · FF: {{ ff_status.masked_email }}{% elif is_operator %} · FurnishedFinder{% endif %}</div>
-    </div>
-    <div class="header-actions">
-      {% if can_scrape %}<button id="refresh-btn" onclick="startRefresh()">Check now</button>{% endif %}
-      <a href="{{ url_for('billing.billing_home') }}" class="settings-link">Billing</a>
-      <a href="{{ url_for('settings') }}" class="settings-link">Settings</a>
-      <form method="post" action="{{ url_for('logout') }}" style="display:inline">
-        <button type="submit" class="ghost">Log out</button>
-      </form>
-    </div>
-  </header>
+  {% set nav_active = 'dashboard' %}
+  {% set nav_extra %}
+    {% if ff_status and ff_status.masked_email %}<span class="badge">FF · {{ ff_status.masked_email }}</span>{% elif is_operator %}<span class="badge">FurnishedFinder</span>{% endif %}
+    {% if can_scrape %}<button id="refresh-btn" class="btn btn--primary btn--sm" onclick="startRefresh()">Check now</button>{% endif %}
+  {% endset %}
+  {% include "_appnav.html" %}
 
-  <main>
+  <main class="app-main">
+    <div class="page-head">
+      <h1>Dashboard</h1>
+      <p>New leads and messages, triaged and drafted — you approve every send.</p>
+    </div>
+
     {% with messages = get_flashed_messages() %}
-      {% for m in messages %}<div class="apikey-note">{{ m }}</div>{% endfor %}
+      {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
     {% endwith %}
   {% if not can_scrape %}
     <div class="connect-card">
@@ -194,13 +132,15 @@
          ask for a password.</p>
       {% if crypto_ready %}
       <form method="post" action="{{ url_for('connect') }}" class="connect-form">
-        <input name="ff_email" type="email" required placeholder="Your FurnishedFinder email">
+        <div class="field">
+          <input name="ff_email" type="email" required placeholder="Your FurnishedFinder email">
+        </div>
         <label class="consent">
           <input type="checkbox" name="consent" value="1" required>
-          I authorize automated access to my FurnishedFinder account to read leads and
-          send replies on my behalf.
+          <span>I authorize automated access to my FurnishedFinder account to read leads and
+          send replies on my behalf.</span>
         </label>
-        <button type="submit">Connect account</button>
+        <button type="submit" class="btn btn--primary btn--block">Connect account</button>
       </form>
       {% else %}
       <p class="muted">Account connection isn't available yet — the operator needs to
@@ -213,7 +153,7 @@
       <span id="banner-msg">Idle</span>
       <form class="otp-row" id="otp-row" onsubmit="submitOtp(event)">
         <input id="otp-input" inputmode="numeric" autocomplete="one-time-code" placeholder="OTP code" />
-        <button type="submit">Submit OTP</button>
+        <button type="submit" class="btn btn--primary btn--sm">Submit OTP</button>
       </form>
     </div>
 
