@@ -10,11 +10,10 @@ address is per tenant in this phase.
 """
 import json
 import os
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from storage import DB_PATH
+import db
 
 _BASE = Path(__file__).parent
 
@@ -70,8 +69,8 @@ _FIELDS = (
 _ADDED_COLUMNS = {"notify_webhook": "TEXT", "onboarded": "TEXT DEFAULT '0'"}
 
 
-def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_PATH)
+def _conn() -> db.Conn:
+    c = db.connect()
     c.execute(
         """CREATE TABLE IF NOT EXISTS tenant_settings (
             tenant_id TEXT PRIMARY KEY,
@@ -86,7 +85,7 @@ def _conn() -> sqlite3.Connection:
         )"""
     )
     # Idempotent migration for DBs created before these columns existed.
-    have = {row[1] for row in c.execute("PRAGMA table_info(tenant_settings)")}
+    have = db.table_columns(c, "tenant_settings")
     for col, decl in _ADDED_COLUMNS.items():
         if col not in have:
             c.execute(f"ALTER TABLE tenant_settings ADD COLUMN {col} {decl}")

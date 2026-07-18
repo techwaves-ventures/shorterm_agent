@@ -1,3 +1,7 @@
+# Full dependency set for local dev + any host that scrapes (worker/Render/Fly).
+# For Vercel serverless, the slimmer api/requirements.txt is used instead (no
+# playwright — it can't run there). psycopg powers the hosted-Postgres path
+# (DATABASE_URL); SQLite (the default) needs nothing extra.
 playwright>=1.48.0
 python-dotenv>=1.0.0
 requests>=2.31.0
@@ -7,3 +11,4 @@ cryptography>=42
 anthropic>=0.40
 stripe>=9.0
 gunicorn>=21.0
+psycopg[binary]>=3.1

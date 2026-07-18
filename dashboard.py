@@ -55,8 +55,34 @@ if not app.secret_key:
     # insecure default — set SECRET_KEY in .env (see .env.example).
     raise RuntimeError("SECRET_KEY not set in .env — required for login sessions.")
 
-# Provision the operator tenant + login (from OPERATOR_EMAIL/PASSWORD) on boot.
-models.ensure_operator()
+
+def public_signup_enabled() -> bool:
+    return os.getenv("PUBLIC_SIGNUP_ENABLED", "").strip().lower() in ("1", "true", "yes")
+
+def _bootstrap_on_boot() -> None:
+    """Provision the operator (and optionally seed demo data) at startup.
+
+    Wrapped in try/except so a transient DB outage at a serverless cold start
+    doesn't crash the whole function — the app still boots and /healthz reports
+    `db: false` (503) until the DB recovers, instead of failing to import.
+    Provisioning is idempotent and can also be run explicitly via
+    `python manage.py init`.
+    """
+    try:
+        models.ensure_operator()
+        # Opt-in one-time demo seed for hosted instances (e.g. Vercel), where
+        # running a CLI is awkward. Set SEED_DEMO_ON_BOOT=1. Idempotent: only
+        # seeds when the demo tenant doesn't exist yet.
+        if os.getenv("SEED_DEMO_ON_BOOT", "").strip().lower() in ("1", "true", "yes"):
+            import seed_demo
+
+            if not models.get_user_by_email(seed_demo.DEMO_EMAIL):
+                seed_demo.seed_demo()
+    except Exception:
+        app.logger.exception("Boot bootstrap failed (DB unreachable?); continuing.")
+
+
+_bootstrap_on_boot()
 
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
@@ -179,7 +205,7 @@ def login():
         title="Log in",
         subtitle="Sign in to your dashboard.",
         action=url_for("login"),
-        alt_text='No account? <a href="%s">Sign up</a>' % url_for("signup"),
+        alt_text='Need access? <a href="%s">Contact us</a>' % (url_for("landing") + "#pilot"),
     )
 
 
@@ -187,6 +213,9 @@ def login():
 def signup():
     if current_user.is_authenticated:
         return redirect(url_for("index"))
+    if not public_signup_enabled():
+        flash("Public signup is closed for now. Request access and we'll set you up.")
+        return redirect(url_for("landing") + "#pilot")
     if request.method == "POST":
         email = (request.form.get("email") or "").strip().lower()
         password = request.form.get("password") or ""

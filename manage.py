@@ -1,6 +1,7 @@
 """Admin CLI for the multi-tenant dashboard.
 
     python manage.py bootstrap                 # ensure operator tenant + login (from .env)
+    python manage.py init                      # hosted one-shot: operator + demo seed data
     python manage.py set-password <email>      # set/reset a user's password (prompts)
     python manage.py create-user <email>       # create a new tenant + user (prompts)
     python manage.py list-users                # show all users and their tenants
@@ -58,21 +59,37 @@ def cmd_create_user(email: str) -> None:
 
 
 def cmd_list_users() -> None:
-    import sqlite3
+    import db
 
-    from storage import DB_PATH
-
-    c = sqlite3.connect(DB_PATH)
-    rows = c.execute(
-        "SELECT u.id, u.email, u.tenant_id, t.is_operator, t.name "
-        "FROM users u JOIN tenants t ON t.id = u.tenant_id ORDER BY u.id"
-    ).fetchall()
+    with db.connect() as c:
+        rows = c.execute(
+            "SELECT u.id, u.email, u.tenant_id, t.is_operator, t.name "
+            "FROM users u JOIN tenants t ON t.id = u.tenant_id ORDER BY u.id"
+        ).fetchall()
     if not rows:
         print("No users yet.")
         return
     for uid, email, tid, is_op, name in rows:
         tag = " [operator]" if is_op else ""
         print(f"#{uid}  {email}  → tenant {tid} ({name}){tag}")
+
+
+def cmd_init() -> None:
+    """One-shot hosted bootstrap: operator tenant/login + demo seed data.
+
+    Run once against a fresh hosted DB (DATABASE_URL set) to make the instance
+    demo-ready: `python manage.py init`. Idempotent — safe to re-run.
+    """
+    import db
+
+    print(f"Database backend: {db.backend()}")
+    models.ensure_operator()
+    import seed_demo
+
+    email, tid = seed_demo.seed_demo()
+    print(f"Operator tenant ready (tenant {models.OPERATOR_TENANT_ID}).")
+    print(f"Demo tenant ready: {email} (tenant {tid}).")
+    print(f"Demo login password: {seed_demo.DEMO_PASSWORD}")
 
 
 def main() -> None:
@@ -82,6 +99,8 @@ def main() -> None:
     cmd, rest = args[0], args[1:]
     if cmd == "bootstrap":
         cmd_bootstrap()
+    elif cmd == "init":
+        cmd_init()
     elif cmd == "set-password":
         if not rest:
             sys.exit("Usage: python manage.py set-password <email>")

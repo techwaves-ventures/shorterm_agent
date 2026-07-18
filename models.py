@@ -9,21 +9,21 @@ Sending/scraping is gated to the operator until Phase 3 gives each tenant its ow
 FurnishedFinder login; see dashboard.py.
 """
 import os
-import sqlite3
 
 from flask_login import UserMixin
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import config
-from storage import DB_PATH
+import db
 
 OPERATOR_TENANT_ID = "1"
 
 
-def _conn() -> sqlite3.Connection:
+def _conn() -> db.Conn:
     """Open the shared DB and ensure the auth tables exist (idempotent)."""
-    c = sqlite3.connect(DB_PATH)
-    c.execute("PRAGMA foreign_keys = ON")
+    c = db.connect()
+    if not c.pg:
+        c.execute("PRAGMA foreign_keys = ON")  # Postgres enforces FKs natively
     c.execute(
         """CREATE TABLE IF NOT EXISTS tenants (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,8 +72,14 @@ _USER_SELECT = (
 
 
 def get_user_by_id(user_id) -> User | None:
+    # users.id is an integer column; Postgres (unlike SQLite) won't compare it
+    # against a string param, and Flask-Login hands back the id as a string.
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return None
     with _conn() as c:
-        row = c.execute(f"{_USER_SELECT} WHERE u.id=?", (user_id,)).fetchone()
+        row = c.execute(f"{_USER_SELECT} WHERE u.id=?", (uid,)).fetchone()
     return _row_to_user(row)
 
 
@@ -107,10 +113,9 @@ def create_user(email: str, password: str, tenant_name: str | None = None) -> Us
     name = (tenant_name or email.split("@")[0]).strip() or email
     pw_hash = generate_password_hash(password)
     with _conn() as c:
-        cur = c.execute(
-            "INSERT INTO tenants (name, is_operator) VALUES (?, 0)", (name,)
+        tenant_id = db.insert_returning_id(
+            c, "INSERT INTO tenants (name, is_operator) VALUES (?, 0)", (name,)
         )
-        tenant_id = cur.lastrowid
         c.execute(
             "INSERT INTO users (tenant_id, email, password_hash) VALUES (?,?,?)",
             (tenant_id, email, pw_hash),
@@ -140,17 +145,20 @@ def ensure_operator() -> None:
     All pre-existing lead data is attached to tenant 1 via the DEFAULT '1' on the
     storage tenant_id columns, so this just needs the tenant row + a login.
     """
+    # tenants.id is integer; pass an int so Postgres accepts the comparison and
+    # the forced-id insert (SQLite is dynamically typed and wouldn't care).
+    op_id = int(OPERATOR_TENANT_ID)
     with _conn() as c:
-        row = c.execute(
-            "SELECT id FROM tenants WHERE id=?", (OPERATOR_TENANT_ID,)
-        ).fetchone()
+        row = c.execute("SELECT id FROM tenants WHERE id=?", (op_id,)).fetchone()
         if not row:
             name = (os.getenv("HOST_NAME") or "Operator").strip()
             # Force id=1 so it matches storage's DEFAULT '1' backfill.
             c.execute(
                 "INSERT INTO tenants (id, name, is_operator) VALUES (?, ?, 1)",
-                (OPERATOR_TENANT_ID, name),
+                (op_id, name),
             )
+            # Keep Postgres' sequence ahead of the forced id (no-op on SQLite).
+            db.sync_serial(c, "tenants")
     # Seed the operator's config from the legacy global files/env (idempotent —
     # won't clobber edits once a settings row exists).
     config.seed_tenant(OPERATOR_TENANT_ID, from_legacy=True)

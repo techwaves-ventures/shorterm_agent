@@ -6,15 +6,14 @@ is the per-tenant browser profile on disk (see check_leads._profile_dir); this
 table just records which email a tenant connected and that they consented to
 automated access.
 """
-import sqlite3
 from datetime import datetime
 
 import crypto
-from storage import DB_PATH
+import db
 
 
-def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_PATH)
+def _conn() -> db.Conn:
+    c = db.connect()
     c.execute(
         """CREATE TABLE IF NOT EXISTS ff_accounts (
             tenant_id TEXT PRIMARY KEY,

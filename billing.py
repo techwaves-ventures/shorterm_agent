@@ -13,7 +13,6 @@ Design goals for the demo SaaS:
 Routes are exposed as a Flask blueprint (`billing_bp`) registered in dashboard.py.
 """
 import os
-import sqlite3
 from datetime import datetime
 
 from flask import (
@@ -27,7 +26,7 @@ from flask import (
 )
 from flask_login import current_user, login_required
 
-from storage import DB_PATH
+import db
 
 # Optional dependency — the app must import and run without `stripe` installed.
 try:
@@ -107,8 +106,8 @@ def _init_stripe() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_PATH)
+def _conn() -> db.Conn:
+    c = db.connect()
     c.execute(
         """CREATE TABLE IF NOT EXISTS subscriptions (
             tenant_id TEXT PRIMARY KEY,
