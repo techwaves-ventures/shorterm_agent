@@ -110,7 +110,7 @@
 <body>
   {% set nav_active = 'dashboard' %}
   {% set nav_extra %}
-    {% if ff_status and ff_status.masked_email %}<span class="badge">FF · {{ ff_status.masked_email }}</span>{% elif is_operator %}<span class="badge">FurnishedFinder</span>{% endif %}
+    {% if ff_status and ff_status.masked_email %}<span class="badge">FF · {{ ff_status.masked_email }}{% if not ff_status.connected %} · unverified{% endif %}</span>{% elif is_operator %}<span class="badge">FurnishedFinder</span>{% endif %}
     {% if can_scrape %}<button id="refresh-btn" class="btn btn--primary btn--sm" onclick="startRefresh()">Check now</button>{% endif %}
   {% endset %}
   {% include "_appnav.html" %}
@@ -148,6 +148,18 @@
       {% endif %}
     </div>
   {% else %}
+    {% if not is_operator and ff_status and ff_status.state != 'connected' %}
+    <div class="apikey-note" style="border-color: var(--warn-soft);">
+      {% if ff_status.state == 'error' %}
+        ⚠️ {{ ff_status.last_error or 'The last connection attempt didn’t finish.' }}
+        Click <b>Check now</b> to retry — you’ll enter the one-time code FurnishedFinder emails you.
+      {% else %}
+        Your FurnishedFinder email{% if ff_status.masked_email %} (<code>{{ ff_status.masked_email }}</code>){% endif %}
+        is saved but <b>not verified yet</b>. Click <b>Check now</b> to log in and enter the
+        one-time code FurnishedFinder emails you — your leads load once verification completes.
+      {% endif %}
+    </div>
+    {% endif %}
     <div id="banner" class="banner">
       <div class="spinner" id="spinner"></div>
       <span id="banner-msg">Idle</span>

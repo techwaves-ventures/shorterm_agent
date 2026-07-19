@@ -51,6 +51,15 @@ log = logging.getLogger("check_leads")
 PROFILE_DIR = Path(__file__).parent / "browser_profile"
 
 
+def playwright_available() -> bool:
+    """True when Playwright (and thus live scraping) can run in this process.
+
+    False on serverless hosts like Vercel, where the app routes scrapes to a
+    worker via the shared DB instead of running them in-process.
+    """
+    return sync_playwright is not None
+
+
 def _require_playwright():
     """Raise a clear error when a scrape is attempted without Playwright."""
     if sync_playwright is None:
