@@ -1,6 +1,8 @@
 # Keep the Vercel upload lean and free of local runtime state.
 .venv/
+.venv-worker/
 __pycache__/
+.pytest_cache/
 *.pyc
 *.pyo
 
