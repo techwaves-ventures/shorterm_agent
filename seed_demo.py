@@ -139,11 +139,14 @@ def seed_demo() -> tuple[str, str]:
     billing.set_subscription(tenant_id, plan="pro", status="active", demo=1)
 
     # Connect a fake FF account so the seeded leads/drafts are visible on the
-    # dashboard (the leads view unlocks once an account is connected). Requires
-    # FF_CRED_KEY — skipped gracefully if encryption isn't configured.
-    if crypto.available() and not ff_account.is_connected(tenant_id):
+    # dashboard (the leads view unlocks once an account is linked). This is
+    # illustrative demo data — no real FF session exists — so we also mark it
+    # verified to present the demo cleanly. Requires FF_CRED_KEY; skipped
+    # gracefully if encryption isn't configured.
+    if crypto.available() and not ff_account.has_account(tenant_id):
         try:
             ff_account.connect(tenant_id, "demo-host@example.test")
+            ff_account.mark_state(tenant_id, ff_account.CONNECTED)
         except (ValueError, RuntimeError):
             pass
 

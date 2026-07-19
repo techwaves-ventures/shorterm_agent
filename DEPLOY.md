@@ -98,27 +98,45 @@ Keep `sslmode=require` in the URL for all three.
 - Demo path: landing `/` → **Log in** → demo dashboard with seeded leads/drafts →
   Settings / Billing (demo mode).
 
-### ⚠️ Vercel limitation: no live scraping / browser automation
+### ⚠️ Vercel can't run the browser — scraping is worker-backed via the shared DB
 
 Live FurnishedFinder scraping and platform sends use Playwright + a real Chrome,
 which **cannot run on Vercel serverless** (no browser, read-only FS, short
-execution limits). On Vercel the app boots fine and the whole demo SaaS surface
-works (landing/auth/onboarding/settings/billing/demo data), but the scrape/send
-routes return a clear "Playwright not available" error instead of running.
+execution limits). So Vercel never runs Playwright in-process. Instead:
 
-**Recommended follow-up for real scraping:** run the scraper off Vercel on a
-worker/host that has Playwright + Chromium and shares the same `DATABASE_URL`:
+- **"Check now" on Vercel enqueues a job** in the shared Postgres (`ff_jobs`,
+  see `jobs.py`) rather than scraping inline. The dashboard shows an honest
+  status — *queued*, *worker offline*, *waiting for your one-time code*,
+  *checking*, *done*, or a friendly *failed* — never a raw runtime/stack error.
+- **A worker on a browser-capable host drains that queue.** Run `worker.py` on
+  any host that has Playwright + Chromium and shares the **same** `DATABASE_URL`
+  as the Vercel app. It claims queued jobs, runs the live scrape, writes leads
+  into the shared Postgres (so the Vercel dashboard renders them), and bridges
+  the tenant's OTP back through the DB (encrypted, consumed once, never logged).
 
-- A small always-on worker (Render/Fly/VM) running `python check_leads.py --loop
-  300`, or the systemd timer in this repo (`deploy/str-leads-check.timer`), or a
-  scheduled job — all writing leads into the shared Postgres so the Vercel
-  dashboard renders them.
-- Email sends (SMTP) already work anywhere; only the *platform*-channel send
-  needs the browser. Human-in-the-loop send posture is unchanged — nothing
-  auto-sends.
+```bash
+# On a small always-on VM / Render worker / Fly machine (NOT Vercel):
+pip install -r requirements.txt
+playwright install --with-deps chrome
+DATABASE_URL='postgres://…?sslmode=require' \
+  SECRET_KEY=… FF_CRED_KEY=… \
+  python worker.py            # polls forever; --once drains the queue and exits
+```
 
-This split (Vercel = dashboard/UI, worker = browser jobs, shared Postgres) is
-tracked as the recommended production topology.
+The `Procfile` declares this as the `worker:` process; a Render/Fly worker
+service or a systemd unit can run the same command. Until a worker is online the
+UI says so (jobs stay *queued*), so nothing looks connected that isn't.
+
+**Connection honesty:** saving a FurnishedFinder email lands the account in
+`needs_verification` — it is **not** shown as connected. The first successful
+worker scrape (a real OTP login) is what flips it to `connected`. See
+`ff_account.py`.
+
+Email sends (SMTP) already work anywhere; only the *platform*-channel send needs
+the browser. Human-in-the-loop send posture is unchanged — nothing auto-sends.
+
+This split (Vercel = dashboard/UI, `worker.py` = browser jobs, shared Postgres)
+is the recommended production topology.
 
 ## Deploy on Render (blueprint)
 

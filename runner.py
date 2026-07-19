@@ -130,16 +130,33 @@ def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]
             )
 
 
+def _mark_ff_state(tenant_id: str, state: str, error: str | None = None) -> None:
+    """Mirror the run outcome into the tenant's FF account state so a connection
+    only reads as `connected` after a real scrape/login succeeds. No-op for the
+    operator (tenant '1'), which has no ff_accounts row."""
+    if str(tenant_id) == "1":
+        return
+    try:
+        ff_account.mark_state(tenant_id, state, error=error)
+    except Exception:
+        log.exception("Could not update FF account state to %s", state)
+
+
 def _worker(tenant_id: str) -> None:
     username = _ff_username(tenant_id)
     furnishedfinder.set_context(username, _otp_provider(tenant_id), _status_cb)
+    _mark_ff_state(tenant_id, ff_account.VERIFYING)
     try:
         counts = check_leads.run_scrape(
             status_cb=_status_cb, on_new_items=_draft_new_items, tenant_id=tenant_id
         )
+        # A completed scrape means a real FF session was established.
+        _mark_ff_state(tenant_id, ff_account.CONNECTED)
         _set(status="done", message="Done.", counts=counts, running=False)
     except Exception as e:
         log.exception("Scrape failed")
+        _mark_ff_state(tenant_id, ff_account.ERROR,
+                       error="Couldn't verify your FurnishedFinder login. Please try Check now again.")
         _set(status="error", message=str(e), running=False)
     finally:
         furnishedfinder.clear_context()

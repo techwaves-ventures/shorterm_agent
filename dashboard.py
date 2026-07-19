@@ -36,9 +36,11 @@ from flask_login import (
 )
 
 import billing
+import check_leads
 import config
 import crypto
 import ff_account
+import jobs
 import models
 import responder
 import runner
@@ -97,9 +99,22 @@ def load_user(user_id):
 
 
 def _can_scrape() -> bool:
-    """A tenant may scrape/send once they've connected an FF account; the
+    """A tenant may attempt a scrape/verification once they've linked an FF email
+    (even before it's verified — that first Check now IS the verification); the
     operator is grandfathered in via the FF_USERNAME env."""
-    return current_user.is_operator or ff_account.is_connected(current_user.tenant_id)
+    return current_user.is_operator or ff_account.has_account(current_user.tenant_id)
+
+
+def _live_state(tenant_id: str) -> dict:
+    """Runner-compatible run state for the UI.
+
+    On a host with Playwright (local/worker-host dashboard) the scrape runs
+    in-process, so the live state comes from the runner. On serverless (Vercel,
+    no Playwright) scrapes are worker-backed via the shared DB, so the state is
+    projected from the tenant's latest job. Same shape either way."""
+    if check_leads.playwright_available():
+        return runner.get_state(tenant_id)
+    return jobs.public_state(tenant_id)
 
 
 def scrape_allowed(fn):
@@ -263,7 +278,7 @@ def index():
         crypto_ready=crypto.available(),
         leads=data["leads"],
         messages=data["messages"],
-        state=runner.get_state(current_user.tenant_id),
+        state=_live_state(current_user.tenant_id),
         has_api_key=bool(os.getenv("ANTHROPIC_API_KEY")),
         billing_label=billing.status_label(billing.get_subscription(current_user.tenant_id)),
     )
@@ -278,23 +293,35 @@ def api_data():
 @app.route("/api/status")
 @login_required
 def api_status():
-    return jsonify(runner.get_state(current_user.tenant_id))
+    return jsonify(_live_state(current_user.tenant_id))
 
 
 @app.route("/refresh", methods=["POST"])
 @login_required
 @scrape_allowed
 def refresh():
-    return jsonify(runner.start_scrape(current_user.tenant_id))
+    tenant_id = current_user.tenant_id
+    if check_leads.playwright_available():
+        # Browser is available here: run the scrape in-process (local/worker host).
+        return jsonify(runner.start_scrape(tenant_id))
+    # Serverless (Vercel): can't run Playwright in-process. Enqueue a job for the
+    # off-Vercel worker that shares this DB, and report the worker-backed state.
+    jobs.enqueue(tenant_id)
+    return jsonify(_live_state(tenant_id))
 
 
 @app.route("/otp", methods=["POST"])
 @login_required
 @scrape_allowed
 def otp():
+    tenant_id = current_user.tenant_id
     code = request.form.get("code", "") or (request.json or {}).get("code", "")
-    ok = runner.submit_otp(current_user.tenant_id, code)
-    return jsonify({"ok": ok, "state": runner.get_state(current_user.tenant_id)})
+    if check_leads.playwright_available():
+        ok = runner.submit_otp(tenant_id, code)
+    else:
+        # Route the code to the tenant's active worker job via the shared DB.
+        ok = jobs.submit_otp(tenant_id, code)
+    return jsonify({"ok": ok, "state": _live_state(tenant_id)})
 
 
 def _form(*keys):
@@ -377,7 +404,8 @@ def connect():
     except (ValueError, RuntimeError) as e:
         flash(str(e))
         return redirect(url_for("index"))
-    flash("FurnishedFinder account connected — click “Check now” to fetch your leads.")
+    flash("FurnishedFinder email saved. It's not verified yet — click “Check now” to "
+          "log in and enter the one-time code FurnishedFinder emails you.")
     return redirect(url_for("index"))
 
 
@@ -445,7 +473,11 @@ def onboarding():
                 except (ValueError, RuntimeError) as e:
                     flash(f"FurnishedFinder not connected: {e}")
         config.mark_onboarded(tenant_id)
-        flash("You're all set. Click “Check now” to fetch your first leads.")
+        if ff_email and request.form.get("ff_consent") and crypto.available():
+            flash("You're set up. Your FurnishedFinder email is saved but not verified yet — "
+                  "click “Check now” to log in and enter the one-time code they email you.")
+        else:
+            flash("You're all set. Connect FurnishedFinder to start fetching leads.")
         return redirect(url_for("index"))
 
     f = {
@@ -468,6 +500,7 @@ def onboarding():
 def disconnect():
     """Remove the tenant's connected FurnishedFinder account."""
     ff_account.disconnect(current_user.tenant_id)
+    jobs.cancel_active(current_user.tenant_id)  # abandon any in-flight worker job
     flash("FurnishedFinder account disconnected.")
     return redirect(url_for("settings"))
 
