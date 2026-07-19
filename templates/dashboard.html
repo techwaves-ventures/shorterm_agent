@@ -149,7 +149,7 @@
     </div>
   {% else %}
     {% if not is_operator and ff_status and ff_status.state != 'connected' %}
-    <div class="apikey-note" style="border-color: var(--warn-soft);">
+    <div class="apikey-note" id="ff-verification-note" style="border-color: var(--warn-soft);">
       {% if ff_status.state == 'error' %}
         ⚠️ {{ ff_status.last_error or 'The last connection attempt didn’t finish.' }}
         Click <b>Check now</b> to retry — you’ll enter the one-time code FurnishedFinder emails you.
@@ -484,6 +484,7 @@
       const otpRow = document.getElementById("otp-row");
       const btn = document.getElementById("refresh-btn");
       const spinner = document.getElementById("spinner");
+      const verificationNote = document.getElementById("ff-verification-note");
 
       const active = ACTIVE.includes(s.status);
       banner.classList.toggle("show", s.status !== "idle");
@@ -491,6 +492,7 @@
       spinner.style.display = active ? "block" : "none";
       msg.textContent = s.message || s.status;
       otpRow.classList.toggle("show", s.status === "waiting_for_otp");
+      if (verificationNote) verificationNote.style.display = active ? "none" : "";
       btn.disabled = active;
       btn.textContent = active ? "Checking…" : "Check now";
       if (s.status === "waiting_for_otp") document.getElementById("otp-input").focus();
