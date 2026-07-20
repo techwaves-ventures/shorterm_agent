@@ -149,7 +149,7 @@ For deployments that need an HTTP wake hook in front of the browser worker,
 run `chrome_task_server.py` on the browser-capable VM. It is a deliberately
 narrow Flask service, not a browser automation API:
 
-- VM bind used for direct callers: `0.0.0.0:6756`
+- VM bind used for direct callers: all interfaces on port `6756`
 - no `/docs` or OpenAPI surface
 - `GET /healthz` is signed-auth only; unauthenticated callers get 401
 - `POST /v1/wake` only claims existing queued DB jobs; it never accepts URLs,
