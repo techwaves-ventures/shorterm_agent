@@ -151,7 +151,10 @@ def wake():
     if error:
         return error
 
-    max_jobs = int(payload.get("max_jobs", 1) if payload else 1)
+    try:
+        max_jobs = int(payload.get("max_jobs", 1) if payload else 1)
+    except (TypeError, ValueError):
+        return _json_error(400, "max_jobs must be an integer")
     max_jobs = max(0, min(max_jobs, MAX_JOBS_PER_WAKE))
     if max_jobs < 1:
         return _json_error(400, "max_jobs must be at least 1")
@@ -172,6 +175,17 @@ def wake():
 @app.errorhandler(404)
 def not_found(_exc):
     return _json_error(404, "not found")
+
+
+@app.errorhandler(405)
+def method_not_allowed(_exc):
+    return _json_error(405, "method not allowed")
+
+
+@app.errorhandler(500)
+def internal_error(_exc):
+    log.exception("Unhandled Chrome task server error")
+    return _json_error(500, "internal server error")
 
 
 def main() -> None:

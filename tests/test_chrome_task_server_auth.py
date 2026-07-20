@@ -45,6 +45,9 @@ def test_health_and_no_docs():
     )).status_code == 200
     assert client.get("/docs").status_code == 404
     assert client.get("/openapi.json").status_code == 404
+    res = client.get("/v1/wake")
+    assert res.status_code == 405
+    assert res.is_json
 
 
 def test_wake_requires_auth():
@@ -87,3 +90,18 @@ def test_wake_rejects_replayed_nonce(monkeypatch):
     headers = _signed_headers(body=body, nonce="nonce-replay")
     assert client.post("/v1/wake", data=body, headers=headers).status_code == 200
     assert client.post("/v1/wake", data=body, headers=headers).status_code == 401
+
+
+def test_wake_rejects_invalid_max_jobs(monkeypatch):
+    monkeypatch.setattr(chrome_task_server.worker, "run_once", lambda _worker_id: False)
+    monkeypatch.setattr(chrome_task_server.jobs, "worker_online", lambda: True)
+
+    client = chrome_task_server.app.test_client()
+    body = b'{"max_jobs":"abc"}'
+    res = client.post(
+        "/v1/wake",
+        data=body,
+        headers=_signed_headers(body=body, nonce="nonce-bad-max"),
+    )
+    assert res.status_code == 400
+    assert "max_jobs" in res.get_json()["error"]
