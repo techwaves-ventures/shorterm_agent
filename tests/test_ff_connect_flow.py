@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import check_leads  # noqa: E402
 import ff_account  # noqa: E402
 import jobs  # noqa: E402
+from sites import furnishedfinder  # noqa: E402
 
 _FAILURES: list[str] = []
 
@@ -196,11 +197,41 @@ def test_serverless_refresh_routing():
         check_leads.sync_playwright = saved
 
 
+def test_cloudflare_challenge_is_fatal():
+    print("test_cloudflare_challenge_is_fatal")
+
+    class Body:
+        def inner_text(self, timeout=0):
+            return "Attention Required! | Cloudflare\nCloudflare Ray ID: test"
+
+    class FakePage:
+        url = "https://www.furnishedfinder.com/members/tenant-lead"
+
+        def title(self):
+            return "Attention Required! | Cloudflare"
+
+        def locator(self, selector):
+            return Body()
+
+    err = None
+    try:
+        furnishedfinder._raise_if_blocked(FakePage(), "test")
+    except Exception as e:
+        err = e
+    check(isinstance(err, furnishedfinder.FurnishedFinderBlocked),
+          "Cloudflare challenge raises a FurnishedFinderBlocked error")
+    check(getattr(err, "fatal_scrape", False) is True,
+          "Cloudflare challenge is fatal for the worker job")
+    check("security challenge" in getattr(err, "user_safe_message", ""),
+          "Cloudflare error has a UI-safe message")
+
+
 if __name__ == "__main__":
     test_connect_states()
     test_jobs_queue()
     test_public_state()
     test_serverless_refresh_routing()
+    test_cloudflare_challenge_is_fatal()
     print()
     if _FAILURES:
         print(f"{len(_FAILURES)} FAILURE(S):")

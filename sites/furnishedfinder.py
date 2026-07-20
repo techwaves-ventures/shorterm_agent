@@ -37,6 +37,20 @@ STATUS_CB = None
 _CONTEXT: dict | None = None
 
 
+class FurnishedFinderBlocked(RuntimeError):
+    """Raised when FurnishedFinder serves a bot/security challenge page."""
+
+    fatal_scrape = True
+    user_safe_message = (
+        "FurnishedFinder blocked the browser check with a security challenge. "
+        "The worker/browser access needs to be adjusted before verification can complete."
+    )
+
+    def __init__(self, context: str):
+        super().__init__(self.user_safe_message)
+        self.context = context
+
+
 def set_context(username: str, otp_provider=None, status_cb=None) -> None:
     """Bind the FF account for the next run. `otp_provider()` (if given) is called
     to obtain an OTP code (blocking) instead of polling the global ./OTP_CODE.
@@ -139,9 +153,42 @@ def _prompt_for_otp() -> str:
     raise RuntimeError("Timed out waiting for OTP.")
 
 
+def _body_text_sample(page: Page) -> str:
+    try:
+        return (page.locator("body").inner_text(timeout=1500) or "")[:4000]
+    except Exception:
+        return ""
+
+
+def _cloudflare_challenge_reason(page: Page) -> str:
+    title = ""
+    try:
+        title = (page.title() or "").strip()
+    except Exception:
+        pass
+    url = (getattr(page, "url", "") or "").strip()
+    body = _body_text_sample(page)
+    haystack = "\n".join([title, url, body]).lower()
+    if "attention required" in haystack and "cloudflare" in haystack:
+        return f"title={title!r} url={url!r}"
+    if "cloudflare ray id" in haystack:
+        return f"title={title!r} url={url!r}"
+    if "checking if the site connection is secure" in haystack:
+        return f"title={title!r} url={url!r}"
+    return ""
+
+
+def _raise_if_blocked(page: Page, context: str) -> None:
+    reason = _cloudflare_challenge_reason(page)
+    if reason:
+        log.warning("FurnishedFinder security challenge during %s: %s", context, reason)
+        raise FurnishedFinderBlocked(context)
+
+
 def _open_login_modal(page: Page) -> None:
     page.goto(HOME_URL, wait_until="domcontentloaded")
     page.wait_for_timeout(2500)
+    _raise_if_blocked(page, "login home")
     page.evaluate("document.querySelector('#nav-login')?.click()")
     page.wait_for_selector("input#username", timeout=10000)
 
@@ -200,6 +247,7 @@ def _session_ok(page: Page) -> bool:
     page.goto(LEADS_URL, wait_until="domcontentloaded")
     page.wait_for_timeout(2500)
     log.info("Session probe: %s (title=%r)", page.url, page.title())
+    _raise_if_blocked(page, "session probe")
     title = (page.title() or "").strip()
     if not title or "403" in title:
         return False
@@ -582,6 +630,7 @@ def check(page: Page) -> list[dict]:
     page.goto(LEADS_URL, wait_until="domcontentloaded")
     page.wait_for_timeout(3000)
     log.info("Leads page: %s (title=%r)", page.url, page.title())
+    _raise_if_blocked(page, "leads page")
     for it in _extract_leads(page):
         it["kind"] = "lead"
         out.append(it)
@@ -589,6 +638,7 @@ def check(page: Page) -> list[dict]:
     page.goto(MESSAGES_URL, wait_until="domcontentloaded")
     page.wait_for_timeout(3000)
     log.info("Messages page: %s (title=%r)", page.url, page.title())
+    _raise_if_blocked(page, "messages page")
     for it in _extract_messages(page):
         it["kind"] = "message"
         out.append(it)

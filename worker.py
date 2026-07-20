@@ -104,10 +104,12 @@ def process(job: dict) -> None:
         jobs.set_status(job_id, jobs.DONE, "Done — leads updated.", counts=json.dumps(counts))
         _mark_ff(tenant_id, ff_account.CONNECTED)
         log.info("Job %s done (counts=%s)", job_id, counts)
-    except Exception:
+    except Exception as exc:
         # Log full detail server-side; show the customer a friendly message only.
         log.exception("Job %s failed", job_id)
-        friendly = "Couldn't verify your FurnishedFinder login. Please try Check now again."
+        friendly = getattr(exc, "user_safe_message", None) or (
+            "Couldn't verify your FurnishedFinder login. Please try Check now again."
+        )
         jobs.set_status(job_id, jobs.ERROR, friendly)
         _mark_ff(tenant_id, ff_account.ERROR, error=friendly)
     finally:

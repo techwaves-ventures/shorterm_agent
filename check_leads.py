@@ -147,6 +147,8 @@ def run_scrape(status_cb=None, on_new_items=None, tenant_id: str = "1") -> dict:
                 items = site.check(page)
             except Exception as e:
                 log.exception("Site %s failed: %s", name, e)
+                if getattr(e, "fatal_scrape", False):
+                    raise
                 continue
 
             log.info("%s: %d items visible", name, len(items))
