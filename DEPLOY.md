@@ -149,8 +149,9 @@ For deployments that need an HTTP wake hook in front of the browser worker,
 run `chrome_task_server.py` on the browser-capable VM. It is a deliberately
 narrow Flask service, not a browser automation API:
 
-- default bind: `127.0.0.1:6756`
+- VM bind used for direct callers: `0.0.0.0:6756`
 - no `/docs` or OpenAPI surface
+- `GET /healthz` is signed-auth only; unauthenticated callers get 401
 - `POST /v1/wake` only claims existing queued DB jobs; it never accepts URLs,
   scripts, selectors, or arbitrary commands
 - every wake request requires:
@@ -165,7 +166,7 @@ narrow Flask service, not a browser automation API:
 Required env for the VM service, stored outside git:
 
 ```bash
-CHROME_TASK_HOST=127.0.0.1
+CHROME_TASK_HOST=0.0.0.0
 CHROME_TASK_PORT=6756
 CHROME_TASK_BEARER_TOKEN=...
 CHROME_TASK_HMAC_KEY=...
@@ -180,9 +181,9 @@ systemctl --user daemon-reload
 systemctl --user enable --now shorterm-chrome-task-server.service
 ```
 
-Keep the service loopback-only unless a TLS tunnel/reverse proxy is added with
-the same bearer+HMAC requirement at the origin. Do not expose a raw browser
-command endpoint.
+When binding publicly, keep the same bearer+HMAC requirement at the origin and
+expose only this narrow service port. Do not expose a raw browser command
+endpoint.
 
 ## Deploy on Render (blueprint)
 

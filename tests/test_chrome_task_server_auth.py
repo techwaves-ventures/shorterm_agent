@@ -23,10 +23,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 chrome_task_server = importlib.import_module("chrome_task_server")
 
 
-def _signed_headers(path="/v1/wake", body=b'{"max_jobs":1}', nonce="nonce-1"):
+def _signed_headers(path="/v1/wake", method="POST", body=b'{"max_jobs":1}', nonce="nonce-1"):
     ts = str(int(time.time()))
     digest = hashlib.sha256(body).hexdigest()
-    msg = "\n".join([ts, nonce, "POST", path, digest]).encode()
+    msg = "\n".join([ts, nonce, method, path, digest]).encode()
     sig = hmac.new(b"test-hmac-key", msg, hashlib.sha256).hexdigest()
     return {
         "Authorization": "Bearer test-bearer-token",
@@ -39,7 +39,10 @@ def _signed_headers(path="/v1/wake", body=b'{"max_jobs":1}', nonce="nonce-1"):
 
 def test_health_and_no_docs():
     client = chrome_task_server.app.test_client()
-    assert client.get("/healthz").status_code == 200
+    assert client.get("/healthz").status_code == 401
+    assert client.get("/healthz", headers=_signed_headers(
+        path="/healthz", method="GET", body=b"", nonce="nonce-health"
+    )).status_code == 200
     assert client.get("/docs").status_code == 404
     assert client.get("/openapi.json").status_code == 404
 

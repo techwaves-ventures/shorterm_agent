@@ -5,7 +5,7 @@ accept arbitrary URLs, scripts, or browser commands. A caller can only ask the
 server to claim existing authorized DB jobs that the web app already enqueued.
 
 Security posture:
-  - bind to loopback by default (127.0.0.1:6756)
+  - bind host is explicit in the service/env; public binds still require auth
   - no generated docs/OpenAPI surface (plain Flask)
   - bearer token plus HMAC signature, timestamp, and nonce replay protection
   - fail closed when auth env is missing
@@ -139,10 +139,10 @@ def require_auth() -> tuple[dict[str, Any] | None, Any | None]:
 
 @app.get("/healthz")
 def healthz():
-    # No secrets, no task visibility. This is intentionally minimal so local
-    # service managers can verify the process is alive.
-    status = 200 if _auth_configured() else 503
-    return jsonify({"ok": _auth_configured(), "service": "shorterm-chrome-task"}), status
+    _payload, error = require_auth()
+    if error:
+        return error
+    return jsonify({"ok": True, "service": "shorterm-chrome-task"})
 
 
 @app.post("/v1/wake")
