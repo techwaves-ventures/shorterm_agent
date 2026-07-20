@@ -496,7 +496,10 @@
       btn.disabled = active;
       btn.textContent = active ? "Checking…" : "Check now";
       if (s.status === "waiting_for_otp") document.getElementById("otp-input").focus();
-      if (wasActive && !active) loadData();
+      if (wasActive && !active) {
+        loadData();
+        if (s.ff_status && s.ff_status.connected) window.location.reload();
+      }
       wasActive = active;
       return active;
     }

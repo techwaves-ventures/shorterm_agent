@@ -188,8 +188,11 @@ def test_serverless_refresh_routing():
         check(jobs.get_active(tid) is not None, "/refresh enqueued a job in the shared DB")
 
         r = client.get("/api/status")
-        check(r.get_json().get("status") in ("launching", "checking", "waiting_for_otp"),
+        status_body = r.get_json()
+        check(status_body.get("status") in ("launching", "checking", "waiting_for_otp"),
               "/api/status reflects the queued worker job")
+        check(status_body.get("ff_status", {}).get("state") == ff_account.NEEDS_VERIFICATION,
+              "/api/status includes current FF account verification state")
 
         r = client.post("/otp", data={"code": "999888"})
         check(r.get_json().get("ok") is True, "/otp routes the code to the active worker job")

@@ -303,7 +303,9 @@ def api_data():
 @app.route("/api/status")
 @login_required
 def api_status():
-    return jsonify(_live_state(current_user.tenant_id))
+    state = _live_state(current_user.tenant_id)
+    state["ff_status"] = ff_account.status(current_user.tenant_id)
+    return jsonify(state)
 
 
 @app.route("/refresh", methods=["POST"])
