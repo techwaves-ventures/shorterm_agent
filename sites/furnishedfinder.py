@@ -51,6 +51,18 @@ class FurnishedFinderBlocked(RuntimeError):
         self.context = context
 
 
+class FurnishedFinderLoginLinkRequired(RuntimeError):
+    """Raised when FF asks for an emailed magic link but the submitted value is not one."""
+
+    user_safe_message = (
+        "FurnishedFinder sent a magic login link, not a short code. "
+        "Click Check now again, then paste the full https://www.furnishedfinder.com/... link from the email."
+    )
+
+    def __init__(self):
+        super().__init__(self.user_safe_message)
+
+
 def set_context(username: str, otp_provider=None, status_cb=None) -> None:
     """Bind the FF account for the next run. `otp_provider()` (if given) is called
     to obtain an OTP code (blocking) instead of polling the global ./OTP_CODE.
@@ -86,13 +98,16 @@ def _mask_email(email: str) -> str:
     return f"{local[:1]}***@{domain}"
 
 
-def _prompt_for_otp() -> str:
+def _prompt_for_otp(prompt_message: str | None = None) -> str:
     import sys, time
     from pathlib import Path
 
+    prompt_message = prompt_message or (
+        "FurnishedFinder sent a login code or magic link to your email — enter it below."
+    )
     print("\n" + "=" * 60, flush=True)
-    print(">> FurnishedFinder sent an OTP to your email.", flush=True)
-    print(">> Write the code to ./OTP_CODE (or set OTP_CODE env var).", flush=True)
+    print(">> FurnishedFinder sent a login code/link to your email.", flush=True)
+    print(">> Write the code/link to ./OTP_CODE (or set OTP_CODE env var).", flush=True)
     print("=" * 60, flush=True)
 
     env_code = os.getenv("OTP_CODE", "").strip()
@@ -101,7 +116,7 @@ def _prompt_for_otp() -> str:
 
     if STATUS_CB:
         try:
-            STATUS_CB("waiting_for_otp", "FurnishedFinder sent an OTP to your email — enter it below.")
+            STATUS_CB("waiting_for_otp", prompt_message)
         except Exception:
             pass
 
@@ -153,11 +168,54 @@ def _prompt_for_otp() -> str:
     raise RuntimeError("Timed out waiting for OTP.")
 
 
+def _is_furnishedfinder_magic_link(value: str) -> bool:
+    value = (value or "").strip().lower()
+    return value.startswith("https://") and "furnishedfinder.com/" in value
+
+
+def _complete_magic_link_login(page: Page, login_link: str) -> None:
+    if not _is_furnishedfinder_magic_link(login_link):
+        raise FurnishedFinderLoginLinkRequired()
+    log.info("Opening FurnishedFinder magic login link")
+    page.goto(login_link.strip(), wait_until="domcontentloaded")
+    page.wait_for_timeout(5000)
+    _raise_if_blocked(page, "magic login link")
+    if not _session_ok(page):
+        raise RuntimeError("FurnishedFinder magic link did not establish a session.")
+
+
 def _body_text_sample(page: Page) -> str:
     try:
         return (page.locator("body").inner_text(timeout=1500) or "")[:4000]
     except Exception:
         return ""
+
+
+def _login_dialog_present(page: Page) -> bool:
+    """True when FF rendered the login dialog inside an otherwise OK page.
+
+    FurnishedFinder can keep the destination title/url (for example
+    "Tenant Leads") while showing only the login modal in the body. Treating
+    that as a live session makes the scraper parse the login shell as zero
+    leads, so the session probe must look at the rendered body too.
+    """
+    body = _body_text_sample(page).lower()
+    if (
+        "login to your account" in body
+        and ("forgot username or password" in body or "not a member yet" in body)
+    ):
+        return True
+    try:
+        if page.locator("input#username").first.is_visible(timeout=800):
+            return True
+    except Exception:
+        pass
+    try:
+        if page.locator('button[type="submit"]:has-text("Login")').first.is_visible(timeout=800):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _cloudflare_challenge_reason(page: Page) -> str:
@@ -213,7 +271,11 @@ def _login(page: Page) -> None:
     try:
         page.wait_for_selector(f"{otp_sel}, {pwd_sel}", timeout=25000)
     except PWTimeout:
-        raise RuntimeError("After username submit, neither OTP nor password field appeared.")
+        login_link = _prompt_for_otp(
+            "FurnishedFinder sent a magic login link to your email. Paste the full link here."
+        )
+        _complete_magic_link_login(page, login_link)
+        return
 
     if page.locator(pwd_sel).first.is_visible(timeout=1500):
         raise RuntimeError("Site asked for a password, not OTP.")
@@ -256,6 +318,8 @@ def _session_ok(page: Page) -> bool:
             return False
     except PWTimeout:
         pass
+    if _login_dialog_present(page):
+        return False
     return True
 
 

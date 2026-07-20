@@ -37,10 +37,23 @@ _COLS = (
 
 # A worker is considered online if it heartbeated within this window.
 WORKER_TTL_SECONDS = 90
+# After a failed login/check, do not immediately create another browser job.
+# This prevents repeated Check now clicks from spamming FurnishedFinder magic
+# login emails while still allowing an intentional retry after a short pause.
+ERROR_RETRY_COOLDOWN_SECONDS = 60
 
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _age_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return (datetime.now() - datetime.fromisoformat(str(value))).total_seconds()
+    except Exception:
+        return None
 
 
 def _conn() -> db.Conn:
@@ -93,6 +106,15 @@ def enqueue(tenant_id: str, kind: str = "scrape") -> dict:
     existing = get_active(tenant_id)
     if existing:
         return existing
+    recent = latest(tenant_id)
+    recent_age = _age_seconds((recent or {}).get("updated_at"))
+    if (
+        recent
+        and recent.get("status") == ERROR
+        and recent_age is not None
+        and recent_age < ERROR_RETRY_COOLDOWN_SECONDS
+    ):
+        return recent
     now = _now()
     with _conn() as c:
         job_id = db.insert_returning_id(
@@ -282,7 +304,7 @@ def public_state(tenant_id: str) -> dict:
                 "counts": {}, "running": True, "tenant_id": str(tenant_id), "updated_at": updated}
     if st == WAITING_FOR_OTP:
         return {"status": "waiting_for_otp",
-                "message": job.get("message") or "Enter the code FurnishedFinder emailed you.",
+                "message": job.get("message") or "Enter the code or magic login link FurnishedFinder emailed you.",
                 "counts": {}, "running": True, "tenant_id": str(tenant_id), "updated_at": updated}
     if st == DONE:
         return {"status": "done", "message": job.get("message") or "Done.",

@@ -28,7 +28,7 @@
     .banner.error .spinner { display: none; }
     .otp-row { display: none; gap: 8px; margin-left: auto; }
     .otp-row.show { display: flex; }
-    .otp-row input { width: 140px; letter-spacing: 3px; padding: 8px 12px; }
+    .otp-row input { width: min(420px, 48vw); padding: 8px 12px; }
 
     section { margin-bottom: 38px; }
     .sec-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 4px; flex-wrap: wrap; }
@@ -111,7 +111,11 @@
   {% set nav_active = 'dashboard' %}
   {% set nav_extra %}
     {% if ff_status and ff_status.masked_email %}<span class="badge">FF · {{ ff_status.masked_email }}{% if not ff_status.connected %} · unverified{% endif %}</span>{% elif is_operator %}<span class="badge">FurnishedFinder</span>{% endif %}
-    {% if can_scrape %}<button id="refresh-btn" class="btn btn--primary btn--sm" onclick="startRefresh()">Check now</button>{% endif %}
+    {% if can_scrape %}
+      <button id="refresh-btn" class="btn btn--primary btn--sm" onclick="startRefresh()" {% if state.status in ['launching', 'checking', 'waiting_for_otp'] %}disabled{% endif %}>
+        {% if state.status in ['launching', 'checking', 'waiting_for_otp'] %}Checking…{% else %}Check now{% endif %}
+      </button>
+    {% endif %}
   {% endset %}
   {% include "_appnav.html" %}
 
@@ -152,20 +156,20 @@
     <div class="apikey-note" id="ff-verification-note" style="border-color: var(--warn-soft);">
       {% if ff_status.state == 'error' %}
         ⚠️ {{ ff_status.last_error or 'The last connection attempt didn’t finish.' }}
-        Click <b>Check now</b> to retry — you’ll enter the one-time code FurnishedFinder emails you.
+        Click <b>Check now</b> to retry — you’ll paste the login code or magic link FurnishedFinder emails you.
       {% else %}
         Your FurnishedFinder email{% if ff_status.masked_email %} (<code>{{ ff_status.masked_email }}</code>){% endif %}
         is saved but <b>not verified yet</b>. Click <b>Check now</b> to log in and enter the
-        one-time code FurnishedFinder emails you — your leads load once verification completes.
+        login code or magic link FurnishedFinder emails you — your leads load once verification completes.
       {% endif %}
     </div>
     {% endif %}
-    <div id="banner" class="banner">
-      <div class="spinner" id="spinner"></div>
-      <span id="banner-msg">Idle</span>
-      <form class="otp-row" id="otp-row" onsubmit="submitOtp(event)">
-        <input id="otp-input" inputmode="numeric" autocomplete="one-time-code" placeholder="OTP code" />
-        <button type="submit" class="btn btn--primary btn--sm">Submit OTP</button>
+    <div id="banner" class="banner{% if state.status != 'idle' %} show{% endif %}{% if state.status == 'error' %} error{% endif %}">
+      <div class="spinner" id="spinner" {% if state.status not in ['launching', 'checking', 'waiting_for_otp'] %}style="display:none"{% endif %}></div>
+      <span id="banner-msg">{{ state.message or state.status or 'Idle' }}</span>
+      <form class="otp-row{% if state.status == 'waiting_for_otp' %} show{% endif %}" id="otp-row" onsubmit="submitOtp(event)">
+        <input id="otp-input" autocomplete="one-time-code" placeholder="Code or login link" />
+        <button type="submit" class="btn btn--primary btn--sm">Submit</button>
       </form>
     </div>
 

@@ -40,7 +40,7 @@ _STATE_LABELS = {
     NOT_CONNECTED: "Not connected",
     NEEDS_VERIFICATION: "Email saved — verification required",
     VERIFYING: "Verifying your FurnishedFinder login…",
-    WAITING_FOR_OTP: "Waiting for your one-time code",
+    WAITING_FOR_OTP: "Waiting for your login code or link",
     CONNECTED: "Connected",
     ERROR: "Last connection attempt failed",
 }
@@ -125,10 +125,13 @@ def mark_state(tenant_id: str, state: str, error: str | None = None) -> None:
         sets += ["connected_at=?", "verified_at=?", "last_error=?"]
         vals += [now, now, None]
     elif state == ERROR:
-        sets.append("last_error=?")
-        vals.append((error or "Connection attempt failed.")[:300])
+        sets += ["connected_at=?", "verified_at=?", "last_error=?"]
+        vals += [None, None, (error or "Connection attempt failed.")[:300]]
+    elif state == NEEDS_VERIFICATION:
+        sets += ["connected_at=?", "verified_at=?", "last_error=?"]
+        vals += [None, None, None]
     else:
-        # Transient/needs states clear any stale error banner.
+        # Transient states clear any stale error banner.
         sets.append("last_error=?")
         vals.append(None)
     vals.append(tenant_id)

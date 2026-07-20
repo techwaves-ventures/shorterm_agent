@@ -115,6 +115,13 @@ def test_jobs_queue():
     check(jobs.latest(t)["status"] == jobs.DONE, "set_status marks the job done")
     check(jobs.get_active(t) is None, "a done job is no longer active")
 
+    t_err = "t-job-error-cooldown"
+    err_job = jobs.enqueue(t_err)
+    jobs.set_status(err_job["id"], jobs.ERROR, "Couldn't verify your FurnishedFinder login.")
+    retry = jobs.enqueue(t_err)
+    check(retry["id"] == err_job["id"] and jobs.get_active(t_err) is None,
+          "recent error retry is throttled instead of creating another login job")
+
     # A brand-new tenant with no active job can't submit an OTP.
     check(jobs.submit_otp("t-nobody", "111") is False, "submit_otp fails with no active job")
 
@@ -261,6 +268,54 @@ def test_cloudflare_challenge_is_fatal():
           "Cloudflare error has a UI-safe message")
 
 
+def test_ff_login_dialog_invalidates_session_probe():
+    print("test_ff_login_dialog_invalidates_session_probe")
+
+    class Locator:
+        def __init__(self, text="", visible=False):
+            self.text = text
+            self.visible = visible
+
+        def inner_text(self, timeout=0):
+            return self.text
+
+        @property
+        def first(self):
+            return self
+
+        def is_visible(self, timeout=0):
+            return self.visible
+
+    class FakePage:
+        url = "https://www.furnishedfinder.com/members/tenant-lead"
+
+        def title(self):
+            return "Tenant Leads | Furnished Finder"
+
+        def goto(self, url, wait_until=None):
+            self.url = url
+
+        def wait_for_timeout(self, ms):
+            pass
+
+        def locator(self, selector):
+            if selector == "body":
+                return Locator(
+                    "Skip to main content\n"
+                    "Dialog content\n"
+                    "Login to your account\n"
+                    "Not a member yet? Sign Up\n"
+                    "Forgot Username Or Password?\n"
+                    "Login"
+                )
+            if selector == "input#username":
+                return Locator(visible=True)
+            return Locator()
+
+    check(furnishedfinder._session_ok(FakePage()) is False,
+          "FF login dialog means the persistent browser session is not authenticated")
+
+
 if __name__ == "__main__":
     test_connect_states()
     test_jobs_queue()
@@ -268,6 +323,7 @@ if __name__ == "__main__":
     test_serverless_refresh_routing()
     test_force_worker_queue_routing()
     test_cloudflare_challenge_is_fatal()
+    test_ff_login_dialog_invalidates_session_probe()
     print()
     if _FAILURES:
         print(f"{len(_FAILURES)} FAILURE(S):")
