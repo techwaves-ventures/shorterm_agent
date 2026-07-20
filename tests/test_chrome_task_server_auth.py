@@ -8,12 +8,14 @@ import tempfile
 import time
 from pathlib import Path
 
+from cryptography.fernet import Fernet
+
 
 _TMP = tempfile.mkdtemp(prefix="chrome_task_server_test_")
 os.environ["SQLITE_PATH"] = str(Path(_TMP) / "test.db")
 os.environ.pop("DATABASE_URL", None)
 os.environ["SECRET_KEY"] = "test-secret-key"
-os.environ["FF_CRED_KEY"] = "a" * 44
+os.environ["FF_CRED_KEY"] = Fernet.generate_key().decode()
 os.environ["CHROME_TASK_BEARER_TOKEN"] = "test-bearer-token"
 os.environ["CHROME_TASK_HMAC_KEY"] = "test-hmac-key"
 os.environ["CHROME_TASK_MAX_JOBS_PER_WAKE"] = "2"

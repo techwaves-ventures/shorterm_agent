@@ -197,6 +197,38 @@ def test_serverless_refresh_routing():
         check_leads.sync_playwright = saved
 
 
+def test_force_worker_queue_routing():
+    print("test_force_worker_queue_routing")
+    import dashboard
+    import models
+
+    email = "force-worker@test.local"
+    if not models.get_user_by_email(email):
+        models.create_user(email, "pw-123456")
+    user = models.get_user_by_email(email)
+    tid = user.tenant_id
+
+    os.environ["FORCE_WORKER_QUEUE"] = "1"
+    try:
+        dashboard.app.config["TESTING"] = True
+        client = dashboard.app.test_client()
+        r = client.post("/login", data={"email": email, "password": "pw-123456"}, follow_redirects=False)
+        check(r.status_code in (302, 303), "force-worker login redirects")
+
+        r = client.post("/connect", data={"ff_email": "force@ff.test", "consent": "1"})
+        check(ff_account.get_state(tid) == ff_account.NEEDS_VERIFICATION,
+              "force-worker /connect saves email for verification")
+
+        r = client.post("/refresh")
+        check(r.status_code == 200, "FORCE_WORKER_QUEUE /refresh returns 200")
+        check(jobs.get_active(tid) is not None, "FORCE_WORKER_QUEUE enqueues a DB job")
+
+        r = client.post("/otp", data={"code": "123456"})
+        check(r.get_json().get("ok") is True, "FORCE_WORKER_QUEUE /otp routes through jobs")
+    finally:
+        os.environ.pop("FORCE_WORKER_QUEUE", None)
+
+
 def test_cloudflare_challenge_is_fatal():
     print("test_cloudflare_challenge_is_fatal")
 
@@ -231,6 +263,7 @@ if __name__ == "__main__":
     test_jobs_queue()
     test_public_state()
     test_serverless_refresh_routing()
+    test_force_worker_queue_routing()
     test_cloudflare_challenge_is_fatal()
     print()
     if _FAILURES:
