@@ -35,12 +35,29 @@ _COLS = (
     "counts", "worker_id", "created_at", "updated_at",
 )
 
-# A worker is considered online if it heartbeated within this window.
+# A worker is considered online if it heartbeated within this window. The worker
+# heartbeats continuously (a background thread, even mid-scrape/OTP-wait), so a
+# lack of heartbeat within this window reliably means the worker crashed/stopped.
 WORKER_TTL_SECONDS = 90
 # After a failed login/check, do not immediately create another browser job.
 # This prevents repeated Check now clicks from spamming FurnishedFinder magic
 # login emails while still allowing an intentional retry after a short pause.
-ERROR_RETRY_COOLDOWN_SECONDS = 60
+ERROR_RETRY_COOLDOWN_SECONDS = 120
+# Absolute backstop: a job stuck in an active browser state longer than this is
+# reaped even if a worker still heartbeats (e.g. a wedged/hung run). Must exceed
+# a legitimate run + the OTP wait (OTP_WAIT_SECONDS=600) so live runs aren't
+# killed; staleness is normally caught far sooner by worker-liveness/ownership.
+MAX_ACTIVE_JOB_SECONDS = 1800
+
+# The browser-bound states a run passes through. A job left in one of these after
+# a worker restart/crash/timeout is what strands the dashboard on "Checking…".
+_BROWSER_STATES = (RUNNING, WAITING_FOR_OTP)
+
+# UI-safe copy shown when the reaper fails a stranded job.
+STALE_JOB_MESSAGE = (
+    "The check stopped before it finished (the worker may have restarted). "
+    "Click Check now to try again."
+)
 
 
 def _now() -> str:
@@ -96,6 +113,78 @@ _SELECT = f"SELECT {', '.join(_COLS)} FROM ff_jobs"
 # ---------------------------------------------------------------------------
 
 
+def _reconcile_ff_error(tenant_id, message: str) -> None:
+    """Mirror a reaped/failed job into the tenant's FF account state so it never
+    lingers in `verifying`. No-op for the operator ('1', no ff_accounts row).
+    Imported lazily to keep jobs.py import-cycle-free."""
+    if str(tenant_id) == "1":
+        return
+    try:
+        import ff_account
+        ff_account.mark_state(str(tenant_id), ff_account.ERROR, error=message)
+    except Exception:
+        pass
+
+
+def _fail_stale_job(job: dict, message: str) -> None:
+    set_status(job["id"], ERROR, message)
+    _reconcile_ff_error(job.get("tenant_id"), message)
+
+
+def reap_stale(active_worker_id: str | None = None) -> int:
+    """Fail jobs stranded in a browser state after a worker restart/crash/timeout.
+
+    Idempotent and cheap; called lazily from the producer/UI paths so DB truth
+    and the dashboard agree without a separate cron. A RUNNING/WAITING_FOR_OTP job
+    is failed when ANY of:
+      * `active_worker_id` is given (worker startup) and the job is owned by a
+        DIFFERENT worker id — an orphan from the previous process (single-worker
+        deploy), caught immediately on restart (RestartSec=5);
+      * no worker heartbeated within WORKER_TTL_SECONDS — the worker crashed and
+        hasn't returned (the dashboard's own /api/status poll drives this);
+      * the job has been active longer than MAX_ACTIVE_JOB_SECONDS — backstop for
+        a wedged worker that still heartbeats.
+    Returns the number of jobs reaped.
+    """
+    online = worker_online()
+    with _conn() as c:
+        placeholders = ",".join("?" * len(_BROWSER_STATES))
+        rows = c.execute(
+            f"{_SELECT} WHERE status IN ({placeholders})", _BROWSER_STATES
+        ).fetchall()
+    reaped = 0
+    for row in rows:
+        job = _row_to_dict(row)
+        if not job:
+            continue
+        owner = job.get("worker_id")
+        age = _age_seconds(job.get("created_at"))
+        orphan = active_worker_id is not None and owner and owner != active_worker_id
+        if orphan or not online or (age is not None and age > MAX_ACTIVE_JOB_SECONDS):
+            _fail_stale_job(job, STALE_JOB_MESSAGE)
+            reaped += 1
+    return reaped
+
+
+def _cooldown_remaining(recent: dict | None) -> int:
+    """Seconds a tenant must wait before a fresh login job is allowed, based on
+    their most recent errored attempt. 0 when there's no active cooldown.
+
+    The cooldown exists to stop repeated Check-now clicks from bursting real
+    FurnishedFinder login emails, so it only applies to errors from an actual
+    browser/login attempt. A reaper-induced error (STALE_JOB_MESSAGE) means the
+    worker crashed/restarted before finishing — no login/email happened — so the
+    user must be able to retry immediately (acceptance criterion #1)."""
+    if not recent or recent.get("status") != ERROR:
+        return 0
+    if (recent.get("message") or "") == STALE_JOB_MESSAGE:
+        return 0
+    age = _age_seconds(recent.get("updated_at"))
+    if age is None or age >= ERROR_RETRY_COOLDOWN_SECONDS:
+        return 0
+    return int(ERROR_RETRY_COOLDOWN_SECONDS - age)
+
+
 def enqueue(tenant_id: str, kind: str = "scrape") -> dict:
     """Queue a scrape job for a tenant, or return the tenant's already-active job.
 
@@ -103,18 +192,17 @@ def enqueue(tenant_id: str, kind: str = "scrape") -> dict:
     the same run instead of stacking browser jobs.
     """
     tenant_id = str(tenant_id)
-    existing = get_active(tenant_id)
+    existing = get_active(tenant_id)   # get_active() reaps stale jobs first
     if existing:
         return existing
     recent = latest(tenant_id)
-    recent_age = _age_seconds((recent or {}).get("updated_at"))
-    if (
-        recent
-        and recent.get("status") == ERROR
-        and recent_age is not None
-        and recent_age < ERROR_RETRY_COOLDOWN_SECONDS
-    ):
-        return recent
+    remaining = _cooldown_remaining(recent)
+    if remaining > 0:
+        # Do not fire another login (another FF email) yet — hand back the recent
+        # errored job so the UI shows the cooldown message from public_state.
+        throttled = dict(recent)
+        throttled["cooldown_remaining"] = remaining
+        return throttled
     now = _now()
     with _conn() as c:
         job_id = db.insert_returning_id(
@@ -128,6 +216,7 @@ def enqueue(tenant_id: str, kind: str = "scrape") -> dict:
 
 def get_active(tenant_id: str) -> dict | None:
     """The tenant's current in-flight job (queued/running/waiting), if any."""
+    reap_stale()
     placeholders = ",".join("?" * len(ACTIVE_STATES))
     with _conn() as c:
         row = c.execute(
@@ -280,6 +369,7 @@ def public_state(tenant_id: str) -> dict:
     status banner, and OTP entry all reflect the worker-backed run. Never leaks
     another tenant's data — it only reads this tenant's own job row.
     """
+    reap_stale()
     job = latest(str(tenant_id))
     idle = {
         "status": "idle", "message": "", "counts": {}, "running": False,
@@ -304,15 +394,21 @@ def public_state(tenant_id: str) -> dict:
                 "counts": {}, "running": True, "tenant_id": str(tenant_id), "updated_at": updated}
     if st == WAITING_FOR_OTP:
         return {"status": "waiting_for_otp",
-                "message": job.get("message") or "Enter the code or magic login link FurnishedFinder emailed you.",
+                "message": job.get("message") or ("FurnishedFinder emailed you a login "
+                    "code or a magic link. Paste the short code, or the entire "
+                    "https://www.furnishedfinder.com/… link."),
                 "counts": {}, "running": True, "tenant_id": str(tenant_id), "updated_at": updated}
     if st == DONE:
         return {"status": "done", "message": job.get("message") or "Done.",
                 "counts": counts, "running": False, "tenant_id": str(tenant_id), "updated_at": updated}
     if st == ERROR:
-        return {"status": "error",
-                "message": job.get("message") or "The scrape didn't finish — please try again.",
-                "counts": {}, "running": False, "tenant_id": str(tenant_id), "updated_at": updated}
+        msg = job.get("message") or "The scrape didn't finish — please try again."
+        remaining = _cooldown_remaining(job)
+        if remaining > 0:
+            msg = (f"{msg} Please wait {remaining}s before retrying so we don't "
+                   "trigger extra FurnishedFinder login emails.")
+        return {"status": "error", "message": msg, "counts": {},
+                "running": False, "tenant_id": str(tenant_id), "updated_at": updated}
     return idle  # canceled / unknown
 
 

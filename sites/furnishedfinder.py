@@ -63,6 +63,19 @@ class FurnishedFinderLoginLinkRequired(RuntimeError):
         super().__init__(self.user_safe_message)
 
 
+class FurnishedFinderTimeout(RuntimeError):
+    """Raised when FF is slow/unreachable (navigation or modal timed out)."""
+
+    user_safe_message = (
+        "FurnishedFinder was slow or unreachable just now. "
+        "Please click Check now again in a few minutes."
+    )
+
+    def __init__(self, context: str = ""):
+        super().__init__(self.user_safe_message)
+        self.context = context
+
+
 def set_context(username: str, otp_provider=None, status_cb=None) -> None:
     """Bind the FF account for the next run. `otp_provider()` (if given) is called
     to obtain an OTP code (blocking) instead of polling the global ./OTP_CODE.
@@ -103,7 +116,8 @@ def _prompt_for_otp(prompt_message: str | None = None) -> str:
     from pathlib import Path
 
     prompt_message = prompt_message or (
-        "FurnishedFinder sent a login code or magic link to your email — enter it below."
+        "FurnishedFinder emailed you a login code or a magic link — paste the short "
+        "code, or the entire https://www.furnishedfinder.com/… link."
     )
     print("\n" + "=" * 60, flush=True)
     print(">> FurnishedFinder sent a login code/link to your email.", flush=True)
@@ -177,7 +191,7 @@ def _complete_magic_link_login(page: Page, login_link: str) -> None:
     if not _is_furnishedfinder_magic_link(login_link):
         raise FurnishedFinderLoginLinkRequired()
     log.info("Opening FurnishedFinder magic login link")
-    page.goto(login_link.strip(), wait_until="domcontentloaded")
+    _safe_goto(page, login_link.strip(), "magic login link")
     page.wait_for_timeout(5000)
     _raise_if_blocked(page, "magic login link")
     if not _session_ok(page):
@@ -243,12 +257,50 @@ def _raise_if_blocked(page: Page, context: str) -> None:
         raise FurnishedFinderBlocked(context)
 
 
+def _safe_goto(page: Page, url: str, context: str, timeout: int = 25000, retries: int = 1) -> None:
+    """page.goto with an explicit timeout + one retry, translating a Playwright
+    timeout into a UI-safe FurnishedFinderTimeout instead of a raw trace."""
+    for attempt in range(retries + 1):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            return
+        except PWTimeout:
+            log.warning("goto timeout during %s (attempt %d) for %s", context, attempt + 1, url)
+    raise FurnishedFinderTimeout(context)
+
+
 def _open_login_modal(page: Page) -> None:
-    page.goto(HOME_URL, wait_until="domcontentloaded")
+    _safe_goto(page, HOME_URL, "login home")
     page.wait_for_timeout(2500)
     _raise_if_blocked(page, "login home")
-    page.evaluate("document.querySelector('#nav-login')?.click()")
-    page.wait_for_selector("input#username", timeout=10000)
+    # Already showing the login form? (FF sometimes renders it inline.)
+    try:
+        if page.locator("input#username").first.is_visible(timeout=800):
+            return
+    except Exception:
+        pass
+    # Try several ways to open the modal; accept the username field appearing.
+    for trigger in (
+        "document.querySelector('#nav-login')?.click()",
+        "document.querySelector('a[href*=\"login\" i]')?.click()",
+    ):
+        try:
+            page.evaluate(trigger)
+        except Exception:
+            pass
+        try:
+            page.wait_for_selector("input#username", timeout=6000)
+            return
+        except PWTimeout:
+            continue
+    # Last resort: a visible "Login" control, then wait once more.
+    try:
+        page.locator('a:has-text("Login"), button:has-text("Login")').first.click(timeout=1500)
+        page.wait_for_selector("input#username", timeout=6000)
+        return
+    except Exception:
+        pass
+    raise FurnishedFinderTimeout("login modal")
 
 
 def _login(page: Page) -> None:
@@ -272,7 +324,8 @@ def _login(page: Page) -> None:
         page.wait_for_selector(f"{otp_sel}, {pwd_sel}", timeout=25000)
     except PWTimeout:
         login_link = _prompt_for_otp(
-            "FurnishedFinder sent a magic login link to your email. Paste the full link here."
+            "FurnishedFinder emailed a magic login link. Paste the ENTIRE "
+            "https://www.furnishedfinder.com/… link (not just a code)."
         )
         _complete_magic_link_login(page, login_link)
         return
@@ -306,7 +359,7 @@ _session_logged_in = False
 
 
 def _session_ok(page: Page) -> bool:
-    page.goto(LEADS_URL, wait_until="domcontentloaded")
+    _safe_goto(page, LEADS_URL, "session probe")
     page.wait_for_timeout(2500)
     log.info("Session probe: %s (title=%r)", page.url, page.title())
     _raise_if_blocked(page, "session probe")
@@ -691,7 +744,7 @@ def check(page: Page) -> list[dict]:
 
     _ensure_session(page)
 
-    page.goto(LEADS_URL, wait_until="domcontentloaded")
+    _safe_goto(page, LEADS_URL, "leads page")
     page.wait_for_timeout(3000)
     log.info("Leads page: %s (title=%r)", page.url, page.title())
     _raise_if_blocked(page, "leads page")
@@ -699,7 +752,7 @@ def check(page: Page) -> list[dict]:
         it["kind"] = "lead"
         out.append(it)
 
-    page.goto(MESSAGES_URL, wait_until="domcontentloaded")
+    _safe_goto(page, MESSAGES_URL, "messages page")
     page.wait_for_timeout(3000)
     log.info("Messages page: %s (title=%r)", page.url, page.title())
     _raise_if_blocked(page, "messages page")

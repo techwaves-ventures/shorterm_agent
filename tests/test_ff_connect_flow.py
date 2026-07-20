@@ -292,7 +292,7 @@ def test_ff_login_dialog_invalidates_session_probe():
         def title(self):
             return "Tenant Leads | Furnished Finder"
 
-        def goto(self, url, wait_until=None):
+        def goto(self, url, wait_until=None, timeout=None):
             self.url = url
 
         def wait_for_timeout(self, ms):
@@ -316,6 +316,107 @@ def test_ff_login_dialog_invalidates_session_probe():
           "FF login dialog means the persistent browser session is not authenticated")
 
 
+def _expire_worker():
+    from datetime import datetime, timedelta
+    old = (datetime.now() - timedelta(seconds=jobs.WORKER_TTL_SECONDS + 60)).isoformat(timespec="seconds")
+    with jobs._conn() as c:
+        c.execute("UPDATE ff_worker SET last_seen=? WHERE id=1", (old,))
+
+
+def _claim_for(worker_id, tenant):
+    """Claim queued jobs (the queue is a global FIFO) until this tenant's own job
+    is the one claimed/running, so a reap test targets the intended job even when
+    earlier tests left other tenants' jobs queued."""
+    for _ in range(100):
+        job = jobs.claim_next(worker_id)
+        if job is None:
+            return None
+        if str(job["tenant_id"]) == str(tenant):
+            return job
+    return None
+
+
+def test_reap_stale_running_job():
+    print("test_reap_stale_running_job")
+    t = "t-stale"
+    ff_account.connect(t, "stale@ff.test")
+    ff_account.mark_state(t, ff_account.VERIFYING)
+    jobs.enqueue(t)
+    jobs.heartbeat("worker-stale")
+    job = _claim_for("worker-stale", t)
+    check(job and jobs.public_state(t)["status"] == "checking", "job running before reap")
+    _expire_worker()                          # worker crashed, no heartbeat
+    reaped = jobs.reap_stale()
+    check(reaped >= 1, "reap_stale fails the orphaned running job")
+    check(jobs.get_active(t) is None, "no active job after reap (UI unsticks)")
+    ps = jobs.public_state(t)
+    check(ps["status"] == "error" and ps["running"] is False, "public_state projects error, not checking")
+    check(ff_account.get_state(t) == ff_account.ERROR, "ff_account reconciled to error (not verifying)")
+    # A reaper error is a crashed worker, not a login failure — Check now must be
+    # able to start a fresh job immediately (no email-burst cooldown applies).
+    retry = jobs.enqueue(t)
+    check(retry["status"] == jobs.QUEUED and retry["id"] != job["id"],
+          "Check now after a reap starts a fresh job (reaper error is not cooldown-throttled)")
+
+
+def test_worker_restart_recovery():
+    print("test_worker_restart_recovery")
+    t = "t-restart"
+    jobs.enqueue(t)
+    jobs.heartbeat("worker-old")
+    _claim_for("worker-old", t)
+    # A NEW worker process starts and reaps orphans owned by the old id.
+    jobs.heartbeat("worker-new")
+    reaped = jobs.reap_stale(active_worker_id="worker-new")
+    check(reaped >= 1, "restart reaps the previous worker's orphaned job")
+    check(jobs.get_active(t) is None, "orphan cleared so Check now can start fresh")
+
+
+def test_hard_cap_backstop():
+    print("test_hard_cap_backstop")
+    from datetime import datetime, timedelta
+    t = "t-wedged"
+    jobs.enqueue(t)
+    jobs.heartbeat("worker-wedged")           # worker ONLINE the whole time
+    job = _claim_for("worker-wedged", t)
+    old = (datetime.now() - timedelta(seconds=jobs.MAX_ACTIVE_JOB_SECONDS + 60)).isoformat(timespec="seconds")
+    with jobs._conn() as c:
+        c.execute("UPDATE ff_jobs SET created_at=? WHERE id=?", (old, job["id"]))
+    check(jobs.reap_stale(active_worker_id="worker-wedged") >= 1,
+          "hard cap reaps a wedged job even while the worker heartbeats")
+
+
+def test_magic_link_required_error():
+    print("test_magic_link_required_error")
+    err = None
+    try:
+        furnishedfinder._complete_magic_link_login(None, "123456")  # a code, not a link
+    except Exception as e:
+        err = e
+    check(isinstance(err, furnishedfinder.FurnishedFinderLoginLinkRequired),
+          "pasting a code when a link is required raises the link-required error")
+    check("paste the full" in getattr(err, "user_safe_message", "").lower(),
+          "link-required error tells the user to paste the full link")
+
+
+def test_retry_cooldown_blocks_burst():
+    print("test_retry_cooldown_blocks_burst")
+    from datetime import datetime, timedelta
+    t = "t-cooldown"
+    j = jobs.enqueue(t)
+    jobs.set_status(j["id"], jobs.ERROR, "Couldn't verify your FurnishedFinder login.")
+    again = jobs.enqueue(t)                    # within cooldown → no new login/email
+    check(again["id"] == j["id"] and jobs.get_active(t) is None,
+          "retry within cooldown coalesces onto the errored job (no burst)")
+    ps = jobs.public_state(t)
+    check("wait" in ps["message"].lower(), "cooldown surfaces a wait message in the banner")
+    old = (datetime.now() - timedelta(seconds=jobs.ERROR_RETRY_COOLDOWN_SECONDS + 5)).isoformat(timespec="seconds")
+    with jobs._conn() as c:
+        c.execute("UPDATE ff_jobs SET updated_at=? WHERE id=?", (old, j["id"]))
+    fresh = jobs.enqueue(t)
+    check(fresh["id"] != j["id"], "after the cooldown a fresh job is allowed")
+
+
 if __name__ == "__main__":
     test_connect_states()
     test_jobs_queue()
@@ -324,6 +425,11 @@ if __name__ == "__main__":
     test_force_worker_queue_routing()
     test_cloudflare_challenge_is_fatal()
     test_ff_login_dialog_invalidates_session_probe()
+    test_reap_stale_running_job()
+    test_worker_restart_recovery()
+    test_hard_cap_backstop()
+    test_magic_link_required_error()
+    test_retry_cooldown_blocks_burst()
     print()
     if _FAILURES:
         print(f"{len(_FAILURES)} FAILURE(S):")

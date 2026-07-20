@@ -159,8 +159,8 @@
         Click <b>Check now</b> to retry — you’ll paste the login code or magic link FurnishedFinder emails you.
       {% else %}
         Your FurnishedFinder email{% if ff_status.masked_email %} (<code>{{ ff_status.masked_email }}</code>){% endif %}
-        is saved but <b>not verified yet</b>. Click <b>Check now</b> to log in and enter the
-        login code or magic link FurnishedFinder emails you — your leads load once verification completes.
+        is saved but <b>not verified yet</b>. Click <b>Check now</b> to log in, then paste the
+        <b>short code</b> or the <b>entire login link</b> FurnishedFinder emails you — your leads load once verification completes.
       {% endif %}
     </div>
     {% endif %}
@@ -168,7 +168,7 @@
       <div class="spinner" id="spinner" {% if state.status not in ['launching', 'checking', 'waiting_for_otp'] %}style="display:none"{% endif %}></div>
       <span id="banner-msg">{{ state.message or state.status or 'Idle' }}</span>
       <form class="otp-row{% if state.status == 'waiting_for_otp' %} show{% endif %}" id="otp-row" onsubmit="submitOtp(event)">
-        <input id="otp-input" autocomplete="one-time-code" placeholder="Code or login link" />
+        <input id="otp-input" autocomplete="one-time-code" placeholder="Paste the short code or the entire login link" />
         <button type="submit" class="btn btn--primary btn--sm">Submit</button>
       </form>
     </div>
