@@ -123,6 +123,11 @@ DATABASE_URL='postgres://…?sslmode=require' \
   python worker.py            # polls forever; --once drains the queue and exits
 ```
 
+If FurnishedFinder blocks the worker host's server/datacenter egress, run the
+browser through an approved proxy by setting `BROWSER_PROXY_SERVER` plus optional
+`BROWSER_PROXY_USERNAME` / `BROWSER_PROXY_PASSWORD` in the worker-only
+environment. Keep proxy credentials out of repo files.
+
 The `Procfile` declares this as the `worker:` process; a Render/Fly worker
 service or a systemd unit can run the same command. Until a worker is online the
 UI says so (jobs stay *queued*), so nothing looks connected that isn't.
@@ -137,6 +142,47 @@ the browser. Human-in-the-loop send posture is unchanged — nothing auto-sends.
 
 This split (Vercel = dashboard/UI, `worker.py` = browser jobs, shared Postgres)
 is the recommended production topology.
+
+### Authenticated Chrome wake endpoint on a VM
+
+For deployments that need an HTTP wake hook in front of the browser worker,
+run `chrome_task_server.py` on the browser-capable VM. It is a deliberately
+narrow Flask service, not a browser automation API:
+
+- default bind: `127.0.0.1:6756`
+- no `/docs` or OpenAPI surface
+- `POST /v1/wake` only claims existing queued DB jobs; it never accepts URLs,
+  scripts, selectors, or arbitrary commands
+- every wake request requires:
+  - `Authorization: Bearer <CHROME_TASK_BEARER_TOKEN>`
+  - `X-Shorterm-Timestamp` Unix seconds, within the configured tolerance
+  - `X-Shorterm-Nonce`, accepted once per process window
+  - `X-Shorterm-Signature`, HMAC-SHA256 over
+    `timestamp + "\n" + nonce + "\n" + method + "\n" + path + "\n" + sha256(body)`
+- if `CHROME_TASK_BEARER_TOKEN` or `CHROME_TASK_HMAC_KEY` is missing, the
+  service fails closed and will not process jobs.
+
+Required env for the VM service, stored outside git:
+
+```bash
+CHROME_TASK_HOST=127.0.0.1
+CHROME_TASK_PORT=6756
+CHROME_TASK_BEARER_TOKEN=...
+CHROME_TASK_HMAC_KEY=...
+```
+
+Install as a user service on this VM:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp deploy/shorterm-chrome-task-server.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now shorterm-chrome-task-server.service
+```
+
+Keep the service loopback-only unless a TLS tunnel/reverse proxy is added with
+the same bearer+HMAC requirement at the origin. Do not expose a raw browser
+command endpoint.
 
 ## Deploy on Render (blueprint)
 

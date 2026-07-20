@@ -1,0 +1,14 @@
+[Unit]
+Description=Shorterm authenticated Chrome task wake server
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/.openclaw/workspace/shorterm_agent
+EnvironmentFile=/home/ubuntu/.openclaw/secure-env/shorterm-worker.env
+ExecStart=/home/ubuntu/.openclaw/workspace/shorterm_agent/.venv/bin/gunicorn --workers 1 --threads 4 --bind 127.0.0.1:6756 chrome_task_server:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

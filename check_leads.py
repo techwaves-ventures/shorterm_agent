@@ -88,6 +88,20 @@ def _profile_dir(tenant_id: str = "1") -> Path:
     return d
 
 
+def _browser_proxy() -> dict | None:
+    server = os.getenv("BROWSER_PROXY_SERVER", "").strip()
+    if not server:
+        return None
+    proxy = {"server": server}
+    username = os.getenv("BROWSER_PROXY_USERNAME", "").strip()
+    password = os.getenv("BROWSER_PROXY_PASSWORD", "").strip()
+    if username:
+        proxy["username"] = username
+    if password:
+        proxy["password"] = password
+    return proxy
+
+
 @contextmanager
 def browser_page(tenant_id: str = "1"):
     """Launch a real (non-sandboxed) Chrome with the tenant's persistent profile
@@ -100,14 +114,18 @@ def browser_page(tenant_id: str = "1"):
         "--start-maximized",
     ]
     with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            user_data_dir=str(_profile_dir(tenant_id)),
-            headless=headless,
-            args=launch_args,
-            viewport=None,  # use real window size
-            ignore_default_args=["--enable-automation"],
-            channel="chrome",  # use installed Google Chrome if available
-        )
+        launch_options = {
+            "user_data_dir": str(_profile_dir(tenant_id)),
+            "headless": headless,
+            "args": launch_args,
+            "viewport": None,  # use real window size
+            "ignore_default_args": ["--enable-automation"],
+            "channel": "chrome",  # use installed Google Chrome if available
+        }
+        proxy = _browser_proxy()
+        if proxy:
+            launch_options["proxy"] = proxy
+        ctx = p.chromium.launch_persistent_context(**launch_options)
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             yield page
