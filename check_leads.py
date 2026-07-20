@@ -125,6 +125,7 @@ def browser_page(tenant_id: str = "1"):
         proxy = _browser_proxy()
         if proxy:
             launch_options["proxy"] = proxy
+            launch_options["ignore_https_errors"] = True
         ctx = p.chromium.launch_persistent_context(**launch_options)
         try:
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
@@ -154,6 +155,7 @@ def run_scrape(status_cb=None, on_new_items=None, tenant_id: str = "1") -> dict:
                 log.exception("status_cb failed")
 
     counts: dict[str, dict] = {}
+    site_failures: list[Exception] = []
     emit("launching", "Launching browser…")
 
     with browser_page(tenant_id) as page:
@@ -167,6 +169,7 @@ def run_scrape(status_cb=None, on_new_items=None, tenant_id: str = "1") -> dict:
                 log.exception("Site %s failed: %s", name, e)
                 if getattr(e, "fatal_scrape", False):
                     raise
+                site_failures.append(e)
                 continue
 
             log.info("%s: %d items visible", name, len(items))
@@ -195,6 +198,9 @@ def run_scrape(status_cb=None, on_new_items=None, tenant_id: str = "1") -> dict:
                         log.exception("on_new_items hook failed")
             if not any_new:
                 log.info("%s: nothing new", name)
+
+    if site_failures and len(site_failures) == len(SITES):
+        raise site_failures[-1]
 
     emit("done", "Done.")
     return counts
