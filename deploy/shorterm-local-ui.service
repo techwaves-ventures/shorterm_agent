@@ -1,12 +1,12 @@
 [Unit]
-Description=Shorterm local-only SaaS dashboard
+Description=Shorterm private-network SaaS dashboard
 After=network-online.target
 
 [Service]
 Type=simple
 WorkingDirectory=/home/ubuntu/.openclaw/workspace/shorterm_agent
 EnvironmentFile=/home/ubuntu/.openclaw/secure-env/shorterm-local-ui.env
-ExecStart=/home/ubuntu/.openclaw/workspace/shorterm_agent/.venv/bin/gunicorn --workers 1 --threads 8 --timeout 120 --bind 127.0.0.1:6757 dashboard:app
+ExecStart=/home/ubuntu/.openclaw/workspace/shorterm_agent/.venv/bin/gunicorn --workers 1 --threads 8 --timeout 120 --bind 0.0.0.0:6757 dashboard:app
 Restart=always
 RestartSec=5
 
