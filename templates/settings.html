@@ -83,7 +83,7 @@
       <h2>FurnishedFinder account</h2>
       {% if ff_status and ff_status.connected %}
         <p class="hint">Connected{% if ff_status.masked_email %} as <b style="color:var(--text)">{{ ff_status.masked_email }}</b>{% endif %}{% if ff_status.verified_at %} · verified {{ ff_status.verified_at }}{% endif %}.
-          Login is passwordless (email + one-time code); your email is stored encrypted.</p>
+          Login is passwordless (email + code or magic link); your email is stored encrypted.</p>
         <form method="post" action="{{ url_for('disconnect') }}">
           <button type="submit" class="btn btn--danger btn--sm">Disconnect</button>
         </form>
@@ -92,7 +92,7 @@
           <b style="color:var(--text)">not verified yet</b>.
           {% if ff_status.state == 'error' %}{{ ff_status.last_error or 'The last attempt didn’t finish.' }} {% endif %}
           Go to your <a href="{{ url_for('index') }}">dashboard</a> and click <b>Check now</b> to log in and
-          enter the one-time code FurnishedFinder emails you. Your email is stored encrypted; we never ask for a password.</p>
+          enter the code or magic link FurnishedFinder emails you. Your email is stored encrypted; we never ask for a password.</p>
         <form method="post" action="{{ url_for('disconnect') }}">
           <button type="submit" class="btn btn--danger btn--sm">Remove &amp; re-enter email</button>
         </form>

@@ -399,7 +399,8 @@ def responder_dismiss():
 @login_required
 def connect():
     """Store the tenant's FF email (encrypted) + their consent to automated
-    access. FF login is passwordless (email + OTP), so only the email is kept."""
+    access. FF login is passwordless (email + code/magic link), so only the
+    email is kept."""
     if not crypto.available():
         flash("Account connection isn't available yet (encryption not configured).")
         return redirect(url_for("index"))
@@ -417,7 +418,7 @@ def connect():
         flash(str(e))
         return redirect(url_for("index"))
     flash("FurnishedFinder email saved. It's not verified yet — click “Check now” to "
-          "log in and enter the one-time code FurnishedFinder emails you.")
+          "log in with the code or magic link FurnishedFinder emails you.")
     return redirect(url_for("index"))
 
 
@@ -487,7 +488,7 @@ def onboarding():
         config.mark_onboarded(tenant_id)
         if ff_email and request.form.get("ff_consent") and crypto.available():
             flash("You're set up. Your FurnishedFinder email is saved but not verified yet — "
-                  "click “Check now” to log in and enter the one-time code they email you.")
+                  "click “Check now” to log in with the code or magic link they email you.")
         else:
             flash("You're all set. Connect FurnishedFinder to start fetching leads.")
         return redirect(url_for("index"))

@@ -25,6 +25,7 @@ import logging
 import os
 import socket
 import sys
+import threading
 import time
 
 from dotenv import load_dotenv
@@ -46,10 +47,25 @@ log = logging.getLogger("worker")
 
 POLL_SECONDS = int(os.getenv("WORKER_POLL_SECONDS", "5"))
 OTP_WAIT_SECONDS = 600  # how long a run waits for the tenant to submit their code
+HEARTBEAT_SECONDS = 15  # keep worker_online() true even during a long OTP wait
 
 
 def _worker_id() -> str:
     return f"{socket.gethostname()}:{os.getpid()}"
+
+
+def _start_heartbeat(worker_id: str, stop_event: "threading.Event") -> "threading.Thread":
+    """Beat continuously (daemon) so jobs.worker_online() stays true across a long
+    process()/OTP wait — the reaper keys staleness off this liveness signal."""
+    def beat() -> None:
+        while not stop_event.wait(HEARTBEAT_SECONDS):
+            try:
+                jobs.heartbeat(worker_id)
+            except Exception:
+                log.exception("Heartbeat failed")
+    t = threading.Thread(target=beat, name="worker-heartbeat", daemon=True)
+    t.start()
+    return t
 
 
 def _otp_provider(job_id: int):
@@ -151,6 +167,12 @@ def main() -> None:
 
     worker_id = _worker_id()
     log.info("Worker %s starting (poll=%ss, once=%s)", worker_id, POLL_SECONDS, args.once)
+
+    jobs.heartbeat(worker_id)
+    reaped = jobs.reap_stale(active_worker_id=worker_id)
+    if reaped:
+        log.info("Reaped %d stale job(s) orphaned before startup", reaped)
+    _start_heartbeat(worker_id, threading.Event())  # daemon; dies with the process
 
     if args.once:
         while run_once(worker_id):
