@@ -6,43 +6,43 @@
      so it works identically locally and on Vercel.
      =================================================================== */
   :root {
-    /* Surfaces (dark, layered) */
-    --bg:          #0b0d12;
-    --bg-2:        #0e1117;
-    --surface:     #14171f;
-    --surface-2:   #1a1e28;
-    --surface-3:   #212632;
-    --border:      #262b37;
-    --border-2:    #333a49;
+    /* Surfaces (light, layered) — clean professional canvas */
+    --bg:          #f7f8fa;
+    --bg-2:        #eef1f5;
+    --surface:     #ffffff;
+    --surface-2:   #f2f4f7;
+    --surface-3:   #eaedf2;
+    --border:      #e3e7ee;
+    --border-2:    #cfd5df;
 
-    /* Text */
-    --text:        #eceef2;
-    --muted:       #99a3b3;
-    --faint:       #6b7484;
+    /* Text (dark on light, AA-contrast on white) */
+    --text:        #1a2230;
+    --muted:       #525c6b;
+    --faint:       #646d79;
 
-    /* Brand + status */
-    --brand:       #5b8cff;
-    --brand-2:     #7aa2ff;
-    --brand-strong:#4571e6;
-    --brand-soft:  rgba(91,140,255,.14);
-    --brand-line:  rgba(91,140,255,.45);
-    --ok:          #2ecc71;
-    --ok-soft:     rgba(46,204,113,.15);
-    --warn:        #f5a623;
-    --warn-soft:   rgba(245,166,35,.15);
-    --err:         #ff5c5c;
-    --err-soft:    rgba(255,92,92,.13);
+    /* Brand + status — deepened for AA on light soft-fills */
+    --brand:       #3a63d4;
+    --brand-2:     #2f56c9;
+    --brand-strong:#2f56c9;
+    --brand-soft:  rgba(58,99,212,.10);
+    --brand-line:  rgba(58,99,212,.32);
+    --ok:          #12703f;
+    --ok-soft:     rgba(23,122,69,.12);
+    --warn:        #8a5a00;
+    --warn-soft:   rgba(180,120,10,.14);
+    --err:         #c0362c;
+    --err-soft:    rgba(192,54,44,.10);
 
-    /* Shape + depth */
+    /* Shape + depth — soft, low light-mode shadows */
     --radius:      10px;
     --radius-lg:   16px;
     --radius-pill: 999px;
-    --shadow-sm:   0 1px 2px rgba(0,0,0,.4);
-    --shadow-md:   0 6px 24px -8px rgba(0,0,0,.55);
-    --shadow-lg:   0 24px 60px -20px rgba(0,0,0,.7);
+    --shadow-sm:   0 1px 2px rgba(16,24,40,.06);
+    --shadow-md:   0 6px 24px -10px rgba(16,24,40,.16);
+    --shadow-lg:   0 24px 60px -22px rgba(16,24,40,.22);
     --ring:        0 0 0 3px var(--brand-soft);
 
-    --grad-brand:  linear-gradient(135deg, #6d9bff 0%, #5b8cff 55%, #4571e6 100%);
+    --grad-brand:  linear-gradient(135deg, #5b8cff 0%, #4571e6 55%, #3a63d4 100%);
     --maxw:        1040px;
     --font:        -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     --mono:        ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -102,7 +102,7 @@
   .btn--primary:hover { filter: brightness(1.06); background: var(--grad-brand); }
   .btn--ghost { background: transparent; color: var(--text); border-color: var(--border-2); }
   .btn--ghost:hover { background: var(--surface-2); }
-  .btn--danger { background: transparent; color: #ffb4b4; border-color: rgba(255,92,92,.5); }
+  .btn--danger { background: transparent; color: var(--err); border-color: rgba(192,54,44,.45); }
   .btn--danger:hover { background: var(--err-soft); }
   .btn--sm { padding: 7px 13px; font-size: .85rem; border-radius: 8px; }
   .btn--block { width: 100%; }
@@ -135,19 +135,19 @@
   .badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px;
     border-radius: var(--radius-pill); font-size: .74rem; font-weight: 600;
     border: 1px solid var(--border-2); color: var(--muted); background: var(--surface-3); }
-  .badge--ok    { background: var(--ok-soft);   color: #7ee2a8; border-color: rgba(46,204,113,.4); }
-  .badge--warn  { background: var(--warn-soft);  color: #f3c170; border-color: rgba(245,166,35,.4); }
+  .badge--ok    { background: var(--ok-soft);   color: var(--ok);   border-color: rgba(23,122,69,.30); }
+  .badge--warn  { background: var(--warn-soft);  color: var(--warn); border-color: rgba(180,120,10,.35); }
   .badge--brand { background: var(--brand-soft); color: var(--brand-2); border-color: var(--brand-line); }
   .badge-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
   /* ---- Flash / alerts ------------------------------------------------ */
   .flash { border-radius: var(--radius); padding: 11px 15px; font-size: .9rem;
     margin-bottom: 12px; border: 1px solid var(--brand-line); background: var(--brand-soft);
-    color: #cdddff; display: flex; gap: 9px; align-items: flex-start; }
+    color: var(--brand-strong); display: flex; gap: 9px; align-items: flex-start; }
   .flash::before { content: "ℹ"; opacity: .8; }
 
   /* ---- App top bar (authenticated shell) ----------------------------- */
-  .appbar { position: sticky; top: 0; z-index: 30; background: rgba(14,17,23,.86);
+  .appbar { position: sticky; top: 0; z-index: 30; background: rgba(255,255,255,.85);
     backdrop-filter: blur(10px); border-bottom: 1px solid var(--border); }
   .appbar__inner { max-width: var(--maxw); margin: 0 auto; padding: 12px 24px;
     display: flex; align-items: center; gap: 20px; }

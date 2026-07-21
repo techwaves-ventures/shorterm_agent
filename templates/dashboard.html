@@ -47,32 +47,44 @@
       padding: 11px 15px; margin-bottom: 16px; color: var(--muted); font-size: .87rem; }
     .apikey-note code { font-size: .82em; }
 
-    /* Lead/message card — overrides the theme .card for the tighter list look. */
-    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
-      padding: 16px 18px; margin-bottom: 12px; transition: border-color .15s; }
-    .card:hover { border-color: var(--border-2); }
+    /* Lead/message card — professional list look with a left status rail.
+       The rail is drawn as an inset box-shadow (keyed to --rail) so the 1px
+       border and hover state never recolor it. Class names below are referenced
+       by the inline script, so they are preserved verbatim. */
+    .card { --rail: var(--border-2); background: var(--surface); border: 1px solid var(--border);
+      border-radius: 12px; padding: 15px 18px 15px 19px; margin-bottom: 12px;
+      box-shadow: inset 4px 0 0 0 var(--rail), var(--shadow-sm);
+      transition: border-color .15s, box-shadow .15s; }
+    .card:hover { border-color: var(--border-2); box-shadow: inset 4px 0 0 0 var(--rail), var(--shadow-md); }
+    .card--none  { --rail: var(--warn); }
+    .card--draft { --rail: var(--brand); }
+    .card--sent  { --rail: var(--ok); }
+    .card--skipped, .card--dismissed { --rail: var(--border-2); }
     .card-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .who { font-weight: 600; font-size: 1rem; }
+    .who { font-weight: 700; font-size: 1rem; color: var(--text); letter-spacing: -.01em; }
     .when { color: var(--faint); font-size: .8rem; }
     .spacer { margin-left: auto; }
 
-    .kind { font-size: .7rem; padding: 3px 9px; border-radius: var(--radius-pill); font-weight: 600; }
+    .kind { font-size: .7rem; padding: 3px 10px; border-radius: 6px; font-weight: 600;
+      letter-spacing: .01em; }
     .kind.lead { background: var(--brand-soft); color: var(--brand-2); }
-    .kind.message { background: var(--warn-soft); color: #f3c170; }
+    .kind.message { background: var(--warn-soft); color: var(--warn); }
 
-    .status { font-size: .72rem; padding: 3px 10px; border-radius: var(--radius-pill); font-weight: 600; }
-    .status.draft { background: var(--brand-soft); color: var(--brand-2); }
-    .status.sent { background: var(--ok-soft); color: #7ee2a8; }
-    .status.skipped, .status.dismissed { background: var(--surface-3); color: var(--muted); }
-    .status.none { background: var(--warn-soft); color: var(--warn); }
+    .status { font-size: .72rem; padding: 3px 11px; border-radius: var(--radius-pill); font-weight: 600;
+      border: 1px solid transparent; }
+    .status.draft { background: var(--brand-soft); color: var(--brand-2); border-color: var(--brand-line); }
+    .status.sent { background: var(--ok-soft); color: var(--ok); border-color: rgba(23,122,69,.28); }
+    .status.skipped, .status.dismissed { background: var(--surface-3); color: var(--muted); border-color: var(--border); }
+    .status.none { background: var(--warn-soft); color: var(--warn); border-color: rgba(180,120,10,.30); }
 
     .prop { color: var(--muted); font-size: .87rem; margin-top: 8px; }
     .email-tag { color: var(--brand-2); font-size: .82rem; }
-    .facts { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
-    .fact { font-size: .76rem; background: var(--surface-3); color: var(--text);
-      border: 1px solid var(--border); border-radius: var(--radius-pill); padding: 3px 10px; }
-    .inquiry-toggle { background: none; color: var(--brand-2); border: 0; padding: 8px 0 0;
-      font-size: .82rem; font-weight: 500; cursor: pointer; font-family: inherit; }
+    .facts { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 11px; }
+    .fact { font-size: .78rem; background: var(--surface-2); color: var(--text);
+      border: 1px solid var(--border); border-radius: 7px; padding: 3px 10px; }
+    .fact b { color: var(--muted); font-weight: 600; }
+    .inquiry-toggle { background: none; color: var(--brand-2); border: 0; padding: 9px 0 0;
+      font-size: .82rem; font-weight: 600; cursor: pointer; font-family: inherit; }
     .inquiry-toggle:hover { text-decoration: underline; }
     .inquiry { display: none; white-space: pre-wrap; background: var(--bg-2); border: 1px solid var(--border);
       border-radius: var(--radius); padding: 11px 13px; margin-top: 8px; color: var(--text);
@@ -155,7 +167,7 @@
     {% if not is_operator and ff_status and ff_status.state != 'connected' %}
     <div class="apikey-note" id="ff-verification-note" style="border-color: var(--warn-soft);">
       {% if ff_status.state == 'error' %}
-        ⚠️ {{ ff_status.last_error or 'The last connection attempt didn’t finish.' }}
+        {{ ff_status.last_error or 'The last connection attempt didn’t finish.' }}
         Click <b>Check now</b> to retry — you’ll paste the login code or magic link FurnishedFinder emails you.
       {% else %}
         Your FurnishedFinder email{% if ff_status.masked_email %} (<code>{{ ff_status.masked_email }}</code>){% endif %}
@@ -179,7 +191,7 @@
 
     <section>
       <div class="sec-head">
-        <h2>📥 Leads <span class="count" id="leads-count"></span></h2>
+        <h2>Leads <span class="count" id="leads-count"></span></h2>
         <span class="sec-sub">interested but haven't messaged — replies introduce your place</span>
       </div>
       <div class="toolbar">
@@ -194,7 +206,7 @@
 
     <section>
       <div class="sec-head">
-        <h2>💬 Messages <span class="count" id="messages-count"></span></h2>
+        <h2>Messages <span class="count" id="messages-count"></span></h2>
         <span class="sec-sub">tenants who wrote to you — replies respond to their message</span>
       </div>
       <div class="toolbar">
@@ -233,12 +245,12 @@
     function quickFacts(it) {
       if (it.kind !== "lead") return "";
       const chips = [];
-      if (it.move_in && it.move_out) chips.push(`📅 ${esc(it.move_in)} → ${esc(it.move_out)}`);
-      else if (it.move_in) chips.push(`📅 ${esc(it.move_in)}`);
-      if (it.nights) chips.push(`${it.nights} nights`);
-      if (it.occupants) chips.push(`👤 ${it.occupants}`);
-      if (it.pets === true) chips.push(`🐾 pets`);
-      if (it.budget) chips.push(`💲 ${esc(it.budget)}`);
+      if (it.move_in && it.move_out) chips.push(`<b>Dates:</b> ${esc(it.move_in)} – ${esc(it.move_out)}`);
+      else if (it.move_in) chips.push(`<b>Move-in:</b> ${esc(it.move_in)}`);
+      if (it.nights) chips.push(`<b>Nights:</b> ${it.nights}`);
+      if (it.occupants) chips.push(`<b>Guests:</b> ${it.occupants}`);
+      if (it.pets === true) chips.push(`<b>Pets:</b> Yes`);
+      if (it.budget) chips.push(`<b>Budget:</b> ${esc(it.budget)}`);
       if (!chips.length) return "";
       return `<div class="facts">` + chips.map(c => `<span class="fact">${c}</span>`).join("") + `</div>`;
     }
@@ -288,7 +300,7 @@
 
     function statusChip(it) {
       const s = statusOf(it);
-      const label = { none: "Needs draft", draft: "Draft ready", sent: "Sent ✓",
+      const label = { none: "Needs draft", draft: "Draft ready", sent: "Sent",
                       skipped: "Skipped", dismissed: "Dismissed" }[s] || s;
       return `<span class="status ${s}">${label}</span>`;
     }
@@ -298,7 +310,7 @@
       const id = esc(it.id || "");
       if (!r || r.status === "none") {
         return `<div class="reply">
-          <button class="mini" id="draft-btn-${id}" onclick="draftItem('${id}')">✨ Draft reply</button>
+          <button class="mini" id="draft-btn-${id}" onclick="draftItem('${id}')">Draft reply</button>
           <div class="reply-msg" id="msg-${id}"></div>
         </div>`;
       }
@@ -341,12 +353,12 @@
       const prop = it.kind === "lead" ? esc(it.title || "") : "";
       const email = it.response && it.response.tenant_email
         ? ` · <span class="email-tag">${esc(it.response.tenant_email)}</span>` : "";
-      return `<div class="card">
+      return `<div class="card card--${statusOf(it)}">
         <div class="card-top">
           <span class="who">${who}</span>
-          <span class="kind ${it.kind}">${it.kind === "lead" ? "📥 New lead" : "💬 Message"}</span>
-          <span class="when">${when}</span>
+          <span class="kind ${it.kind}">${it.kind === "lead" ? "New lead" : "Message"}</span>
           <span class="spacer"></span>
+          <span class="when">${when}</span>
           ${statusChip(it)}
         </div>
         <div class="prop">${prop}${prop && email ? "" : ""}${shortLine(it) ? (prop ? " — " : "") + esc(shortLine(it)) : ""}${email}</div>
@@ -428,7 +440,7 @@
     async function draftItem(id) {
       const btn = document.getElementById("draft-btn-" + id);
       setBusy(btn, true, "Drafting…");
-      setMsg(id, "✨ Asking Claude to draft a reply…", "");
+      setMsg(id, "Drafting your reply…", "");
       try {
         const res = await postForm("/responder/draft", { item_id: id });
         if (!res.ok) { setBusy(btn, false); setMsg(id, res.error || "Draft failed", "err"); return; }
