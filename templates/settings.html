@@ -6,124 +6,453 @@
   <title>Settings — Shorterm</title>
   {% include "_theme.html" %}
   <style>
-    .app-main { max-width: 820px; }
-    .card { margin-bottom: 16px; }
-    .card > h2 { font-size: 1.05rem; }
-    .card > .hint { color: var(--muted); font-size: .85rem; margin: 6px 0 14px; }
-    .card > .hint code { font-size: .8em; }
-    .plan-row { display: flex; align-items: center; justify-content: space-between;
-      gap: 14px; flex-wrap: wrap; }
+    .panel { background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); margin-bottom: 22px; overflow: hidden; }
+    .panel__head { padding: 17px 22px; border-bottom: 1px solid var(--border);
+      background: var(--surface-2); }
+    .panel__head h2 { font-size: 1.05rem; }
+    .panel__head p { color: var(--muted); font-size: .85rem; margin-top: 3px; }
+    .panel__body { padding: 20px 22px; }
+
+    /* ---- Property cards ---- */
+    .unit { border: 1px solid var(--border); border-radius: var(--radius);
+      padding: 16px 18px; margin-bottom: 14px; background: var(--surface); }
+    .unit__head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+    .unit__num { flex: 0 0 auto; width: 24px; height: 24px; border-radius: 50%;
+      background: var(--brand-soft); color: var(--brand-2); font-size: .74rem; font-weight: 700;
+      display: flex; align-items: center; justify-content: center; }
+    .unit__title { font-weight: 650; font-size: .95rem; flex: 1; }
+    .unit__photos { display: flex; gap: 8px; margin-bottom: 14px; overflow-x: auto; }
+    .unit__photos img { width: 132px; height: 92px; object-fit: cover; border-radius: 9px;
+      border: 1px solid var(--border); flex: 0 0 auto; background: var(--surface-2); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+    .grid--wide { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+    .hint { font-size: .76rem; color: var(--faint); margin-top: 4px; }
+    .remove { background: transparent; border: 1px solid rgba(192,54,44,.4); color: var(--err);
+      border-radius: 8px; padding: 5px 11px; font-size: .8rem; font-weight: 600;
+      cursor: pointer; font-family: inherit; }
+    .remove:hover { background: var(--err-soft); }
+
+    .discover { background: var(--brand-soft); border: 1px solid var(--brand-line);
+      border-radius: var(--radius); padding: 15px 18px; margin-bottom: 20px;
+      display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+    .discover__txt { flex: 1 1 320px; font-size: .88rem; }
+    .discover ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); font-size: .84rem; }
+
+    .enrich { background: var(--surface); border: 1px solid var(--brand-line);
+      border-left: 3px solid var(--brand); border-radius: var(--radius-lg);
+      padding: 18px 22px; margin-bottom: 22px; }
+    .enrich__head b { font-size: .96rem; }
+    .enrich__head p { color: var(--muted); font-size: .86rem; margin: 5px 0 14px; }
+    .enrich__row { display: flex; gap: 10px; align-items: flex-start; font-size: .88rem;
+      padding: 9px 0; border-top: 1px solid var(--border); margin: 0; color: var(--text); }
+    .enrich__row input { width: auto; margin-top: 3px; flex: 0 0 auto; }
+    .enrich__row em { color: var(--faint); font-style: normal; font-size: .82rem; }
+    .enrich__row code { font-size: .84em; }
+    .warn-note { display: block; margin-top: 5px; color: var(--warn); font-size: .81rem;
+      line-height: 1.45; }
+    .toggles { display: flex; gap: 22px; flex-wrap: wrap; }
+    .fwd { background: var(--surface-2); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 14px 16px; margin: 0 0 16px 26px; }
+    .fwd__label { font-size: .78rem; font-weight: 600; color: var(--muted);
+      text-transform: uppercase; letter-spacing: .04em; margin-bottom: 7px; }
+    .fwd__addr { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .fwd__addr code { font-size: .88rem; padding: 6px 10px; background: var(--surface);
+      border: 1px solid var(--border); word-break: break-all; }
+    .toggle { display: flex; gap: 8px; align-items: flex-start; font-size: .87rem; max-width: 300px; }
+    .toggle input { width: auto; margin-top: 3px; }
+    .toggle span { color: var(--muted); }
+    .toggle b { display: block; color: var(--text); font-weight: 600; }
+
+    .statusline { display: flex; align-items: center; gap: 10px; font-size: .89rem; flex-wrap: wrap; }
+    .empty-units { color: var(--muted); font-size: .89rem; padding: 20px; margin-bottom: 14px;
+      border: 1px dashed var(--border); border-radius: var(--radius); text-align: center; }
   </style>
 </head>
 <body>
-  {% set nav_active = 'settings' %}
   {% include "_appnav.html" %}
-
   <main class="app-main">
     <div class="page-head">
       <h1>Settings</h1>
-      <p>Your units, reply voice, sending identity, and connected accounts.</p>
+      <p>Your properties, your voice, and how replies go out. The agent only ever states facts you enter here.</p>
     </div>
 
-    {% with messages = get_flashed_messages() %}
-      {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
+    {% with flashes = get_flashed_messages() %}
+      {% for f in flashes %}<div class="flash">{{ f }}</div>{% endfor %}
     {% endwith %}
 
-    <form method="post" action="{{ url_for('settings') }}">
-      <div class="card">
-        <h2>Units</h2>
-        <p class="hint">Your unit catalog as a JSON array of objects. Each unit can have
-          <code>id, name, area, monthly_price, max_occupancy, pets_allowed, min_nights,
-          max_nights, available_from, notes</code>. The agent only states facts that
-          appear here — it never invents amenities or prices.</p>
-        <textarea class="code" name="units_json" rows="16" spellcheck="false">{{ settings.units_json }}</textarea>
+    {% if discovered %}
+    <form method="post" action="{{ url_for('import_units') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="discover">
+        <div class="discover__txt">
+          <b>We found {{ discovered|length }} propert{{ 'y' if discovered|length == 1 else 'ies' }} in your FurnishedFinder leads.</b>
+          <ul>{% for u in discovered %}<li>{{ u.name }}{% if u.area %} — {{ u.area }}{% endif %}</li>{% endfor %}</ul>
+        </div>
+        <button type="submit" class="btn btn--primary btn--sm">Import {{ 'it' if discovered|length == 1 else 'them' }}</button>
+      </div>
+    </form>
+    {% endif %}
+
+    {% if enrichments %}
+    {# Additive suggestions from the scraped listing. Values are shown in full
+       because the agent quotes them verbatim to guests — nothing is applied
+       without the host ticking the exact number. #}
+    <form method="post" action="{{ url_for('enrich_units') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="enrich">
+        <div class="enrich__head">
+          <b>FurnishedFinder has details your catalog is missing.</b>
+          <p>The agent can only state facts you've entered — these are blank today, so it
+             stays vague instead. Tick what's correct.</p>
+        </div>
+        {% for s in enrichments %}
+          {% for field, value in s.fields.items() %}
+          <label class="enrich__row">
+            <input type="checkbox" name="apply" value="{{ s.unit_id }}:{{ field }}"
+                   {% if not (s.shared and field == 'monthly_price') %}checked{% endif %}>
+            <span>
+              <b>{{ s.unit_name }}</b> →
+              {% if field == 'monthly_price' %}monthly price
+                <code>${{ "{:,}".format(value) }}</code>
+              {% else %}area <code>{{ value }}</code>{% endif %}
+              <em>from “{{ s.source }}”</em>
+              {% if s.shared and field == 'monthly_price' %}
+              <span class="warn-note">⚠ This listing covers more than one of your units, so
+                ${{ "{:,}".format(value) }} is likely the whole-property rate — not this unit's.
+                Only tick it if that's genuinely this unit's price.</span>
+              {% endif %}
+            </span>
+          </label>
+          {% endfor %}
+        {% endfor %}
+        <button type="submit" class="btn btn--primary btn--sm" style="margin-top:14px">Fill these in</button>
+      </div>
+    </form>
+    {% endif %}
+
+    <form method="post" id="settings-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="panel">
+        <div class="panel__head">
+          <h2>Your properties</h2>
+          <p>What the agent is allowed to say about each place. Leave a field blank if you're not
+             sure — it asks the guest rather than guessing.</p>
+        </div>
+        <div class="panel__body">
+          <div id="units">
+            {% for u in units %}
+            <div class="unit" data-unit>
+              <div class="unit__head">
+                <span class="unit__num" data-num>{{ loop.index }}</span>
+                <span class="unit__title">Property {{ loop.index }}</span>
+                <button type="button" class="remove" onclick="removeUnit(this)">Remove</button>
+              </div>
+              {% if u.images %}
+              {# Photos come straight from the FurnishedFinder listing. If one
+                 fails to load (expired CDN link) the tile removes itself rather
+                 than showing a broken image. #}
+              <div class="unit__photos">
+                {% for src in u.images[:3] %}
+                <img src="{{ src }}" alt="{{ u.name }}" loading="lazy"
+                     referrerpolicy="no-referrer" onerror="this.remove()">
+                {% endfor %}
+              </div>
+              {% endif %}
+              <input type="hidden" name="unit_id" value="{{ u.id or '' }}">
+              <div class="grid grid--wide">
+                <div>
+                  <label>Property name</label>
+                  <input name="unit_name" value="{{ u.name or '' }}" placeholder="Quiet Spacious Home in NW DC - Unit 1">
+                  <div class="hint">Should match how it's listed on FurnishedFinder.</div>
+                </div>
+                <div>
+                  <label>Area</label>
+                  <input name="unit_area" value="{{ u.area or '' }}" placeholder="Washington, DC (NW)">
+                  <div class="hint">Used to rule out guests looking in another city.</div>
+                </div>
+              </div>
+              <div class="grid" style="margin-top:12px">
+                <div>
+                  <label>Monthly price</label>
+                  <input name="unit_price" value="{{ u.monthly_price or '' }}" placeholder="3200" inputmode="numeric">
+                  <div class="hint">Blank = never quote a price.</div>
+                </div>
+                <div>
+                  <label>Max guests</label>
+                  <input name="unit_guests" value="{{ u.max_occupancy or '' }}" placeholder="2" inputmode="numeric">
+                </div>
+                <div>
+                  <label>Pets</label>
+                  <select name="unit_pets">
+                    <option value="" {% if u.pets_allowed is not defined or u.pets_allowed is none %}selected{% endif %}>Not specified</option>
+                    <option value="yes" {% if u.pets_allowed is sameas true %}selected{% endif %}>Allowed</option>
+                    <option value="no" {% if u.pets_allowed is sameas false %}selected{% endif %}>Not allowed</option>
+                  </select>
+                </div>
+                <div>
+                  <label>Min nights</label>
+                  <input name="unit_min_nights" value="{{ u.min_nights or '' }}" placeholder="30" inputmode="numeric">
+                </div>
+                <div>
+                  <label>Max nights</label>
+                  <input name="unit_max_nights" value="{{ u.max_nights or '' }}" placeholder="365" inputmode="numeric">
+                </div>
+              </div>
+              <div style="margin-top:12px">
+                <label>What makes it good (the agent quotes these)</label>
+                <textarea name="unit_notes" rows="2" placeholder="Private entrance, off-street parking, fully furnished, utilities and wifi included">{{ u.notes or '' }}</textarea>
+              </div>
+            </div>
+            {% endfor %}
+          </div>
+          {% if not units %}
+          <div class="empty-units" id="units-empty">
+            No properties yet.{% if discovered %} Import the ones we found above, or add one manually.{% else %}
+            Add one below — or click <b>Check now</b> on the dashboard and we'll find them from your leads.{% endif %}
+          </div>
+          {% endif %}
+          <button type="button" class="btn btn--ghost btn--sm" onclick="addUnit()">+ Add a property</button>
+        </div>
       </div>
 
-      <div class="card">
-        <h2>Response template</h2>
-        <p class="hint">The voice and style guide the agent personalizes around (it doesn't
-          fill blanks literally).</p>
-        <textarea name="template" rows="14">{{ settings.template }}</textarea>
-      </div>
-
-      <div class="card">
-        <h2>Identity &amp; sending</h2>
-        <div class="field-row">
-          <div class="field">
-            <label for="host_name">Sign-off name</label>
-            <input id="host_name" name="host_name" value="{{ settings.host_name }}"
-                   placeholder="The name replies sign off with">
-          </div>
-          <div class="field">
-            <label for="from_email">From email</label>
-            <input id="from_email" name="from_email" type="email" value="{{ settings.from_email }}"
-                   placeholder="you@example.com (sent via shared relay)">
-          </div>
-          <div class="field">
-            <label for="reply_channels">Reply channels</label>
-            <input id="reply_channels" name="reply_channels" value="{{ settings.reply_channels }}"
-                   placeholder="platform,email">
+      <div class="panel">
+        <div class="panel__head">
+          <h2>You</h2>
+          <p>How the agent signs off, and the address replies come from.</p>
+        </div>
+        <div class="panel__body">
+          <div class="grid grid--wide">
+            <div>
+              <label>Your name (sign-off)</label>
+              <input name="host_name" value="{{ settings.host_name or '' }}" placeholder="Sagiv">
+              <div class="hint">Every reply is signed with this — never "Your host".</div>
+            </div>
+            <div>
+              <label>Reply-from email</label>
+              <input name="from_email" type="email" value="{{ settings.from_email or '' }}" placeholder="you@example.com">
+            </div>
           </div>
         </div>
-        <div class="field" style="margin-bottom:0">
-          <label for="notify_webhook">Notification webhook (optional)</label>
-          <input id="notify_webhook" name="notify_webhook" value="{{ settings.notify_webhook }}"
-                 placeholder="https://hooks.slack.com/… — pinged when an OTP is needed">
-        </div>
-        <p class="hint" style="margin: 14px 0 0">
-          <b style="color:var(--text)">Sending is human-in-the-loop.</b> Every reply waits for your
-          one-click approval — the agent drafts, but never sends on its own. This is the
-          account-safety posture and can't be bypassed in this build.</p>
       </div>
 
-      <button type="submit" class="btn btn--primary">Save settings</button>
+      <div class="panel">
+        <div class="panel__head">
+          <h2>How replies go out</h2>
+          <p>Nothing sends without your approval unless you arm a step in <a href="{{ url_for('automations') }}">Automations</a>.</p>
+        </div>
+        <div class="panel__body">
+          <div class="toggles">
+            <label class="toggle">
+              <input type="checkbox" name="reply_channels" value="platform" {% if 'platform' in channels %}checked{% endif %}>
+              <span><b>On FurnishedFinder</b>Replies inside the platform thread.</span>
+            </label>
+            <label class="toggle">
+              <input type="checkbox" name="reply_channels" value="email" {% if 'email' in channels %}checked{% endif %}>
+              <span><b>By email</b>Also emails the guest when we have their address.</span>
+            </label>
+          </div>
+          <div style="margin-top:18px; max-width:460px">
+            <label>Notification webhook (optional)</label>
+            <input name="notify_webhook" value="{{ settings.notify_webhook or '' }}" placeholder="Slack or Discord webhook URL">
+            <div class="hint">Where we ping you when a login code is needed or a send fails.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel__head">
+          <h2>How leads reach us</h2>
+          <p>Forwarding FurnishedFinder's own notification emails means we never run
+             automated checks against their site — safer for your account, and leads
+             arrive the moment they're sent rather than at the next scheduled check.</p>
+        </div>
+        <div class="panel__body">
+          <label class="toggle" style="max-width:none; margin-bottom:14px">
+            <input type="radio" name="ingest_mode" value="email"
+                   {% if ingest_mode == 'email' %}checked{% endif %}>
+            <span><b>Forwarded email <span class="badge badge--ok">Recommended</span></b>
+              No automated access to FurnishedFinder. Leads arrive instantly.</span>
+          </label>
+
+          {% if ingest_mode == 'email' %}
+            {% if inbound_ready %}
+            <div class="fwd">
+              <div class="fwd__label">Forward your FurnishedFinder emails to</div>
+              <div class="fwd__addr">
+                <code id="fwd-addr">{{ inbound_address }}</code>
+                <button type="button" class="btn btn--ghost btn--sm" onclick="copyAddr(this)">Copy</button>
+              </div>
+              <p class="hint">In Gmail: Settings → Forwarding → add this address, then a filter
+                for mail from <code>furnishedfinder.com</code>. This address is unique to you —
+                treat it like a password.</p>
+            </div>
+            {% else %}
+            <div class="hint" style="margin-bottom:14px">
+              Email ingestion isn't configured on this server yet
+              (<code>INBOUND_EMAIL_DOMAIN</code> / <code>INBOUND_WEBHOOK_SECRET</code>).
+              Until it is, use scheduled checks below.
+            </div>
+            {% endif %}
+          {% endif %}
+
+          <label class="toggle" style="max-width:none">
+            <input type="radio" name="ingest_mode" value="browser"
+                   {% if ingest_mode == 'browser' %}checked{% endif %}>
+            <span><b>Scheduled checks</b>
+              Signs in and reads your leads on a schedule. Use only if forwarding
+              isn't an option for you.</span>
+          </label>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel__head">
+          <h2>Daily summary</h2>
+          <p>One email at the end of each day: what the agent sent, who's still waiting on you,
+             and anything that failed. Nothing is sent on a quiet day.</p>
+        </div>
+        <div class="panel__body">
+          <label class="toggle" style="max-width:none">
+            <input type="checkbox" name="digest_enabled" value="1" {% if settings.digest_enabled in ('1','true','True') %}checked{% endif %}>
+            <span><b>Email me a daily summary</b>Sent in your property's local time.</span>
+          </label>
+          <div class="grid grid--wide" style="margin-top:16px">
+            <div>
+              <label>Send at (24h, property local)</label>
+              <input name="digest_hour" value="{{ settings.digest_hour or '18:00' }}" placeholder="18:00">
+            </div>
+            <div>
+              <label>Property timezone</label>
+              <select name="timezone">
+                <option value="" {% if not settings.timezone %}selected{% endif %}>Server default</option>
+                {% for tz in timezones %}
+                <option value="{{ tz }}" {% if settings.timezone == tz %}selected{% endif %}>{{ tz.replace('_', ' ') }}</option>
+                {% endfor %}
+              </select>
+              <div class="hint">All schedules — checks and this summary — follow this clock.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel__head">
+          <h2>Reply style</h2>
+          <p>The voice the agent writes in. Plain English — it follows this guidance, it doesn't fill in blanks.</p>
+        </div>
+        <div class="panel__body">
+          <textarea name="template" rows="12">{{ settings.template or '' }}</textarea>
+        </div>
+      </div>
+
+      <div style="padding-bottom:10px">
+        <button type="submit" class="btn btn--primary">Save settings</button>
+      </div>
     </form>
 
-    <div class="card" style="margin-top:16px">
-      <h2>FurnishedFinder account</h2>
-      {% if ff_status and ff_status.connected %}
-        <p class="hint">Connected{% if ff_status.masked_email %} as <b style="color:var(--text)">{{ ff_status.masked_email }}</b>{% endif %}{% if ff_status.verified_at %} · verified {{ ff_status.verified_at }}{% endif %}.
-          Login is passwordless (email + code or magic link); your email is stored encrypted.</p>
-        <form method="post" action="{{ url_for('disconnect') }}">
-          <button type="submit" class="btn btn--danger btn--sm">Disconnect</button>
+    <div class="panel">
+      <div class="panel__head"><h2>FurnishedFinder account</h2></div>
+      <div class="panel__body">
+        <div class="statusline">
+          <span class="badge {% if ff_status.connected %}badge--ok{% else %}badge--warn{% endif %}">
+            <span class="badge-dot"></span>{{ ff_status.state_label }}
+          </span>
+          {% if ff_status.masked_email %}<span class="muted">{{ ff_status.masked_email }}</span>{% endif %}
+          {% if ff_status.last_error %}<span class="muted">— {{ ff_status.last_error }}</span>{% endif %}
+        </div>
+        {% if ff_status.state != 'not_connected' %}
+        <form method="post" action="{{ url_for('disconnect') }}" style="margin-top:14px">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button type="submit" class="btn btn--danger btn--sm">Disconnect account</button>
         </form>
-      {% elif ff_status and ff_status.masked_email %}
-        <p class="hint">Email saved as <b style="color:var(--text)">{{ ff_status.masked_email }}</b>, but
-          <b style="color:var(--text)">not verified yet</b>.
-          {% if ff_status.state == 'error' %}{{ ff_status.last_error or 'The last attempt didn’t finish.' }} {% endif %}
-          Go to your <a href="{{ url_for('index') }}">dashboard</a> and click <b>Check now</b> to log in and
-          enter the code or magic link FurnishedFinder emails you. Your email is stored encrypted; we never ask for a password.</p>
-        <form method="post" action="{{ url_for('disconnect') }}">
-          <button type="submit" class="btn btn--danger btn--sm">Remove &amp; re-enter email</button>
-        </form>
-      {% elif crypto_ready %}
-        <p class="hint">Link your FurnishedFinder login so the agent can fetch leads and send replies you approve.
-          We never ask for a password.</p>
-        <form method="post" action="{{ url_for('connect') }}">
-          <div class="field">
-            <label for="ff_email">FurnishedFinder email</label>
-            <input id="ff_email" name="ff_email" type="email" required placeholder="Your FurnishedFinder email">
-          </div>
-          <label class="consent" style="margin-bottom:14px">
+        {% elif crypto_ready %}
+        <form method="post" action="{{ url_for('connect') }}" style="margin-top:14px; max-width:420px">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <div class="field"><input name="ff_email" type="email" required placeholder="Your FurnishedFinder email"></div>
+          <label class="consent">
             <input type="checkbox" name="consent" value="1" required>
             <span>I authorize automated access to my FurnishedFinder account to read leads and send replies I approve.</span>
           </label>
           <button type="submit" class="btn btn--primary btn--sm">Connect account</button>
         </form>
-      {% else %}
-        <p class="hint">Account connection isn't available yet — encryption (<code>FF_CRED_KEY</code>) isn't configured.</p>
-      {% endif %}
+        {% endif %}
+      </div>
     </div>
 
-    <div class="card">
-      <div class="plan-row">
-        <div>
-          <h2>Plan</h2>
-          <p class="hint" style="margin:6px 0 0">Current plan: <b style="color:var(--text)">{{ billing_label }}</b>.</p>
+    <div class="panel">
+      <div class="panel__head"><h2>Plan</h2></div>
+      <div class="panel__body">
+        <div class="statusline">
+          <span class="muted">Current plan:</span> <b>{{ billing_label }}</b>
+          <a class="btn btn--ghost btn--sm" href="{{ url_for('billing.billing_home') }}">Manage billing</a>
         </div>
-        <a class="btn btn--ghost btn--sm" href="{{ url_for('billing.billing_home') }}">Manage billing →</a>
       </div>
     </div>
   </main>
+
+  <script>
+    // A blank property row, cloned client-side. Field names match the parallel
+    // arrays the server zips back together (config.units_from_form).
+    function addUnit() {
+      const wrap = document.getElementById("units");
+      const n = wrap.querySelectorAll("[data-unit]").length + 1;
+      const el = document.createElement("div");
+      el.className = "unit";
+      el.setAttribute("data-unit", "");
+      el.innerHTML = `
+        <div class="unit__head">
+          <span class="unit__num" data-num>${n}</span>
+          <span class="unit__title">Property ${n}</span>
+          <button type="button" class="remove" onclick="removeUnit(this)">Remove</button>
+        </div>
+        <input type="hidden" name="unit_id" value="">
+        <div class="grid grid--wide">
+          <div><label>Property name</label>
+            <input name="unit_name" placeholder="Quiet Spacious Home in NW DC - Unit 1">
+            <div class="hint">Should match how it's listed on FurnishedFinder.</div></div>
+          <div><label>Area</label>
+            <input name="unit_area" placeholder="Washington, DC (NW)">
+            <div class="hint">Used to rule out guests looking in another city.</div></div>
+        </div>
+        <div class="grid" style="margin-top:12px">
+          <div><label>Monthly price</label><input name="unit_price" inputmode="numeric" placeholder="3200">
+            <div class="hint">Blank = never quote a price.</div></div>
+          <div><label>Max guests</label><input name="unit_guests" inputmode="numeric" placeholder="2"></div>
+          <div><label>Pets</label><select name="unit_pets">
+            <option value="">Not specified</option><option value="yes">Allowed</option><option value="no">Not allowed</option>
+          </select></div>
+          <div><label>Min nights</label><input name="unit_min_nights" inputmode="numeric" placeholder="30"></div>
+          <div><label>Max nights</label><input name="unit_max_nights" inputmode="numeric" placeholder="365"></div>
+        </div>
+        <div style="margin-top:12px"><label>What makes it good (the agent quotes these)</label>
+          <textarea name="unit_notes" rows="2" placeholder="Private entrance, off-street parking, fully furnished, utilities and wifi included"></textarea></div>`;
+      wrap.appendChild(el);
+      const empty = document.getElementById("units-empty");
+      if (empty) empty.style.display = "none";
+      el.querySelector("input[name=unit_name]").focus();
+    }
+
+    function removeUnit(btn) {
+      btn.closest("[data-unit]").remove();
+      renumber();
+    }
+
+    function copyAddr(btn) {
+      const text = document.getElementById('fwd-addr').textContent.trim();
+      navigator.clipboard.writeText(text).then(() => {
+        const original = btn.textContent;
+        btn.textContent = 'Copied';
+        setTimeout(() => { btn.textContent = original; }, 1600);
+      });
+    }
+
+    function renumber() {
+      document.querySelectorAll("#units [data-unit]").forEach((el, i) => {
+        el.querySelector("[data-num]").textContent = i + 1;
+        el.querySelector(".unit__title").textContent = "Property " + (i + 1);
+      });
+    }
+  </script>
 </body>
 </html>

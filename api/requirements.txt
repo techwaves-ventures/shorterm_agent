@@ -10,6 +10,7 @@
 # root requirements.txt, which additionally pins playwright + gunicorn.
 flask>=3.0
 flask-login>=0.6
+flask-wtf>=1.2
 cryptography>=42
 requests>=2.31.0
 python-dotenv>=1.0.0

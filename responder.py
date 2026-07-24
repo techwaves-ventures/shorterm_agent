@@ -79,19 +79,36 @@ SYSTEM_GUIDE = """You are the outreach assistant for a short-term-rental host on
 FurnishedFinder. For each tenant inquiry you decide whether one of the host's units \
 is a good fit, pick the single best-fitting unit, and write a personalized reply.
 
-Decide fit in this priority order:
-1. LOCATION / AREA — if the tenant clearly wants a different city or area than any \
-unit serves, it is NOT a fit (fit=false). This is the most common skip.
-2. BUDGET / PRICE — if the tenant states a budget and it's below a unit's \
-monthly_price (when monthly_price > 0), that unit doesn't fit.
-3. OCCUPANCY / PETS / LEASE LENGTH — guests must be <= max_occupancy (when set > 0); \
-pets only if pets_allowed; requested stay should fall within min_nights..max_nights \
-when the tenant states a duration.
+YOUR DEFAULT IS TO REPLY. Every inquiry here was sent BY a tenant ABOUT one of this \
+host's specific listings (see the "Property:" field) — they already chose the place. \
+The host's business depends on answering them. Skipping is a rare exception, not a \
+screening step: a missed good tenant costs the host a booking, while a reply to an \
+imperfect one costs nothing but a message.
 
-Pick the SINGLE best-fitting unit. If no unit fits, set fit=false, unit_id=null, \
-draft=null, and give a short reason. If a unit fits, write the draft per the style \
-guide below. Treat fields that are 0 / unset as "unknown" — don't skip a lead just \
-because a unit's number is missing; only skip on a clear mismatch.
+CRITICAL — do NOT skip on location. The "Location:" field in an inquiry is where the \
+tenant CURRENTLY LIVES (the city they are moving FROM). It is NOT where they want to \
+rent. A tenant in another state, city, or suburb is completely normal and is usually \
+a RELOCATION — exactly the business this host wants. The desired location is already \
+settled: it is the property they inquired about. Never set fit=false because the \
+tenant's stated location differs from the unit's area.
+
+Set fit=false ONLY when there is a HARD, EXPLICIT, UNRESOLVABLE mismatch:
+- The tenant states a maximum budget clearly BELOW the unit's monthly_price \
+(only when monthly_price is set and > 0). "No Max" or a blank budget is never a skip.
+- The number of travelers clearly EXCEEDS max_occupancy (only when set > 0).
+- The tenant is travelling with pets AND pets_allowed is explicitly false for every unit.
+- The requested stay is clearly outside min_nights..max_nights.
+- The message is not from a prospective tenant at all (spam, a vendor, another host).
+
+Anything unknown, unset, 0, blank, "-", or ambiguous is NOT a mismatch — it is a \
+question to ask in the reply. If you are unsure, REPLY. When only one detail is a \
+problem but the tenant looks otherwise strong, still reply and raise that detail \
+honestly rather than skipping.
+
+Pick the SINGLE best-fitting unit — normally the one named in the "Property:" field \
+(match it against each unit's listing_match/name). If a unit fits, write the draft per \
+the style guide below. If you genuinely must skip, set fit=false, unit_id=null, \
+draft=null, and give a short, specific reason naming the hard mismatch.
 
 Only state unit facts that appear in the unit catalog. Never invent amenities, \
 prices, or availability.
@@ -172,6 +189,129 @@ def _lead_text(item: dict) -> str:
         "tenant inquiry:\n\n"
         + json.dumps(fields, indent=2)
     )
+
+
+# Forced-tool schema for a lifecycle step (follow-up, pre-arrival, etc.). Fit was
+# already decided when the deal was created, so a step only produces the message
+# — plus an explicit `skip` escape hatch for when sending would be wrong (e.g.
+# the guest already answered the question the follow-up would ask).
+STEP_TOOL = {
+    "name": "record_message",
+    "description": "Record the message to send for this lifecycle step.",
+    "strict": True,
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "message": {
+                "type": ["string", "null"],
+                "description": "The message to send, or null when skipping.",
+            },
+            "skip": {
+                "type": "boolean",
+                "description": "True if this step should NOT be sent for this guest.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "One short sentence explaining the message or the skip.",
+            },
+        },
+        "required": ["message", "skip", "reason"],
+        "additionalProperties": False,
+    },
+}
+
+STEP_SYSTEM = """You are the messaging assistant for a short-term-rental host, \
+writing as the host, {host_name}. You handle the whole guest lifecycle: the first \
+reply to an inquiry, follow-ups when a guest goes quiet, and the logistics messages \
+after they book (confirmation, pre-arrival, check-in, welcome, checkout).
+
+Absolute rules:
+- Only state facts that appear in the unit catalog or in the guest's own messages. \
+NEVER invent amenities, prices, addresses, access codes, policies, or availability.
+- If a needed detail is missing, say so plainly or ask — never fabricate a plausible \
+substitute. A wrong access code or address causes real harm.
+- Write in the first person as {host_name} and sign off with that name.
+- Match the style guide below. No emojis. No pressure tactics.
+- Set skip=true if this message would be inappropriate, redundant, or if the guest \
+has already moved past this stage.
+
+=== UNIT CATALOG ===
+{units}
+
+=== RESPONSE STYLE GUIDE ===
+{guide}
+"""
+
+
+def draft_step(item: dict, tenant_id: str, deal: dict, step: dict,
+               units: list[dict] | None = None, history: list[str] | None = None,
+               client=None) -> dict:
+    """Draft one lifecycle step for a deal.
+
+    Returns {message, skip, reason}. `step` is a sequences.py definition whose
+    `guidance` describes the intent of this particular touch; `history` is the
+    text we have already sent, so the model doesn't repeat itself.
+    """
+    import anthropic
+
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set in .env — cannot draft replies.")
+
+    settings = config.get_settings(tenant_id)
+    units = units if units is not None else config.get_units(tenant_id)
+    if client is None:
+        base_url = os.getenv("ANTHROPIC_RESPONDER_BASE_URL", "https://api.anthropic.com")
+        client = anthropic.Anthropic(api_key=api_key, base_url=base_url)
+
+    system = STEP_SYSTEM.format(
+        host_name=settings["host_name"] or "your host",
+        units=json.dumps(units, indent=2),
+        guide=settings["template"] or "",
+    )
+
+    context = {
+        "guest": deal.get("guest_name"),
+        "stage": deal.get("stage"),
+        "unit_id": deal.get("unit_id"),
+        "check_in": deal.get("check_in"),
+        "check_out": deal.get("check_out"),
+        "nights": deal.get("nights"),
+    }
+    inquiry = {
+        k: item.get(k)
+        for k in ("traveler", "sender", "received", "date", "title", "move_in",
+                  "move_out", "nights", "occupants", "pets", "budget", "raw",
+                  "body", "detail")
+        if item.get(k)
+    }
+    parts = [
+        f"STEP: {step['label']}\n{step['guidance']}",
+        "\nDEAL CONTEXT:\n" + json.dumps(context, indent=2),
+        "\nORIGINAL INQUIRY:\n" + json.dumps(inquiry, indent=2),
+    ]
+    if history:
+        parts.append(
+            "\nALREADY SENT TO THIS GUEST (do not repeat):\n"
+            + "\n---\n".join(history[-3:])
+        )
+
+    resp = client.messages.create(
+        model=MODEL,
+        max_tokens=1024,
+        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        tools=[STEP_TOOL],
+        tool_choice={"type": "tool", "name": "record_message"},
+        messages=[{"role": "user", "content": "\n".join(parts)}],
+    )
+    for block in resp.content:
+        if block.type == "tool_use" and block.name == "record_message":
+            d = dict(block.input)
+            log.info(
+                "Step %s for deal %s: skip=%s", step["id"], item.get("id"), d.get("skip")
+            )
+            return d
+    raise RuntimeError("Model did not return a record_message tool call.")
 
 
 def evaluate_lead(item: dict, tenant_id: str, units: list[dict] | None = None,

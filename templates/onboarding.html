@@ -61,6 +61,7 @@
     </div>
 
     <form method="post" action="{{ url_for('onboarding') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <div class="step">
         <h2><span class="n">1</span> Your host profile</h2>
         <p class="hint">How replies sign off, and the email address replies are sent from.</p>

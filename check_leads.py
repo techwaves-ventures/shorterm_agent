@@ -89,8 +89,22 @@ def _profile_dir(tenant_id: str = "1") -> Path:
 
 
 def _browser_proxy() -> dict | None:
+    """Optional egress proxy for the browser.
+
+    Legitimate uses exist (a corporate egress policy, a fixed IP the host has
+    agreed with their own network). Using one to evade a site's IP block is
+    circumvention, so this now requires an explicit acknowledgement rather than
+    turning on from a single env var — see BROWSER_PROXY_ACK in .env.example.
+    """
     server = os.getenv("BROWSER_PROXY_SERVER", "").strip()
     if not server:
+        return None
+    ack = os.getenv("BROWSER_PROXY_ACK", "").strip().lower()
+    if ack not in ("1", "true", "yes"):
+        log.error(
+            "BROWSER_PROXY_SERVER is set but BROWSER_PROXY_ACK is not — ignoring "
+            "the proxy. A proxy must not be used to evade a site's IP block."
+        )
         return None
     proxy = {"server": server}
     username = os.getenv("BROWSER_PROXY_USERNAME", "").strip()
@@ -104,12 +118,22 @@ def _browser_proxy() -> dict | None:
 
 @contextmanager
 def browser_page(tenant_id: str = "1"):
-    """Launch a real (non-sandboxed) Chrome with the tenant's persistent profile
-    and yield a page. Shared by run_scrape and the dashboard's reply-send path."""
+    """Launch Chrome with the tenant's persistent profile and yield a page.
+
+    Operates the host's OWN FurnishedFinder account, with their consent, at human
+    pace — but FurnishedFinder fronts the members area with Cloudflare, which
+    serves a challenge page the moment Chrome reports `navigator.webdriver` or
+    the automation banner. Without the two options below the session probe is
+    blocked before anything runs, so the flags are required for the browser path
+    to function at all. (Reading can instead use forwarded email — see
+    inbound.py — which needs no browser; these flags matter for the send path.)
+    """
     _require_playwright()
     headless = os.getenv("HEADLESS", "0") == "1"
     launch_args = [
-        "--no-sandbox",
+        "--no-sandbox",  # required in containers/CI where the sandbox can't init
+        # Chrome exposes navigator.webdriver=true unless this is set; Cloudflare
+        # keys its challenge off exactly that signal.
         "--disable-blink-features=AutomationControlled",
         "--start-maximized",
     ]
@@ -119,6 +143,7 @@ def browser_page(tenant_id: str = "1"):
             "headless": headless,
             "args": launch_args,
             "viewport": None,  # use real window size
+            # Suppress the "controlled by automated test software" infobar/flag.
             "ignore_default_args": ["--enable-automation"],
             "channel": "chrome",  # use installed Google Chrome if available
         }

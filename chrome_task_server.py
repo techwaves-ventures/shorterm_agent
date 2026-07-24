@@ -109,7 +109,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    if not _auth_configured():
+    if not _auth.configured():
         log.error("CHROME_TASK_BEARER_TOKEN and CHROME_TASK_HMAC_KEY are required")
     app.run(host=HOST, port=PORT, debug=False)
 

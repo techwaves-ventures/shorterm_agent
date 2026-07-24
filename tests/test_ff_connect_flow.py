@@ -175,13 +175,16 @@ def test_serverless_refresh_routing():
         # ...but /refresh must NOT call it — it enqueues a worker job instead.
         email = "webuser@test.local"
         if not models.get_user_by_email(email):
-            models.create_user(email, "pw-123456")
+            models.create_user(email, "test-passphrase-123")
         user = models.get_user_by_email(email)
         tid = user.tenant_id
 
         dashboard.app.config["TESTING"] = True
+        # These cases exercise scrape routing, not CSRF; the token flow has
+        # its own coverage. Without this the client's tokenless POSTs 400.
+        dashboard.app.config["WTF_CSRF_ENABLED"] = False
         client = dashboard.app.test_client()
-        r = client.post("/login", data={"email": email, "password": "pw-123456"}, follow_redirects=False)
+        r = client.post("/login", data={"email": email, "password": "test-passphrase-123"}, follow_redirects=False)
         check(r.status_code in (302, 303), "login redirects")
 
         r = client.post("/connect", data={"ff_email": "landlord@ff.test", "consent": "1"})
@@ -214,15 +217,18 @@ def test_force_worker_queue_routing():
 
     email = "force-worker@test.local"
     if not models.get_user_by_email(email):
-        models.create_user(email, "pw-123456")
+        models.create_user(email, "test-passphrase-123")
     user = models.get_user_by_email(email)
     tid = user.tenant_id
 
     os.environ["FORCE_WORKER_QUEUE"] = "1"
     try:
         dashboard.app.config["TESTING"] = True
+        # These cases exercise scrape routing, not CSRF; the token flow has
+        # its own coverage. Without this the client's tokenless POSTs 400.
+        dashboard.app.config["WTF_CSRF_ENABLED"] = False
         client = dashboard.app.test_client()
-        r = client.post("/login", data={"email": email, "password": "pw-123456"}, follow_redirects=False)
+        r = client.post("/login", data={"email": email, "password": "test-passphrase-123"}, follow_redirects=False)
         check(r.status_code in (302, 303), "force-worker login redirects")
 
         r = client.post("/connect", data={"ff_email": "force@ff.test", "consent": "1"})

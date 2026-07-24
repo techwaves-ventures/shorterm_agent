@@ -52,17 +52,25 @@
           {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
         {% endwith %}
         <form method="post" action="{{ action }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          {# email_field / password_field let this one card serve login, signup,
+             "forgot password" (email only) and "set a new password" (password only). #}
+          {% if email_field is not defined or email_field %}
           <div class="field">
             <label for="email">Email</label>
             <input id="email" name="email" type="email" autocomplete="email" required autofocus
                    placeholder="you@example.com">
           </div>
+          {% endif %}
+          {% if password_field is not defined or password_field %}
           <div class="field" style="margin-bottom:0">
-            <label for="password">Password</label>
+            <label for="password">{{ 'New password' if email_field is defined and not email_field else 'Password' }}</label>
             <input id="password" name="password" type="password"
-                   autocomplete="{{ 'new-password' if title == 'Sign up' else 'current-password' }}"
+                   autocomplete="{{ 'current-password' if title == 'Log in' else 'new-password' }}"
                    required placeholder="••••••••">
+            {% if password_hint %}<div class="sub" style="margin-top:6px">{{ password_hint }}</div>{% endif %}
           </div>
+          {% endif %}
           <button type="submit" class="btn btn--primary btn--block">{{ title }}</button>
         </form>
         <div class="alt">{{ alt_text|safe }}</div>

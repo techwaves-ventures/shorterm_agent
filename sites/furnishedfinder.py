@@ -2,6 +2,7 @@
 import hashlib
 import logging
 import os
+import random
 import re
 
 # Optional at import time so the web app (which imports this adapter via runner)
@@ -21,8 +22,15 @@ log = logging.getLogger(__name__)
 
 SITE_NAME = "furnishedfinder"
 HOME_URL = "https://www.furnishedfinder.com/"
+# The members landing page — a person lands here after logging in, before they
+# ever click into leads. Used to warm up the session (see _warm_up).
+DASHBOARD_URL = "https://www.furnishedfinder.com/members/pm-dashboard"
 LEADS_URL = "https://www.furnishedfinder.com/members/tenant-lead"
 MESSAGES_URL = "https://www.furnishedfinder.com/members/tenant-message"
+# The host's own listings — the only place FurnishedFinder exposes property
+# photos and the real asking price. Lead pages carry neither (they show tenant
+# avatars only), so the unit catalog is seeded from here.
+PROPERTIES_URL = "https://www.furnishedfinder.com/members/my-properties"
 
 # Optional UI hook: set by the dashboard runner to surface progress (e.g. the
 # moment we start waiting for an OTP). Signature: STATUS_CB(state, message).
@@ -80,17 +88,19 @@ def set_context(username: str, otp_provider=None, status_cb=None) -> None:
     """Bind the FF account for the next run. `otp_provider()` (if given) is called
     to obtain an OTP code (blocking) instead of polling the global ./OTP_CODE.
     Resets the per-page login flag so the new account/profile re-authenticates."""
-    global _CONTEXT, STATUS_CB, _session_logged_in
+    global _CONTEXT, STATUS_CB, _session_logged_in, _session_warmed
     _CONTEXT = {"username": username or "", "otp_provider": otp_provider}
     STATUS_CB = status_cb
     _session_logged_in = False
+    _session_warmed = False
 
 
 def clear_context() -> None:
-    global _CONTEXT, STATUS_CB, _session_logged_in
+    global _CONTEXT, STATUS_CB, _session_logged_in, _session_warmed
     _CONTEXT = None
     STATUS_CB = None
     _session_logged_in = False
+    _session_warmed = False
 
 
 def _username() -> str:
@@ -356,9 +366,53 @@ def _login(page: Page) -> None:
 
 
 _session_logged_in = False
+_session_warmed = False
+
+
+def _human_scroll(page: Page) -> None:
+    """A small scroll + settle, the way a person skims a page before clicking on."""
+    try:
+        page.mouse.wheel(0, random.randint(280, 900))
+        page.wait_for_timeout(random.randint(350, 1100))
+    except Exception:
+        pass
+
+
+def _warm_up(page: Page) -> None:
+    """Approach the members area like a person, not a deep link.
+
+    Cloudflare challenges a browser that jumps straight to a deep member URL
+    (/members/tenant-lead) with no prior context — that's what was getting the
+    scraper blocked. A real host lands on the home page, opens their dashboard,
+    and only then reaches leads; navigating that path by hand is exactly what
+    clears the challenge. We mirror it — home → dashboard, human-paced, with a
+    scroll — before any deep navigation. Once per run (module flag), and
+    best-effort: a warm-up hiccup must not fail the check, but a challenge during
+    warm-up is still surfaced.
+    """
+    global _session_warmed
+    if _session_warmed:
+        return
+    for url, ctx, pause in (
+        (HOME_URL, "warm-up home", 2200),
+        (DASHBOARD_URL, "warm-up dashboard", 2600),
+    ):
+        try:
+            _safe_goto(page, url, ctx)
+            page.wait_for_timeout(pause + random.randint(0, 1400))
+            _raise_if_blocked(page, ctx)
+            _human_scroll(page)
+        except FurnishedFinderBlocked:
+            raise
+        except Exception:
+            log.info("Warm-up step %s didn't complete cleanly; continuing", ctx)
+    _session_warmed = True
 
 
 def _session_ok(page: Page) -> bool:
+    # Warm the session the way a human would before touching the leads deep-link,
+    # so Cloudflare sees a normal browsing path rather than a bot deep-hit.
+    _warm_up(page)
     _safe_goto(page, LEADS_URL, "session probe")
     page.wait_for_timeout(2500)
     log.info("Session probe: %s (title=%r)", page.url, page.title())
@@ -457,6 +511,18 @@ def _parse_lead_detail(detail: str) -> dict:
         facts["move_in"] = _norm_date(rng.group(1))
         facts["move_out"] = _norm_date(rng.group(2))
 
+    # When the lead actually arrived. The row-derived `received` is unreliable —
+    # it takes the last M/D/YY in the row, which is the move-OUT date whenever the
+    # received date isn't rendered in that numeric form. The detail page states it
+    # explicitly ("Date received: July 18, 2026"), so prefer that. Matches both the
+    # inline and label-on-its-own-line layouts.
+    recv = re.search(
+        r"Date\s+received:?\s*\n?\s*([A-Za-z]{3}[a-z]*\.?\s+\d{1,2},?\s*\d{4})",
+        detail, re.I,
+    )
+    if recv:
+        facts["received_at"] = _norm_date(recv.group(1))
+
     phone = re.search(
         r"(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}", detail
     )
@@ -508,6 +574,142 @@ def _find_inquiry_block(page: Page) -> str:
         return ""
 
 
+# Filenames/alt text that mark site furniture rather than a listing photo.
+_IMAGE_NOISE = (
+    "logo", "avatar", "icon", "sprite", "placeholder", "badge", "banner",
+    "favicon", "profile", "flag", "star", "spinner", "loading", "pixel",
+)
+
+
+def _property_images(page: Page, limit: int = 4) -> list[str]:
+    """Listing photo URLs visible on the current (lead detail) page.
+
+    Selected by rendered size rather than by CSS selector: FurnishedFinder's
+    markup shifts, but a property photo is always substantially larger than the
+    surrounding chrome. Small, inline, or furniture-named images are dropped so
+    a logo can never be presented to the host as a photo of someone's home.
+
+    Returns [] on any failure — photos are decorative and must never fail a scrape.
+    """
+    js = """() => {
+      const out = [];
+      for (const img of document.querySelectorAll('img')) {
+        const r = img.getBoundingClientRect();
+        const src = img.currentSrc || img.src || '';
+        if (!src || src.startsWith('data:')) continue;
+        out.push({
+          src: src,
+          w: Math.round(r.width || img.naturalWidth || 0),
+          h: Math.round(r.height || img.naturalHeight || 0),
+          alt: img.alt || ''
+        });
+      }
+      return out;
+    }"""
+    try:
+        candidates = page.evaluate(js) or []
+    except Exception:
+        return []
+
+    seen: set[str] = set()
+    picked: list[tuple[int, str]] = []
+    for c in candidates:
+        src = c.get("src") or ""
+        key = src.split("?")[0]
+        if not src.startswith("http") or key in seen or key.lower().endswith(".svg"):
+            continue
+        if any(token in (key + " " + (c.get("alt") or "")).lower() for token in _IMAGE_NOISE):
+            continue
+        w, h = int(c.get("w") or 0), int(c.get("h") or 0)
+        if w < 120 or h < 90:
+            continue
+        seen.add(key)
+        picked.append((w * h, src))
+    picked.sort(reverse=True)  # biggest first: the hero shot beats a thumbnail
+    return [src for _area, src in picked[:limit]]
+
+
+_PRICE_RE = re.compile(r"\$([\d,]{3,})")
+_PROPERTY_STATUSES = ("active", "pending", "inactive", "paused", "expired")
+
+
+def scrape_properties(page: Page) -> list[dict]:
+    """The host's own listings: name, asking price, location, address and photos.
+
+    Each table row is one property. Parsed positionally-but-defensively — we key
+    off recognisable shapes (a `$` amount, a "City, ST" line, a status word)
+    rather than column indexes, so a reordered or extra column doesn't break it.
+    Returns [] on any failure: the catalog is an enhancement, and a miss here
+    must never fail the lead scrape it rides along with.
+    """
+    try:
+        _safe_goto(page, PROPERTIES_URL, "properties page")
+        page.wait_for_timeout(3500)
+        _raise_if_blocked(page, "properties page")
+    except FurnishedFinderBlocked:
+        raise
+    except Exception:
+        log.exception("Could not open the properties page")
+        return []
+
+    js = """() => [...document.querySelectorAll('table tr')].map(tr => {
+      const img = tr.querySelector('img');
+      return {
+        text: tr.innerText || '',
+        img: img ? (img.currentSrc || img.src || '') : '',
+        w: img ? (img.naturalWidth || 0) : 0
+      };
+    })"""
+    try:
+        rows = page.evaluate(js) or []
+    except Exception:
+        log.exception("Could not read the properties table")
+        return []
+
+    out: list[dict] = []
+    for row in rows:
+        text = (row.get("text") or "").strip()
+        if not text or len(text) < 12:
+            continue
+        lines = [ln.strip() for ln in text.replace("\t", "\n").splitlines() if ln.strip()]
+        if not lines:
+            continue
+        name = lines[0]
+        low = name.lower()
+        # Skip the header row and any all-boilerplate row.
+        if low.startswith("property") or low in ("add", "actions"):
+            continue
+
+        prop: dict = {"name": name}
+        price = _PRICE_RE.search(text)
+        if price:
+            try:
+                prop["monthly_price"] = int(price.group(1).replace(",", ""))
+            except ValueError:
+                pass
+        for ln in lines[1:]:
+            # "Washington, DC" — city + state is the area we screen against.
+            if "area" not in prop and re.match(r"^[A-Z][\w .'-]+,\s*[A-Z]{2}$", ln):
+                prop["area"] = ln
+            # "5309 7th St NW" — a street address starts with a number.
+            elif "address" not in prop and re.match(r"^\d+\s+\S", ln):
+                prop["address"] = ln
+            elif "status" not in prop and ln.lower() in _PROPERTY_STATUSES:
+                prop["status"] = ln
+        img = row.get("img") or ""
+        # The row thumbnail points at the full-size asset; keep it if it's a
+        # real photo rather than an icon.
+        if img.startswith("http") and int(row.get("w") or 0) >= 200:
+            if not any(tok in img.lower() for tok in _IMAGE_NOISE):
+                prop["images"] = [img]
+        if prop.get("monthly_price") or prop.get("area") or prop.get("images"):
+            out.append(prop)
+
+    log.info("Found %d propert%s on the listings page",
+             len(out), "y" if len(out) == 1 else "ies")
+    return out
+
+
 def _real_lead_rows(page: Page) -> list:
     """Visible lead <tr> rows (header skipped) as (locator, text) pairs."""
     out = []
@@ -525,13 +727,13 @@ def _real_lead_rows(page: Page) -> list:
     return out
 
 
-def _scrape_lead_detail(page: Page, row, move_in: str) -> str:
-    """Click a lead row open and return its detail-page inquiry text.
+def _scrape_lead_detail(page: Page, row, move_in: str) -> tuple[str, list[str]]:
+    """Click a lead row open and return (inquiry text, listing photo URLs).
 
     The travel-dates cell navigates to the lead's `?leadId=…` detail route (it
-    is NOT a modal). We click, wait for that route, capture the inquiry block,
-    and leave the caller to navigate back to the list. Returns "" on failure so
-    the caller falls back to the row text.
+    is NOT a modal). We click, wait for that route, capture the inquiry block
+    and any listing photos, and leave the caller to navigate back to the list.
+    Returns ("", []) on failure so the caller falls back to the row text.
     """
     clicked = False
     sels = []
@@ -555,14 +757,14 @@ def _scrape_lead_detail(page: Page, row, move_in: str) -> str:
             row.click()
             clicked = True
         except Exception:
-            return ""
+            return "", []
 
     try:
         page.wait_for_url("**leadId=**", timeout=5000)
     except Exception:
         pass  # capture whatever rendered even if the URL pattern shifts
     page.wait_for_timeout(1500)
-    return _find_inquiry_block(page)
+    return _find_inquiry_block(page), _property_images(page)
 
 
 def _extract_leads(page: Page) -> list[dict]:
@@ -654,7 +856,9 @@ def _extract_leads(page: Page) -> list[dict]:
             if row is None:
                 continue
 
-            detail = _scrape_lead_detail(page, row, move_in)
+            detail, images = _scrape_lead_detail(page, row, move_in)
+            if images:
+                item["images"] = images
             if detail:
                 item["detail"] = detail
                 facts = _parse_lead_detail(detail)
@@ -759,6 +963,23 @@ def check(page: Page) -> list[dict]:
     for it in _extract_messages(page):
         it["kind"] = "message"
         out.append(it)
+
+    # The host's own listings, so the unit catalog can be seeded with real
+    # photos and the actual asking price instead of asking them to retype it.
+    # Never fatal: a failure here must not cost the caller their leads.
+    try:
+        for prop in scrape_properties(page):
+            out.append({
+                "id": _hash("property", prop["name"]),
+                "kind": "property",
+                "title": prop["name"],
+                "url": PROPERTIES_URL,
+                **prop,
+            })
+    except FurnishedFinderBlocked:
+        raise
+    except Exception:
+        log.exception("Property scrape failed; continuing with leads/messages")
 
     return out
 

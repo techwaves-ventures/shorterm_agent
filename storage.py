@@ -182,6 +182,49 @@ def get_recent(tenant_id: str, site: str, kind: str, limit: int = 20) -> list[di
     return out
 
 
+def all_items(tenant_id: str, site: str) -> dict[str, dict]:
+    """Every stored item for a tenant+site, keyed by item_id.
+
+    One query for the whole board: the dashboard joins deals to their scraped
+    payloads, and doing that per-deal would be N round-trips per page load.
+    """
+    out: dict[str, dict] = {}
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT item_id, payload, first_seen, kind FROM seen "
+            "WHERE tenant_id=? AND site=?",
+            (tenant_id, site),
+        ).fetchall()
+    for item_id, payload, first_seen, kind in rows:
+        item = _parse_payload(payload)
+        item["first_seen"] = first_seen
+        item.setdefault("kind", kind)
+        item.setdefault("id", item_id)
+        out[item_id] = item
+    return out
+
+
+def get_item(tenant_id: str, site: str, item_id: str) -> dict | None:
+    """One stored item by id, regardless of kind (tagged with its kind).
+
+    Direct lookup on the primary key — the automation scheduler resolves deals
+    back to their scraped payload constantly, and scanning get_recent() for that
+    would be O(n) per deal.
+    """
+    with _conn() as c:
+        row = c.execute(
+            """SELECT payload, first_seen, kind FROM seen
+               WHERE tenant_id=? AND site=? AND item_id=?""",
+            (tenant_id, site, str(item_id)),
+        ).fetchone()
+    if not row:
+        return None
+    item = _parse_payload(row[0])
+    item["first_seen"] = row[1]
+    item.setdefault("kind", row[2])
+    return item
+
+
 # ---------------------------------------------------------------------------
 # Responder decisions
 # ---------------------------------------------------------------------------

@@ -3,18 +3,18 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Shorterm — Faster, on-brand replies for FurnishedFinder hosts</title>
-  <meta name="description" content="Shorterm reads each FurnishedFinder inquiry, matches it to the right unit, and drafts a personalized, fact-grounded reply. You approve; it sends. Close mid-term bookings without living in your inbox.">
+  <title>Shorterm — Win mid-term bookings by replying first</title>
+  <meta name="description" content="Shorterm answers every FurnishedFinder inquiry in minutes, follows up until they book, and handles the pre-arrival messages. Grounded only in your facts. You stay in control.">
   {% include "_theme.html" %}
   <style>
     body { background:
-      radial-gradient(1100px 620px at 78% -8%, rgba(58,99,212,.06), transparent 60%),
-      radial-gradient(760px 420px at 5% 8%, rgba(58,99,212,.035), transparent 62%),
+      radial-gradient(1200px 680px at 78% -10%, rgba(58,99,212,.09), transparent 62%),
+      radial-gradient(820px 460px at 3% 6%, rgba(58,99,212,.05), transparent 64%),
       var(--bg); }
 
-    /* Nav */
-    .lnav { position: sticky; top: 0; z-index: 30; background: rgba(247,248,250,.82);
-      backdrop-filter: blur(10px); border-bottom: 1px solid transparent; transition: border-color .2s; }
+    /* ---- Nav ---- */
+    .lnav { position: sticky; top: 0; z-index: 40; background: rgba(247,248,250,.8);
+      backdrop-filter: blur(12px); border-bottom: 1px solid transparent; transition: border-color .25s; }
     .lnav.scrolled { border-color: var(--border); }
     .lnav__inner { max-width: var(--maxw); margin: 0 auto; padding: 15px 24px;
       display: flex; align-items: center; justify-content: space-between; }
@@ -23,97 +23,194 @@
       padding: 7px 12px; border-radius: 8px; }
     .lnav__links a:hover { color: var(--text); text-decoration: none; }
     .lnav__links a.cta { color: #fff; background: var(--grad-brand); font-weight: 600;
-      box-shadow: 0 2px 12px -3px rgba(91,140,255,.5); }
-    @media (max-width: 620px) { .lnav__links .hide-sm { display: none; } }
+      box-shadow: 0 2px 14px -3px rgba(91,140,255,.55); }
+    @media (max-width: 660px) { .lnav__links .hide-sm { display: none; } }
 
-    section { padding: 68px 0; }
+    section { padding: 76px 0; }
     .divider { border-top: 1px solid var(--border); }
-    .eyebrow { color: var(--brand-2); font-size: .78rem; font-weight: 700; letter-spacing: .06em;
+    .eyebrow { color: var(--brand-2); font-size: .78rem; font-weight: 700; letter-spacing: .07em;
       text-transform: uppercase; }
+    h2.sec { font-size: 2rem; max-width: 680px; letter-spacing: -.02em; }
+    .sub { color: var(--muted); font-size: 1.03rem; max-width: 640px; margin-top: 12px; }
 
-    /* Hero */
-    .hero { padding: 72px 0 60px; }
-    .hero-grid { display: grid; grid-template-columns: 1.05fr .95fr; gap: 48px; align-items: center; }
-    .hero h1 { font-size: 2.9rem; margin: 14px 0 18px; max-width: 620px; }
-    .hero .lead { font-size: 1.14rem; color: var(--muted); max-width: 560px; }
-    .hero-ctas { display: flex; gap: 12px; margin: 28px 0 18px; flex-wrap: wrap; }
-    .trust { color: var(--muted); font-size: .86rem; display: flex; gap: 8px; flex-wrap: wrap;
+    /* ---- Scroll reveal ---- */
+    .reveal { opacity: 0; transform: translateY(18px); transition: opacity .7s cubic-bezier(.2,.7,.3,1),
+      transform .7s cubic-bezier(.2,.7,.3,1); }
+    .reveal.in { opacity: 1; transform: none; }
+    .reveal.d1 { transition-delay: .08s } .reveal.d2 { transition-delay: .16s }
+    .reveal.d3 { transition-delay: .24s } .reveal.d4 { transition-delay: .32s }
+
+    /* ---- Hero ---- */
+    .hero { padding: 78px 0 64px; }
+    .hero-grid { display: grid; grid-template-columns: 1.02fr .98fr; gap: 52px; align-items: center; }
+    .hero h1 { font-size: 3.05rem; margin: 15px 0 20px; max-width: 620px; letter-spacing: -.03em;
+      line-height: 1.06; }
+    .hero h1 .grad { background: var(--grad-brand); -webkit-background-clip: text;
+      background-clip: text; color: transparent; }
+    .hero .lead { font-size: 1.16rem; color: var(--muted); max-width: 545px; }
+    .hero-ctas { display: flex; gap: 12px; margin: 30px 0 20px; flex-wrap: wrap; }
+    .trust { color: var(--muted); font-size: .86rem; display: flex; gap: 9px; flex-wrap: wrap;
       align-items: center; }
     .trust b { color: var(--text); font-weight: 600; }
     .trust .dot { color: var(--faint); }
-    @media (max-width: 860px) {
-      .hero-grid { grid-template-columns: 1fr; gap: 36px; }
-      .hero h1 { font-size: 2.3rem; }
+    @media (max-width: 900px) {
+      .hero-grid { grid-template-columns: 1fr; gap: 40px; }
+      .hero h1 { font-size: 2.4rem; }
       .hero .lead { max-width: none; }
     }
+    @media (max-width: 620px) { .hero h1 { font-size: 2.05rem; } section { padding: 56px 0; } }
 
-    /* Product mock */
-    .mock { background: var(--surface); border: 1px solid var(--border-2); border-radius: 16px;
-      box-shadow: var(--shadow-lg); overflow: hidden; }
-    .mock__bar { display: flex; align-items: center; gap: 7px; padding: 12px 14px;
+    /* ---- Animated product demo ---- */
+    .demo { background: var(--surface); border: 1px solid var(--border-2); border-radius: 18px;
+      box-shadow: var(--shadow-lg); overflow: hidden; position: relative; }
+    .demo__bar { display: flex; align-items: center; gap: 7px; padding: 12px 15px;
       border-bottom: 1px solid var(--border); background: var(--surface-2); }
-    .mock__bar i { width: 10px; height: 10px; border-radius: 50%; background: var(--border-2); display: block; }
-    .mock__bar .u { margin-left: 10px; font-size: .75rem; color: var(--faint); }
-    .mock__body { padding: 16px; }
-    .mock__lead { background: var(--bg-2); border: 1px solid var(--border); border-radius: 12px;
-      padding: 14px; }
-    .mock__row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-    .mock__who { font-weight: 600; font-size: .92rem; }
-    .mock__chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 10px 0; }
-    .mock__chip { font-size: .72rem; background: var(--surface-3); border: 1px solid var(--border);
-      color: var(--muted); border-radius: 999px; padding: 2px 9px; }
-    .mock__draft { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
-      padding: 11px 12px; font-size: .82rem; color: var(--muted); line-height: 1.55; margin-top: 10px; }
-    .mock__actions { display: flex; gap: 8px; margin-top: 12px; }
-    .mock__btn { font-size: .78rem; font-weight: 600; padding: 7px 13px; border-radius: 8px;
+    .demo__bar i { width: 10px; height: 10px; border-radius: 50%; background: var(--border-2); display: block; }
+    .demo__bar .u { margin-left: 10px; font-size: .75rem; color: var(--faint); }
+    .demo__clock { margin-left: auto; font-size: .72rem; font-weight: 600; color: var(--brand-2);
+      font-variant-numeric: tabular-nums; background: var(--brand-soft); border: 1px solid var(--brand-line);
+      padding: 2px 9px; border-radius: 999px; }
+    .demo__body { padding: 17px; min-height: 340px; }
+
+    .demo__idle { display: flex; align-items: center; gap: 10px; color: var(--faint);
+      font-size: .86rem; padding: 26px 4px; }
+    .pulse { width: 9px; height: 9px; border-radius: 50%; background: var(--ok); position: relative; }
+    .pulse::after { content: ""; position: absolute; inset: -5px; border-radius: 50%;
+      border: 2px solid var(--ok); opacity: .5; animation: ring 1.8s ease-out infinite; }
+    @keyframes ring { 0% { transform: scale(.6); opacity: .6 } 100% { transform: scale(1.5); opacity: 0 } }
+
+    .lead-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: 13px;
+      padding: 15px; opacity: 0; transform: translateY(10px); transition: all .5s cubic-bezier(.2,.7,.3,1); }
+    .lead-card.show { opacity: 1; transform: none; }
+    .lc__row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .lc__who { font-weight: 700; font-size: .95rem; }
+    .lc__prop { color: var(--muted); font-size: .82rem; margin-top: 3px; }
+    .lc__chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 11px 0 0; }
+    .lc__chip { font-size: .72rem; background: var(--surface); border: 1px solid var(--border);
+      color: var(--muted); border-radius: 999px; padding: 3px 10px; }
+
+    .think { display: flex; align-items: center; gap: 9px; margin-top: 13px; font-size: .8rem;
+      color: var(--brand-2); font-weight: 600; opacity: 0; transition: opacity .3s; }
+    .think.show { opacity: 1; }
+    .think .dots i { width: 4px; height: 4px; border-radius: 50%; background: var(--brand-2);
+      display: inline-block; margin-right: 3px; animation: bob 1.1s infinite; }
+    .think .dots i:nth-child(2) { animation-delay: .18s } .think .dots i:nth-child(3) { animation-delay: .36s }
+    @keyframes bob { 0%,60%,100% { transform: translateY(0); opacity: .4 } 30% { transform: translateY(-4px); opacity: 1 } }
+
+    .verdict { margin-top: 12px; background: var(--brand-soft); border: 1px solid var(--brand-line);
+      border-radius: 10px; padding: 9px 12px; font-size: .8rem; opacity: 0; max-height: 0;
+      overflow: hidden; transition: opacity .4s, max-height .4s; }
+    .verdict.show { opacity: 1; max-height: 90px; }
+    .verdict b { color: var(--brand-2); }
+
+    .draft { background: var(--surface); border: 1px solid var(--border); border-radius: 11px;
+      padding: 12px 13px; font-size: .83rem; color: var(--text); line-height: 1.6; margin-top: 11px;
+      min-height: 84px; opacity: 0; transition: opacity .3s; }
+    .draft.show { opacity: 1; }
+    .caret { display: inline-block; width: 2px; height: 1em; background: var(--brand);
+      vertical-align: -2px; animation: blink .9s steps(1) infinite; }
+    @keyframes blink { 50% { opacity: 0 } }
+
+    .demo__actions { display: flex; gap: 8px; margin-top: 13px; align-items: center;
+      opacity: 0; transition: opacity .35s; }
+    .demo__actions.show { opacity: 1; }
+    .demo__btn { font-size: .79rem; font-weight: 600; padding: 8px 14px; border-radius: 9px;
       background: var(--grad-brand); color: #fff; }
-    .mock__btn.ghost { background: var(--surface-3); color: var(--muted); border: 1px solid var(--border); }
+    .demo__btn.ghost { background: var(--surface-3); color: var(--muted); border: 1px solid var(--border); }
+    .sent { display: flex; align-items: center; gap: 7px; font-size: .82rem; font-weight: 700;
+      color: var(--ok); opacity: 0; transform: scale(.9); transition: all .35s cubic-bezier(.2,1.4,.4,1); }
+    .sent.show { opacity: 1; transform: none; }
 
-    h2.sec { font-size: 1.85rem; max-width: 640px; }
-    .sub { color: var(--muted); font-size: 1.02rem; max-width: 620px; margin-top: 10px; }
-    .tiles, .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-      gap: 16px; margin-top: 30px; }
-    .tile, .card-m { background: var(--surface); border: 1px solid var(--border);
-      border-radius: var(--radius-lg); padding: 22px; }
-    .tile h3, .card-m h3 { font-size: 1rem; margin-bottom: 7px; }
-    .tile p, .card-m p { margin: 0; color: var(--muted); font-size: .9rem; }
-    .card-m .ic { width: 34px; height: 34px; border-radius: 9px; background: var(--brand-soft);
-      display: flex; align-items: center; justify-content: center; margin-bottom: 12px; font-size: 1.05rem; }
+    .demo__steps { display: flex; gap: 5px; padding: 0 17px 15px; }
+    .demo__steps span { height: 3px; flex: 1; border-radius: 2px; background: var(--surface-3); }
+    .demo__steps span.on { background: var(--grad-brand); }
 
-    .steps { counter-reset: step; margin-top: 30px; display: grid; gap: 14px; }
+    /* ---- Stat band ---- */
+    .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 18px;
+      margin-top: 34px; }
+    .stat { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+      padding: 22px; }
+    .stat b { display: block; font-size: 1.9rem; letter-spacing: -.025em; line-height: 1.1;
+      background: var(--grad-brand); -webkit-background-clip: text; background-clip: text; color: transparent; }
+    .stat span { color: var(--muted); font-size: .87rem; display: block; margin-top: 6px; }
+
+    /* ---- Feature cards with SVG icons ---- */
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 16px; margin-top: 32px; }
+    .card-m { background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); padding: 24px; transition: transform .25s, box-shadow .25s; }
+    .card-m:hover { transform: translateY(-3px); box-shadow: var(--shadow-md); }
+    .card-m h3 { font-size: 1.02rem; margin-bottom: 8px; }
+    .card-m p { margin: 0; color: var(--muted); font-size: .9rem; }
+    .ic { width: 38px; height: 38px; border-radius: 11px; background: var(--brand-soft);
+      border: 1px solid var(--brand-line); display: flex; align-items: center;
+      justify-content: center; margin-bottom: 14px; color: var(--brand-2); }
+
+    /* ---- Timeline (lifecycle) ---- */
+    .tl { margin-top: 34px; position: relative; padding-left: 30px; }
+    .tl::before { content: ""; position: absolute; left: 9px; top: 8px; bottom: 8px; width: 2px;
+      background: linear-gradient(180deg, var(--brand-line), var(--border), transparent); }
+    .tl__item { position: relative; padding: 0 0 26px 4px; }
+    .tl__item::before { content: ""; position: absolute; left: -26px; top: 5px; width: 12px; height: 12px;
+      border-radius: 50%; background: var(--surface); border: 2px solid var(--brand); }
+    .tl__item.soft::before { border-color: var(--border-2); }
+    .tl__when { font-size: .74rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+      color: var(--brand-2); }
+    .tl__item.soft .tl__when { color: var(--faint); }
+    .tl__item h3 { font-size: 1rem; margin: 4px 0 4px; }
+    .tl__item p { color: var(--muted); font-size: .9rem; margin: 0; }
+
+    /* ---- Property cards ---- */
+    .props { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 16px;
+      margin-top: 30px; }
+    .prop { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+      overflow: hidden; }
+    .prop__img { height: 118px; position: relative; overflow: hidden;
+      background: linear-gradient(135deg, #dbe4fb, #eef2fb 55%, #e6ecfa); }
+    .prop__img svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+    .prop__meta { padding: 14px 16px; }
+    .prop__meta h4 { font-size: .92rem; font-weight: 650; }
+    .prop__meta p { color: var(--muted); font-size: .8rem; margin-top: 3px; }
+
+    .steps { counter-reset: step; margin-top: 32px; display: grid; gap: 14px; }
     .steps .s { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
-      padding: 20px 22px 20px 64px; position: relative; }
+      padding: 21px 22px 21px 66px; position: relative; }
     .steps .s::before { counter-increment: step; content: counter(step); position: absolute;
-      left: 20px; top: 20px; width: 30px; height: 30px; border-radius: 999px; background: var(--grad-brand);
+      left: 21px; top: 21px; width: 30px; height: 30px; border-radius: 999px; background: var(--grad-brand);
       color: #fff; font-weight: 700; display: flex; align-items: center; justify-content: center; font-size: .9rem; }
     .steps .s h3 { font-size: 1rem; margin-bottom: 5px; }
     .steps .s p { margin: 0; color: var(--muted); font-size: .9rem; }
 
-    .pricing { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 18px; margin-top: 30px; }
+    .pricing { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 18px; margin-top: 32px; }
     .plan { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
-      padding: 24px 22px; position: relative; }
+      padding: 26px 23px; position: relative; transition: transform .25s, box-shadow .25s; }
+    .plan:hover { transform: translateY(-3px); box-shadow: var(--shadow-md); }
     .plan.hot { border-color: var(--brand-line); box-shadow: 0 0 0 1px var(--brand-line) inset, var(--shadow-md); }
     .plan h3 { font-size: 1.1rem; }
-    .plan .price { font-size: 1.9rem; font-weight: 700; margin: 8px 0; letter-spacing: -.02em; }
+    .plan .price { font-size: 2rem; font-weight: 700; margin: 8px 0; letter-spacing: -.025em; }
     .plan .price small { font-size: .82rem; color: var(--muted); font-weight: 500; }
     .plan p { color: var(--muted); font-size: .86rem; margin: 0; }
     .plan .tag { position: absolute; top: 18px; right: 18px; }
 
     details { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-      padding: 15px 20px; margin-bottom: 10px; }
+      padding: 16px 20px; margin-bottom: 10px; }
     details summary { cursor: pointer; font-weight: 600; font-size: .95rem; }
     details summary::-webkit-details-marker { color: var(--brand-2); }
     details p { color: var(--muted); margin-top: 10px; font-size: .9rem; }
 
-    .cta-band { background:
-      linear-gradient(180deg, rgba(58,99,212,.07), rgba(58,99,212,.02));
-      border: 1px solid var(--brand-line); border-radius: var(--radius-lg); padding: 40px 32px; }
-    .waitlist { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 22px; max-width: 640px; }
+    .cta-band { background: linear-gradient(180deg, rgba(58,99,212,.09), rgba(58,99,212,.02));
+      border: 1px solid var(--brand-line); border-radius: var(--radius-lg); padding: 44px 34px; }
+    .waitlist { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 24px; max-width: 660px; }
     .waitlist input { flex: 1 1 200px; }
     .waitlist input.units { flex: 0 1 120px; }
-    footer { padding: 36px 0; color: var(--faint); font-size: .84rem; border-top: 1px solid var(--border); }
+    footer { padding: 38px 0; color: var(--faint); font-size: .84rem; border-top: 1px solid var(--border); }
 
-    @media (max-width: 620px) { .hero h1 { font-size: 2rem; } section { padding: 52px 0; } }
+    /* Anyone who asks for less motion gets the finished state, not a loop. */
+    @media (prefers-reduced-motion: reduce) {
+      .reveal { opacity: 1 !important; transform: none !important; transition: none !important; }
+      .pulse::after, .think .dots i, .caret { animation: none !important; }
+      .demo *, .card-m, .plan { transition: none !important; }
+    }
   </style>
 </head>
 <body>
@@ -131,6 +228,7 @@
       </a>
       <div class="lnav__links">
         <a href="#how" class="hide-sm">How it works</a>
+        <a href="#lifecycle" class="hide-sm">Lifecycle</a>
         <a href="#pricing" class="hide-sm">Pricing</a>
         <a href="{{ url_for('login') }}">Log in</a>
         <a class="cta" href="#pilot">Request access</a>
@@ -143,136 +241,423 @@
       {% for m in messages %}<div class="flash" style="margin-top:18px">{{ m }}</div>{% endfor %}
     {% endwith %}
 
-    <!-- Hero -->
+    <!-- ===================== Hero ===================== -->
     <section class="hero">
       <div class="hero-grid">
-        <div>
-          <div class="eyebrow">For FurnishedFinder operators &amp; property managers</div>
-          <h1>Reply to every lead in seconds — in your voice, with your facts.</h1>
-          <p class="lead">Shorterm reads each FurnishedFinder inquiry, matches it to the right unit, and
-            drafts a personalized reply grounded only in the details you provide. You review and click send.
-            Nothing goes out without you.</p>
+        <div class="reveal">
+          <div class="eyebrow">For FurnishedFinder hosts &amp; property managers</div>
+          <h1>Your inquiries get answered in minutes.<br><span class="grad">Even the 2am ones.</span></h1>
+          <p class="lead">Every FurnishedFinder lead goes to several landlords at once — the first
+            genuine reply usually takes the booking. Shorterm writes that reply from your real
+            unit facts, keeps following up until they book or pass, and handles the arrival
+            messages after.</p>
           <div class="hero-ctas">
-            <a class="btn btn--primary" href="#pilot">Request access</a>
+            <a class="btn btn--primary" href="#pilot">Request pilot access</a>
             <a class="btn btn--ghost" href="#how">See how it works</a>
           </div>
           <div class="trust">
-            <b>Human-in-the-loop</b> <span class="dot">•</span> Uses only your listed facts
-            <span class="dot">•</span> Your credentials stay yours
+            <b>You approve every send</b> <span class="dot">•</span> Only your listed facts
+            <span class="dot">•</span> Never stores your password
           </div>
         </div>
 
-        <!-- Product mock -->
-        <div class="mock" aria-hidden="true">
-          <div class="mock__bar"><i></i><i></i><i></i><span class="u">app.shorterm — Dashboard</span></div>
-          <div class="mock__body">
-            <div class="mock__lead">
-              <div class="mock__row">
-                <span class="mock__who">Rebecca M.</span>
-                <span class="badge badge--brand">New lead</span>
-                <span class="badge badge--ok" style="margin-left:auto">Draft ready</span>
+        <!-- Live demo of the product doing its job -->
+        <div class="demo reveal d2" id="demo" aria-label="Animated demonstration of Shorterm answering a lead">
+          <div class="demo__bar">
+            <i></i><i></i><i></i><span class="u">app.shorterm — Command center</span>
+            <span class="demo__clock" id="clock">idle</span>
+          </div>
+          <div class="demo__body">
+            <div class="demo__idle" id="idle"><span class="pulse"></span> Watching FurnishedFinder for new inquiries…</div>
+
+            <div class="lead-card" id="card">
+              <div class="lc__row">
+                <span class="lc__who">Emma M.</span>
+                <span class="badge badge--brand">New inquiry</span>
+                <span class="badge" style="margin-left:auto" id="age">just now</span>
               </div>
-              <div class="mock__chips">
-                <span class="mock__chip">Dates: Aug 1 – Nov 1</span>
-                <span class="mock__chip">92 nights</span>
-                <span class="mock__chip">Guests: 1</span>
-                <span class="mock__chip">Budget: ~$2,400/mo</span>
+              <div class="lc__prop">Quiet Spacious Home in NW DC — Unit 1</div>
+              <div class="lc__chips">
+                <span class="lc__chip">Aug 16 → Jul 16</span>
+                <span class="lc__chip">334 nights</span>
+                <span class="lc__chip">3 guests</span>
+                <span class="lc__chip">Pets</span>
+                <span class="lc__chip">Budget: No max</span>
               </div>
-              <div class="mock__draft">Hi Rebecca — thanks for reaching out! The Sunny 1BR near Metro is
-                available from Aug 1 and fits a 3-month stay perfectly. It's fully furnished with utilities
-                included at $2,400/mo. Happy to answer any questions…</div>
-              <div class="mock__actions">
-                <span class="mock__btn">Send</span>
-                <span class="mock__btn ghost">Re-draft</span>
+
+              <div class="think" id="think">
+                <span class="dots"><i></i><i></i><i></i></span> Matching to your units…
+              </div>
+
+              <div class="verdict" id="verdict">
+                <b>Good fit · Unit 1</b> — 334 nights and 3 guests are inside your limits, and pets are allowed.
+              </div>
+
+              <div class="draft" id="draft"></div>
+
+              <div class="demo__actions" id="actions">
+                <span class="demo__btn">Approve &amp; send</span>
+                <span class="demo__btn ghost">Edit</span>
+                <span class="sent" id="sentflag">✓ Sent</span>
               </div>
             </div>
           </div>
+          <div class="demo__steps" id="steps">
+            <span></span><span></span><span></span><span></span>
+          </div>
         </div>
       </div>
     </section>
 
-    <!-- Problem -->
+    <!-- ===================== Problem ===================== -->
     <section class="divider">
-      <h2 class="sec">On FurnishedFinder, the fastest good reply wins the tenant.</h2>
-      <p class="sub">Leads come in while you're working, sleeping, or mid-turnover. By the time you write back,
-        a nurse with a 13-week contract has already toured someone else's place. Generic templates read as spam;
-        hand-writing every reply doesn't scale.</p>
-      <div class="tiles">
-        <div class="tile"><h3>Every inquiry = triage + draft</h3><p>Is it a lead or a message? Does it fit my dates, budget, pets? Which unit?</p></div>
-        <div class="tile"><h3>Replies at 8am and 6pm</h3><p>Drafts are waiting when you open the dashboard — automatically.</p></div>
-        <div class="tile"><h3>Zero invented facts</h3><p>It only says what's in your unit catalog. No made-up amenities or prices.</p></div>
+      <h2 class="sec reveal">The lead isn't lost to a better place. It's lost to a faster one.</h2>
+      <p class="sub reveal d1">Inquiries land while you're at work, asleep, or mid-turnover. A travelling
+        nurse with a 13-week contract messages five landlords and tours whoever answers first. Then the
+        ones you did answer go quiet — and nobody follows up.</p>
+      <div class="stats">
+        <div class="stat reveal d1"><b>Minutes</b><span>to a personalized first reply, day or night</span></div>
+        <div class="stat reveal d2"><b>4 touches</b><span>of follow-up before a quiet lead is written off</span></div>
+        <div class="stat reveal d3"><b>0</b><span>invented prices, amenities or availability</span></div>
       </div>
     </section>
 
-    <!-- How it works -->
-    <section id="how" class="divider">
-      <h2 class="sec">Drafted for you. Approved by you.</h2>
-      <div class="steps">
-        <div class="s"><h3>Connect your listings</h3><p>Add your units — area, price, occupancy, pet policy, stay length, notes. This is the only source of facts the agent may use.</p></div>
-        <div class="s"><h3>It checks for new leads</h3><p>Twice a day (or on demand), it logs into FurnishedFinder in a real browser, finds only what's new, and reads each inquiry's real dates, occupants, budget, and reason for travel.</p></div>
-        <div class="s"><h3>It drafts the right reply</h3><p>A warm intro for a new lead; a contextual answer for a message. Best-fit unit chosen automatically; poor fits flagged and skipped with a reason.</p></div>
-        <div class="s"><h3>You click send</h3><p>Review or edit the draft, then send on-platform (and by email if you like). Nothing is ever sent without your click.</p></div>
-      </div>
-    </section>
-
-    <!-- Why different -->
-    <section class="divider">
-      <h2 class="sec">Not a template bot.</h2>
+    <!-- ===================== What it does ===================== -->
+    <section class="divider" id="how">
+      <div class="eyebrow reveal">What it does</div>
+      <h2 class="sec reveal">An assistant that works the whole booking, not just the inbox.</h2>
       <div class="cards">
-        <div class="card-m"><div class="ic">🔍</div><h3>Reads the real inquiry</h3><p>Opens the travel-dates detail — dates, occupants, pets, budget, reason — and drafts from that, not a thin table row.</p></div>
-        <div class="card-m"><div class="ic">🛡️</div><h3>Can't make things up</h3><p>Grounded in your unit catalog. It won't promise an amenity you don't have or quote a price you didn't set.</p></div>
-        <div class="card-m"><div class="ic">✋</div><h3>You stay in control</h3><p>Editable drafts, one-click send, skip/dismiss. Your account, your voice, your approval.</p></div>
+        <div class="card-m reveal d1">
+          <div class="ic">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+          </div>
+          <h3>Replies before your competition</h3>
+          <p>Checks FurnishedFinder on a schedule and answers new inquiries in minutes — with the guest's
+            dates, group size and pets already read and addressed.</p>
+        </div>
+        <div class="card-m reveal d2">
+          <div class="ic">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/></svg>
+          </div>
+          <h3>Chases the quiet ones</h3>
+          <p>Most deals die of silence, not of a bad first message. Shorterm follows up on day 2, 5 and 10,
+            each time with something new to say — then closes the loop politely.</p>
+        </div>
+        <div class="card-m reveal d3">
+          <div class="ic">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 11h18"/></svg>
+          </div>
+          <h3>Handles the arrival</h3>
+          <p>Once they book: confirmation, the week-before note, check-in details, an arrival-day welcome
+            and checkout — all timed off their actual dates.</p>
+        </div>
+        <div class="card-m reveal d1">
+          <div class="ic">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6v6c0 5 3.4 8.4 8 9 4.6-.6 8-4 8-9V6l-8-3z"/><path d="m9 12 2 2 4-4"/></svg>
+          </div>
+          <h3>Never invents a fact</h3>
+          <p>It quotes only what's in your unit catalog. No price you didn't set, no amenity you don't have,
+            and never a door code it made up.</p>
+        </div>
+        <div class="card-m reveal d2">
+          <div class="ic">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>
+          </div>
+          <h3>You stay in control</h3>
+          <p>Approve every message, or hand over only the steps you trust. Autopilot is off until you turn
+            it on — and access details always need your eyes.</p>
+        </div>
+        <div class="card-m reveal d3">
+          <div class="ic">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
+          </div>
+          <h3>Tells you where you stand</h3>
+          <p>Median reply time, who's still waiting, what's booked, who arrives this week — plus one
+            end-of-day email so you never have to log in to know.</p>
+        </div>
       </div>
     </section>
 
-    <!-- Pricing -->
-    <section id="pricing" class="divider">
-      <h2 class="sec">Simple, unit-based pricing.</h2>
-      <p class="sub">Human approval is included in every tier — never a paid add-on. Founding pilots get
-        white-glove setup and pricing locked for 12 months.</p>
-      <div class="pricing">
-        <div class="plan"><h3>Starter</h3><div class="price">$39<small>/mo</small></div><p>Solo host, up to 2 units. Twice-daily checks, AI drafts, one-click send, human approval.</p></div>
-        <div class="plan hot"><span class="badge badge--brand tag">Most popular</span><h3>Pro</h3><div class="price">$99<small>/mo</small></div><p>Multi-unit host / small PM, up to 10 units. Everything in Starter plus more frequent checks and priority support.</p></div>
-        <div class="plan"><h3>Portfolio</h3><div class="price">Custom</div><p>10+ units / property manager. Multiple hosts, white-glove onboarding, SLA.</p></div>
+    <!-- ===================== Lifecycle ===================== -->
+    <section class="divider" id="lifecycle">
+      <div class="eyebrow reveal">The full lifecycle</div>
+      <h2 class="sec reveal">From "just enquired" to "keys in hand".</h2>
+      <p class="sub reveal d1">Every inquiry becomes a deal with a next action and a due time. Nothing sits
+        in an inbox hoping you remember it.</p>
+      <div class="tl">
+        <div class="tl__item reveal d1"><div class="tl__when">Minute 1</div>
+          <h3>Inquiry answered</h3>
+          <p>Matched to the right unit, written in your voice, addressing their dates and group.</p></div>
+        <div class="tl__item reveal d1"><div class="tl__when">Day 2 · 5 · 10</div>
+          <h3>Follow-ups, if they go quiet</h3>
+          <p>Short, warm, and never a copy of the last one — then a polite close so you're not chasing forever.</p></div>
+        <div class="tl__item reveal d2"><div class="tl__when">On booking</div>
+          <h3>Confirmation</h3>
+          <p>Restates only the dates and unit you confirmed. No invented deposits or policies.</p></div>
+        <div class="tl__item reveal d2"><div class="tl__when">7 days before</div>
+          <h3>Pre-arrival note</h3>
+          <p>Confirms the date, asks their arrival time and how they're travelling in.</p></div>
+        <div class="tl__item reveal d3"><div class="tl__when">Day before</div>
+          <h3>Check-in details</h3>
+          <p>Access, parking, arrival window. This one always waits for your approval — it carries keys.</p></div>
+        <div class="tl__item soft reveal d3"><div class="tl__when">During the stay</div>
+          <h3>Welcome, mid-stay check-in, checkout</h3>
+          <p>The service touches that turn a tenant into a renewal.</p></div>
       </div>
-      <div class="hero-ctas" style="margin-top:26px"><a class="btn btn--primary" href="#pilot">Request pilot access</a></div>
     </section>
 
-    <!-- FAQ -->
+    <!-- ===================== Your properties ===================== -->
     <section class="divider">
-      <h2 class="sec">Questions hosts ask.</h2>
-      <div style="margin-top:28px">
-        <details><summary>Will this get my account banned?</summary><p>Shorterm operates your account the way you would — it drafts replies, and a human approves and clicks send on every message. No mass, unattended blasting. It replies only to your real inquiries, personalized, and skips poor fits. Human-in-the-loop is the core design, precisely to stay account-safe.</p></details>
-        <details><summary>Is this automated sending?</summary><p>Checking for new leads is automated (twice daily); sending is not — it's one click by you, per message. You can also send by email in the same click if you choose.</p></details>
-        <details><summary>Will it say something wrong to my guest?</summary><p>It drafts only from the facts you enter in your unit catalog. It won't invent amenities, promise availability, or quote a price you didn't set. You see and can edit every draft before it goes.</p></details>
-        <details><summary>What about my credentials and my guests' data?</summary><p>The hosted version stores your FurnishedFinder email in an encrypted per-tenant vault, isolates tenants, and processes inquiry text only to draft your replies. FurnishedFinder login is passwordless (email + code or magic link) — we never store a password.</p></details>
-        <details><summary>Which platforms?</summary><p>FurnishedFinder today. The adapter model is built to add platforms based on pilot demand.</p></details>
+      <div class="eyebrow reveal">Set-up in minutes</div>
+      <h2 class="sec reveal">It already knows your properties.</h2>
+      <p class="sub reveal d1">Connect FurnishedFinder and Shorterm reads your listings straight from your
+        leads — name, area and photos. You fill in price and house rules once, and that's the only thing
+        it's ever allowed to say about your place.</p>
+      <div class="props">
+        <div class="prop reveal d1">
+          <div class="prop__img">
+            <svg viewBox="0 0 200 120" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+              <rect width="200" height="120" fill="#e3eafc"/>
+              <path d="M0 92h200v28H0z" fill="#cfdbf7"/>
+              <path d="M42 88V54l30-20 30 20v34z" fill="#fff" opacity=".95"/>
+              <path d="M72 30 36 56h72z" fill="#8fabec"/>
+              <rect x="58" y="66" width="12" height="12" rx="2" fill="#bcd0f5"/>
+              <rect x="76" y="66" width="12" height="12" rx="2" fill="#bcd0f5"/>
+              <rect x="64" y="82" width="16" height="6" rx="1" fill="#a8c0f2"/>
+              <circle cx="150" cy="40" r="13" fill="#f5d78e" opacity=".7"/>
+              <path d="M118 92c8-16 18-24 26-24s16 8 22 24z" fill="#b9cef4"/>
+            </svg>
+          </div>
+          <div class="prop__meta"><h4>Unit 1 — NW DC</h4><p>Furnished · 30–365 nights · Pets OK</p></div>
+        </div>
+        <div class="prop reveal d2">
+          <div class="prop__img">
+            <svg viewBox="0 0 200 120" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+              <rect width="200" height="120" fill="#e8ecf9"/>
+              <path d="M0 96h200v24H0z" fill="#d3dcf5"/>
+              <rect x="46" y="38" width="46" height="58" rx="3" fill="#fff" opacity=".95"/>
+              <rect x="100" y="54" width="40" height="42" rx="3" fill="#fff" opacity=".85"/>
+              <rect x="54" y="48" width="12" height="12" rx="2" fill="#bcd0f5"/>
+              <rect x="72" y="48" width="12" height="12" rx="2" fill="#bcd0f5"/>
+              <rect x="54" y="66" width="12" height="12" rx="2" fill="#bcd0f5"/>
+              <rect x="72" y="66" width="12" height="12" rx="2" fill="#bcd0f5"/>
+              <rect x="108" y="64" width="10" height="10" rx="2" fill="#c8d8f7"/>
+              <rect x="122" y="64" width="10" height="10" rx="2" fill="#c8d8f7"/>
+              <circle cx="164" cy="34" r="11" fill="#f5d78e" opacity=".6"/>
+            </svg>
+          </div>
+          <div class="prop__meta"><h4>Unit 2 — NW DC</h4><p>Furnished · Private entrance</p></div>
+        </div>
+        <div class="prop reveal d3">
+          <div class="prop__img">
+            <svg viewBox="0 0 200 120" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+              <rect width="200" height="120" fill="#e6edfa"/>
+              <path d="M0 94h200v26H0z" fill="#d0dcf6"/>
+              <path d="M30 94V50h44v44z" fill="#fff" opacity=".92"/>
+              <path d="M74 94V62h40v32z" fill="#fff" opacity=".8"/>
+              <path d="M52 40 24 56h56z" fill="#93b0ee"/>
+              <rect x="40" y="62" width="11" height="11" rx="2" fill="#bcd0f5"/>
+              <rect x="56" y="62" width="11" height="11" rx="2" fill="#bcd0f5"/>
+              <rect x="86" y="72" width="10" height="10" rx="2" fill="#c8d8f7"/>
+              <path d="M140 94c6-18 14-26 20-26s14 8 20 26z" fill="#b3caf3"/>
+              <circle cx="168" cy="36" r="10" fill="#f5d78e" opacity=".55"/>
+            </svg>
+          </div>
+          <div class="prop__meta"><h4>Add your own</h4><p>Imported from your FurnishedFinder listings</p></div>
+        </div>
       </div>
     </section>
 
-    <!-- Final CTA + waitlist -->
+    <!-- ===================== How it works ===================== -->
+    <section class="divider">
+      <div class="eyebrow reveal">Getting started</div>
+      <h2 class="sec reveal">Three steps, about ten minutes.</h2>
+      <div class="steps">
+        <div class="s reveal d1"><h3>Connect FurnishedFinder</h3>
+          <p>Enter the email you log in with. FurnishedFinder is passwordless — you paste the code they
+            send once, and we never store a password.</p></div>
+        <div class="s reveal d2"><h3>Confirm your properties</h3>
+          <p>We import them from your leads. You add price, occupancy and house rules — the only facts the
+            assistant is permitted to state.</p></div>
+        <div class="s reveal d3"><h3>Choose how much to hand over</h3>
+          <p>Start with drafts you approve. Turn on autopilot when you trust it — step by step, on your terms.</p></div>
+      </div>
+    </section>
+
+    <!-- ===================== Pricing ===================== -->
+    <section class="divider" id="pricing">
+      <div class="eyebrow reveal">Pricing</div>
+      <h2 class="sec reveal">One booking pays for the year.</h2>
+      <p class="sub reveal d1">Human approval is included in every tier — it's the trust posture, never a paid add-on.</p>
+      <div class="pricing">
+        <div class="plan reveal d1"><h3>Starter</h3><div class="price">$39<small>/mo</small></div>
+          <p>Solo host, up to 2 units. Scheduled checks, AI drafts, one-click send.</p></div>
+        <div class="plan hot reveal d2"><span class="badge badge--brand tag">Most popular</span>
+          <h3>Pro</h3><div class="price">$99<small>/mo</small></div>
+          <p>Multi-unit host or small PM, up to 10 units. Full lifecycle automation and notifications.</p></div>
+        <div class="plan reveal d3"><h3>Portfolio</h3><div class="price">Custom</div>
+          <p>10+ units or a property manager. Multiple hosts, white-glove onboarding, SLA.</p></div>
+      </div>
+    </section>
+
+    <!-- ===================== FAQ ===================== -->
+    <section class="divider">
+      <h2 class="sec reveal">Questions hosts ask.</h2>
+      <div style="margin-top:28px" class="reveal d1">
+        <details><summary>Will this get my FurnishedFinder account in trouble?</summary>
+          <p>Shorterm works your account the way you would: it replies to your real inquiries, personalized,
+          at a human pace — no mass blasting. By default a person approves every message. This is a genuine
+          consideration with any automation, so we're upfront about it during pilot onboarding rather than
+          burying it here.</p></details>
+        <details><summary>Does it send on its own?</summary>
+          <p>Only if you turn it on. Out of the box it drafts and schedules everything and waits for your
+          approval. Autopilot is a switch you flip, and even then it's step-by-step: you decide which
+          messages may go unattended. Check-in instructions can never be automated, because they carry
+          access details.</p></details>
+        <details><summary>Will it say something wrong to my guest?</summary>
+          <p>It can only state facts from your unit catalog. It won't invent amenities, promise availability,
+          or quote a price you didn't set. If a detail is missing it asks the guest instead of guessing —
+          and it flags the gap to you rather than filling it in.</p></details>
+        <details><summary>What happens to my credentials and my guests' data?</summary>
+          <p>Your FurnishedFinder email is encrypted at rest in a per-tenant vault and tenants are isolated
+          from each other. Login is passwordless, so there's no password to store. Inquiry text is used only
+          to draft your replies.</p></details>
+        <details><summary>Which platforms does it support?</summary>
+          <p>FurnishedFinder today. The adapter model is built to add Airbnb, VRBO and Booking.com — pilot
+          demand decides the order.</p></details>
+      </div>
+    </section>
+
+    <!-- ===================== CTA ===================== -->
     <section id="pilot">
-      <div class="cta-band">
+      <div class="cta-band reveal">
         <h2 class="sec">Stop losing mid-term bookings to a slow inbox.</h2>
         <p class="sub">Request pilot access — founding pilots get white-glove setup and pricing locked for 12 months.</p>
         <form class="waitlist" method="post" action="{{ url_for('pilot') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <input name="email" type="email" required placeholder="you@example.com">
           <input name="market" placeholder="Your market (e.g. DC)">
           <input name="units" type="number" min="0" placeholder="# units" class="units">
           <button class="btn btn--primary" type="submit">Request access</button>
         </form>
-        <div class="hero-ctas" style="margin-top:18px"><a class="btn btn--ghost" href="{{ url_for('login') }}">Already have access? Log in</a></div>
+        <div class="hero-ctas" style="margin-top:18px">
+          <a class="btn btn--ghost" href="{{ url_for('login') }}">Already have access? Log in</a>
+        </div>
       </div>
     </section>
   </div>
 
-  <footer><div class="container">© Shorterm — a real-browser leasing assistant for FurnishedFinder hosts. Human approves every send.</div></footer>
+  <footer><div class="container">© Shorterm — a leasing assistant for FurnishedFinder hosts. You approve what goes out.</div></footer>
 
   <script>
-    // Subtle nav border on scroll — small polish detail.
-    var lnav = document.getElementById('lnav');
-    var onScroll = function () { lnav.classList.toggle('scrolled', window.scrollY > 8); };
-    window.addEventListener('scroll', onScroll, { passive: true }); onScroll();
+    (function () {
+      var reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+      // Nav hairline on scroll.
+      var lnav = document.getElementById('lnav');
+      var onScroll = function () { lnav.classList.toggle('scrolled', window.scrollY > 8); };
+      window.addEventListener('scroll', onScroll, { passive: true }); onScroll();
+
+      // Scroll reveals. IntersectionObserver so nothing animates off-screen.
+      var items = document.querySelectorAll('.reveal');
+      if (reduced || !('IntersectionObserver' in window)) {
+        items.forEach(function (el) { el.classList.add('in'); });
+      } else {
+        var io = new IntersectionObserver(function (entries) {
+          entries.forEach(function (e) {
+            if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); }
+          });
+        }, { rootMargin: '0px 0px -8% 0px', threshold: .12 });
+        items.forEach(function (el) { io.observe(el); });
+      }
+
+      // ---- Hero demo: the product doing its job, on a loop. -----------------
+      // This is the clearest explanation of the value prop we have, so it plays
+      // the real sequence: inquiry lands -> matched -> drafted -> sent.
+      var DRAFT = "Hi Emma,\n\nI'm Sagiv — I'd love to host you at my place in NW DC. It's " +
+                  "fully furnished and pet-friendly, and a 334-night stay is exactly what it's set up for.\n\n" +
+                  "Could you tell me a little about your move-in timing?";
+      var el = {
+        idle: document.getElementById('idle'), card: document.getElementById('card'),
+        think: document.getElementById('think'), verdict: document.getElementById('verdict'),
+        draft: document.getElementById('draft'), actions: document.getElementById('actions'),
+        sent: document.getElementById('sentflag'), clock: document.getElementById('clock'),
+        age: document.getElementById('age'), steps: document.getElementById('steps').children
+      };
+      if (!el.card) return;
+
+      var timers = [];
+      function at(ms, fn) { timers.push(setTimeout(fn, ms)); }
+      function step(i) {
+        for (var s = 0; s < el.steps.length; s++) el.steps[s].classList.toggle('on', s <= i);
+      }
+      function reset() {
+        timers.forEach(clearTimeout); timers = [];
+        el.card.classList.remove('show'); el.think.classList.remove('show');
+        el.verdict.classList.remove('show'); el.draft.classList.remove('show');
+        el.actions.classList.remove('show'); el.sent.classList.remove('show');
+        el.draft.textContent = ''; el.idle.style.display = '';
+        el.clock.textContent = 'idle'; el.age.textContent = 'just now';
+        step(-1);
+      }
+
+      function type(text, done) {
+        var i = 0;
+        el.draft.classList.add('show');
+        (function tick() {
+          // Chunked rather than per-character: smooth at 60fps and finishes in
+          // a length of time a visitor will actually wait through.
+          i = Math.min(text.length, i + 2);
+          el.draft.innerHTML = text.slice(0, i).replace(/\n/g, '<br>') +
+            (i < text.length ? '<span class="caret"></span>' : '');
+          if (i < text.length) timers.push(setTimeout(tick, 16)); else done && done();
+        })();
+      }
+
+      function play() {
+        reset();
+        at(900, function () {
+          el.idle.style.display = 'none';
+          el.card.classList.add('show'); el.clock.textContent = '0:01'; step(0);
+        });
+        at(1700, function () { el.think.classList.add('show'); el.clock.textContent = '0:04'; step(1); });
+        at(3100, function () {
+          el.think.classList.remove('show');
+          el.verdict.classList.add('show'); el.clock.textContent = '0:09'; step(2);
+        });
+        at(3900, function () {
+          type(DRAFT, function () {
+            el.actions.classList.add('show'); el.clock.textContent = '0:38'; step(3);
+            at(1500, function () {
+              el.sent.classList.add('show');
+              el.clock.textContent = 'replied in 41s';
+              el.age.textContent = 'answered';
+            });
+          });
+        });
+        at(16000, play);
+      }
+
+      if (reduced) {
+        // Show the finished result instead of looping.
+        el.idle.style.display = 'none';
+        el.card.classList.add('show'); el.verdict.classList.add('show');
+        el.draft.classList.add('show'); el.draft.innerHTML = DRAFT.replace(/\n/g, '<br>');
+        el.actions.classList.add('show'); el.sent.classList.add('show');
+        el.clock.textContent = 'replied in 41s'; el.age.textContent = 'answered';
+        step(3);
+      } else {
+        // Only run while it's actually on screen — no work in a background tab.
+        var demo = document.getElementById('demo'), playing = false;
+        var vis = new IntersectionObserver(function (entries) {
+          entries.forEach(function (e) {
+            if (e.isIntersecting && !playing) { playing = true; play(); }
+            else if (!e.isIntersecting && playing) { playing = false; timers.forEach(clearTimeout); timers = []; }
+          });
+        }, { threshold: .25 });
+        vis.observe(demo);
+      }
+    })();
   </script>
 </body>
 </html>

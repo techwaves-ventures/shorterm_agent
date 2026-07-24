@@ -53,6 +53,7 @@
         </div>
       </div>
       <form method="post" action="{{ url_for('billing.portal') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn btn--ghost btn--sm">Manage subscription</button>
       </form>
     </div>
@@ -78,6 +79,7 @@
           <button type="button" class="btn btn--block" disabled>Current plan</button>
         {% else %}
           <form method="post" action="{{ url_for('billing.checkout') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <input type="hidden" name="plan" value="{{ p.key }}">
             <button type="submit" class="btn {{ 'btn--primary' if p.highlight else '' }} btn--block">{{ 'Choose ' + p.name }}</button>
           </form>

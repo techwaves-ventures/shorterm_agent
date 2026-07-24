@@ -48,6 +48,8 @@ log = logging.getLogger("worker")
 POLL_SECONDS = int(os.getenv("WORKER_POLL_SECONDS", "5"))
 OTP_WAIT_SECONDS = 600  # how long a run waits for the tenant to submit their code
 HEARTBEAT_SECONDS = 15  # keep worker_online() true even during a long OTP wait
+# How often to scan for due lifecycle steps (follow-ups, pre-arrival messages).
+AGENT_INTERVAL_SECONDS = int(os.getenv("AGENT_INTERVAL_SECONDS", "300"))
 
 
 def _worker_id() -> str:
@@ -151,6 +153,65 @@ def run_once(worker_id: str) -> bool:
     return True
 
 
+SITE = "furnishedfinder"
+
+
+def run_agent_pass() -> None:
+    """Draft every due lifecycle step, then deliver whatever is cleared to send.
+
+    This is what makes the product agentic on an unattended host. Two separate
+    phases on purpose: drafting is cheap API work, delivery drives a real
+    browser and is serialized by the runner. Only messages that reached
+    `queued` are delivered — i.e. a human approved them, or the tenant armed
+    that specific step (see sequences.can_auto_send). Everything else waits.
+    """
+    import automation
+    import pipeline
+
+    # Autopilot: fire any scheduled FurnishedFinder check that's come due.
+    try:
+        automation.run_scheduled_checks(SITE)
+    except Exception:
+        log.exception("Autopilot scheduled-check pass failed")
+
+    # End-of-day summary, in each property's local time.
+    try:
+        import digest
+
+        digest.run_due()
+    except Exception:
+        log.exception("Daily digest pass failed")
+
+    for tenant_id in pipeline.tenants_with_due():
+        try:
+            summary = automation.run_due(tenant_id, SITE)
+            if any(summary.values()):
+                log.info("Agent pass for tenant %s: %s", tenant_id, summary)
+        except Exception:
+            log.exception("Agent drafting pass failed for tenant %s", tenant_id)
+
+    # Deliver approved/armed messages one at a time; send_next blocks until each
+    # browser send reaches a terminal state, so the loop stays serialized.
+    for tenant_id in outbox_tenants():
+        try:
+            while automation.send_next(tenant_id, SITE):
+                pass
+        except Exception:
+            log.exception("Agent delivery pass failed for tenant %s", tenant_id)
+
+
+def outbox_tenants() -> list[str]:
+    """Tenants with at least one message cleared for delivery."""
+    import db
+    import outbox as ob
+
+    with ob._conn() as c:
+        rows = c.execute(
+            "SELECT DISTINCT tenant_id FROM outbox WHERE status=?", (ob.QUEUED,)
+        ).fetchall()
+    return [str(r[0]) for r in rows]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="FurnishedFinder scrape worker")
     ap.add_argument("--once", action="store_true",
@@ -180,12 +241,22 @@ def main() -> None:
         log.info("Queue drained; exiting (--once).")
         return
 
+    last_agent_pass = 0.0
     while True:
         try:
             ran = run_once(worker_id)
         except Exception:
             log.exception("Worker loop error; continuing")
             ran = False
+        # The lifecycle agent runs on its own cadence: scrape jobs are
+        # user-triggered and bursty, whereas due follow-ups only change on the
+        # order of minutes, so there's no reason to re-scan every poll.
+        if time.time() - last_agent_pass >= AGENT_INTERVAL_SECONDS:
+            last_agent_pass = time.time()
+            try:
+                run_agent_pass()
+            except Exception:
+                log.exception("Agent pass failed; continuing")
         if not ran:
             time.sleep(POLL_SECONDS)
 

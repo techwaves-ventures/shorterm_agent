@@ -15,6 +15,7 @@ import check_leads
 import config
 import ff_account
 import mailer
+import pipeline
 import responder
 import storage
 from notify import notify
@@ -47,6 +48,11 @@ _state = {
     "counts": {},
     "running": False,
     "tenant_id": None,  # which tenant the current/last run belongs to
+    # What this run is: "scrape" or "send". The UI refreshes the board when a
+    # scrape finishes (new leads to show) but must NOT when a background send
+    # finishes — that would yank the page out from under whatever the user is
+    # doing, which is the whole thing async delivery is meant to avoid.
+    "kind": None,
     "updated_at": None,
 }
 
@@ -72,7 +78,7 @@ def get_state(tenant_id: str | None = None) -> dict:
     if tenant_id is not None and snap.get("tenant_id") not in (None, str(tenant_id)):
         return {
             "status": "idle", "message": "", "counts": {}, "running": False,
-            "tenant_id": None, "updated_at": snap.get("updated_at"),
+            "tenant_id": None, "kind": None, "updated_at": snap.get("updated_at"),
         }
     return snap
 
@@ -104,6 +110,11 @@ def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]
     scrape thread, after the browser work — no network send, just stores
     draft/skipped. Leads get an introduction; messages get a response (the
     responder branches on item['kind'])."""
+    # Properties aren't inquiries — they're the host's own listings, scraped to
+    # seed the unit catalog. They're stored (dedup handles that) but must never
+    # be drafted at or opened as a deal.
+    if kind == "property":
+        return
     try:
         units = responder.load_units(tenant_id)
     except Exception:
@@ -111,16 +122,17 @@ def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]
         return
     for it in new_items:
         it.setdefault("kind", kind)  # ensure the responder sees the right mode
+        decision = None
         try:
-            d = responder.evaluate_lead(it, tenant_id, units=units)
+            decision = responder.evaluate_lead(it, tenant_id, units=units)
             storage.save_response(
                 tenant_id, site, kind, it["id"],
-                status="draft" if d.get("fit") else "skipped",
-                unit_id=d.get("unit_id"),
-                reason=d.get("reason"),
-                draft=d.get("draft"),
-                confidence=d.get("confidence"),
-                tenant_email=d.get("tenant_email"),
+                status="draft" if decision.get("fit") else "skipped",
+                unit_id=decision.get("unit_id"),
+                reason=decision.get("reason"),
+                draft=decision.get("draft"),
+                confidence=decision.get("confidence"),
+                tenant_email=decision.get("tenant_email"),
             )
         except Exception as e:
             log.exception("Auto-draft failed for %s", it.get("id"))
@@ -128,6 +140,44 @@ def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]
                 tenant_id, site, kind, it["id"], status="skipped",
                 reason=f"draft error: {e}",
             )
+        # Open the deal regardless of whether drafting succeeded — the lifecycle
+        # (and the owner's queue) shouldn't depend on the model being reachable.
+        try:
+            pipeline.ensure(tenant_id, site, it, decision, units=units)
+        except Exception:
+            log.exception("Could not open deal for %s", it.get("id"))
+
+        # Autopilot: the owner has explicitly granted autonomy, so a good-fit
+        # lead is answered now rather than waiting for them to open the app —
+        # speed is the whole advantage. Poor fits are skipped and never sent.
+        # Imported lazily to keep runner free of an import cycle.
+        if decision and decision.get("fit") and (decision.get("draft") or "").strip():
+            try:
+                import automation
+                import scheduler
+
+                if scheduler.is_on(tenant_id):
+                    automation.enqueue_send(
+                        tenant_id, site, it["id"], decision["draft"],
+                        step_label="First reply (autopilot)",
+                    )
+                    log.info("Autopilot queued first reply for %s", it.get("id"))
+            except Exception:
+                log.exception("Autopilot auto-reply failed for %s", it.get("id"))
+
+
+def draft_ingested(tenant_id: str, site: str, item: dict) -> None:
+    """Draft a reply for a lead that arrived by email, off the request thread.
+
+    The inbound webhook must answer the mail provider immediately, and drafting
+    is a model round-trip — so it runs in a daemon thread, reusing the exact
+    path a scraped lead takes (including autopilot auto-reply).
+    """
+    threading.Thread(
+        target=_draft_new_items,
+        args=(tenant_id, site, item.get("kind", "lead"), [item]),
+        daemon=True,
+    ).start()
 
 
 def _mark_ff_state(tenant_id: str, state: str, error: str | None = None) -> None:
@@ -162,18 +212,35 @@ def _worker(tenant_id: str) -> None:
         furnishedfinder.clear_context()
 
 
+def _busy_state(tenant_id: str) -> dict:
+    """Tenant-scoped 'try again shortly' snapshot for when another tenant's run
+    owns the global lock. Never echoes another tenant's status/message (which
+    can contain their traveler/lead details) — see get_state()'s leak guard."""
+    return {
+        "status": "busy",
+        "message": "Another check is currently running. Please try again shortly.",
+        "counts": {}, "running": False, "tenant_id": tenant_id, "kind": None,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
 def start_scrape(tenant_id: str = "1") -> dict:
     """Kick off a scrape if one isn't already running. Returns current state.
 
     Runs are serialized by the global run-lock (one browser at a time); the
-    tenant's FF account + isolated profile are bound for the duration."""
+    tenant's FF account + isolated profile are bound for the duration. If a
+    *different* tenant's run currently owns the lock, this tenant's request is
+    not silently dropped — it gets an explicit "busy" state of its own rather
+    than a leaked snapshot of the other tenant's run."""
     tenant_id = str(tenant_id)
     with _lock:
         if _state["running"]:
-            return dict(_state)
+            if _state.get("tenant_id") == tenant_id:
+                return dict(_state)
+            return _busy_state(tenant_id)
         _state.update(
             status="launching", message="Starting…", counts={}, running=True,
-            tenant_id=tenant_id,
+            tenant_id=tenant_id, kind="scrape",
             updated_at=datetime.now().isoformat(timespec="seconds"),
         )
     threading.Thread(target=_worker, args=(tenant_id,), daemon=True).start()
@@ -214,8 +281,6 @@ def submit_otp(tenant_id: str, code: str) -> bool:
 # One-click send (draft → approve → send)
 # ---------------------------------------------------------------------------
 
-_send_lock = threading.Lock()
-
 
 def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
     item_id = item["id"]
@@ -239,6 +304,15 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
                     furnishedfinder.send_reply(page, item, text)
         now = datetime.now().isoformat(timespec="seconds")
         storage.update_response(tenant_id, site, item_id, status="sent", draft=text, sent_at=now)
+        # Real contact was made: stamp response time and start the follow-up
+        # cadence. Imported here to keep runner free of an import cycle
+        # (automation -> runner for delivery).
+        try:
+            import automation
+
+            automation.after_contact(tenant_id, site, item_id)
+        except Exception:
+            log.exception("Could not advance deal lifecycle for %s", item_id)
 
         # 2. Email — best-effort; never fails the send if the platform reply went.
         email_note = ""
@@ -250,9 +324,13 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
             else:
                 try:
                     _set(status="checking", message=f"Emailing {tenant_email}…")
+                    # The guest sees the host's name and replies reach them
+                    # directly; the envelope stays on our verified sender so it
+                    # authenticates instead of landing in spam (see mailer.py).
                     mailer.send_email(
                         tenant_email, "Re: your FurnishedFinder inquiry", text,
                         from_email=from_email,
+                        from_name=config.get_settings(tenant_id)["host_name"],
                     )
                     storage.update_response(
                         tenant_id, site, item_id,
@@ -274,8 +352,13 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
         _set(status="error", message=f"Send failed: {e}", running=False)
     finally:
         furnishedfinder.clear_context()
-        with _send_lock:
-            _state["running"] = False
+        # Belt-and-braces: the paths above already clear `running`, but if one
+        # ever escaped without doing so the global lock would wedge every tenant
+        # out of scraping and sending. Guarded by `_lock` (the lock that actually
+        # protects `_state`) and scoped to this run, so a newer run isn't clobbered.
+        with _lock:
+            if _state.get("tenant_id") == tenant_id and _state.get("running"):
+                _state["running"] = False
 
 
 def send_reply(tenant_id: str, site: str, item: dict, text: str) -> dict:
@@ -285,10 +368,12 @@ def send_reply(tenant_id: str, site: str, item: dict, text: str) -> dict:
     tenant_id = str(tenant_id)
     with _lock:
         if _state["running"]:
-            return dict(_state)
+            if _state.get("tenant_id") == tenant_id:
+                return dict(_state)
+            return _busy_state(tenant_id)
         _state.update(
             status="launching", message="Starting…", running=True,
-            tenant_id=tenant_id,
+            tenant_id=tenant_id, kind="send",
             updated_at=datetime.now().isoformat(timespec="seconds"),
         )
     threading.Thread(

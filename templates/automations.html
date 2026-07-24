@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Automations — Shorterm</title>
+  {% include "_theme.html" %}
+  <style>
+    .master { display: flex; align-items: flex-start; gap: 14px; background: var(--surface);
+      border: 1px solid var(--border); border-left: 3px solid var(--brand);
+      border-radius: var(--radius-lg); padding: 20px 22px; margin-bottom: 24px; }
+    .master h2 { font-size: 1.08rem; margin-bottom: 5px; }
+    .master p { color: var(--muted); font-size: .88rem; }
+    .master input[type=checkbox] { width: auto; margin-top: 4px; }
+
+    .seq { background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); overflow: hidden; margin-bottom: 20px; }
+    .seq__head { padding: 17px 22px; border-bottom: 1px solid var(--border);
+      background: var(--surface-2); }
+    .seq__head h2 { font-size: 1.05rem; }
+    .seq__head p { color: var(--muted); font-size: .85rem; margin-top: 3px; }
+
+    .step { display: flex; gap: 14px; padding: 15px 22px; border-bottom: 1px solid var(--border);
+      align-items: flex-start; }
+    .step:last-child { border-bottom: none; }
+    .step__num { flex: 0 0 26px; height: 26px; border-radius: 50%; background: var(--surface-3);
+      border: 1px solid var(--border-2); color: var(--muted); font-size: .78rem; font-weight: 700;
+      display: flex; align-items: center; justify-content: center; margin-top: 1px; }
+    .step__body { flex: 1; min-width: 0; }
+    .step__top { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+    .step__name { font-weight: 650; font-size: .95rem; }
+    .step__when { color: var(--faint); font-size: .8rem; }
+    .step__guide { color: var(--muted); font-size: .85rem; margin-top: 5px; line-height: 1.5; }
+    .step__toggle { flex: 0 0 auto; display: flex; align-items: center; gap: 7px;
+      font-size: .8rem; color: var(--muted); white-space: nowrap; margin-top: 2px; }
+    .step__toggle input { width: auto; }
+    .locked { color: var(--warn); font-size: .78rem; font-weight: 600; }
+
+    .counts { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 22px; }
+    .countbox { background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 11px 16px; min-width: 108px; }
+    .countbox b { display: block; font-size: 1.3rem; letter-spacing: -.02em;
+      font-variant-numeric: tabular-nums; }
+    .countbox span { font-size: .77rem; color: var(--muted); }
+    .savebar { border-top: 1px solid var(--border); padding: 18px 0 4px; margin-top: 4px; }
+
+    /* ---- Autopilot (the headline switch) ---- */
+    .autopilot { background: linear-gradient(180deg, var(--brand-soft) 0%, var(--surface) 70%);
+      border: 1px solid var(--brand-line); border-radius: var(--radius-lg);
+      padding: 22px 24px; margin-bottom: 24px; }
+    .autopilot--on { background: linear-gradient(180deg, var(--ok-soft) 0%, var(--surface) 70%);
+      border-color: rgba(23,122,69,.35); }
+    .autopilot h2 { font-size: 1.22rem; display: flex; align-items: center; gap: 10px; }
+    .autopilot p { color: var(--muted); font-size: .9rem; margin-top: 6px; max-width: 640px; }
+    .autopilot__row { display: flex; align-items: flex-end; gap: 18px; flex-wrap: wrap;
+      margin-top: 18px; }
+    .switch { display: flex; align-items: center; gap: 9px; font-size: .95rem;
+      font-weight: 600; color: var(--text); margin: 0; }
+    .switch input { width: auto; }
+    .times { max-width: 190px; }
+    .times label { font-size: .78rem; }
+    .autopilot__foot { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border);
+      font-size: .83rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+  {% include "_appnav.html" %}
+  <main class="app-main">
+    <div class="page-head">
+      <h1>Automations</h1>
+      <p>What the agent says at each point in the guest lifecycle — and which steps it may send on its own.</p>
+    </div>
+
+    {% with flashes = get_flashed_messages() %}
+      {% for f in flashes %}<div class="flash">{{ f }}</div>{% endfor %}
+    {% endwith %}
+
+    {% if not has_api_key %}
+    <div class="flash">Set <code>ANTHROPIC_API_KEY</code> in <code>.env</code> — without it the agent can schedule steps but can't write them.</div>
+    {% endif %}
+
+    <!-- Autopilot is the headline decision on this page: one switch that grants
+         the system real autonomy. Deliberately placed above everything else and
+         sold on the benefit, because the product only pays off when owners
+         actually turn it on — but it ships off, so it's always their call. -->
+    <form method="post" action="{{ url_for('autopilot_toggle') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="autopilot {% if autopilot %}autopilot--on{% endif %}">
+        <div class="autopilot__top">
+          <div>
+            <h2>Autopilot {% if autopilot %}<span class="badge badge--ok"><span class="badge-dot"></span>On</span>
+                {% else %}<span class="badge">Off</span>{% endif %}</h2>
+            <p>
+              Check FurnishedFinder twice a day and reply to good-fit leads on its own.
+              Speed is what wins these leads — they go to several landlords at once, and
+              the first genuine reply usually takes the booking.
+            </p>
+          </div>
+        </div>
+        <div class="autopilot__row">
+          <label class="switch">
+            <input type="checkbox" name="autopilot" value="1" {% if autopilot %}checked{% endif %}>
+            <span>{% if autopilot %}Autopilot is running{% else %}Turn autopilot on{% endif %}</span>
+          </label>
+          <div class="times">
+            <label>Check at (24h, local)</label>
+            <input name="check_times" value="{{ check_times }}" placeholder="09:00,16:00">
+          </div>
+          <button type="submit" class="btn btn--primary">{% if autopilot %}Update{% else %}Turn on{% endif %}</button>
+        </div>
+        <div class="autopilot__foot">
+          {% if autopilot %}
+            Next check: <b>{{ next_run }}</b>. Poor-fit leads are skipped, never messaged.
+          {% else %}
+            While off, nothing is checked or sent unless you click it yourself.
+          {% endif %}
+          Only clear mismatches are skipped — the agent replies whenever it's unsure,
+          so you don't lose business to a cautious filter.
+        </div>
+      </div>
+    </form>
+
+    <div class="counts">
+      <div class="countbox"><b>{{ counts.pending }}</b><span>awaiting approval</span></div>
+      <div class="countbox"><b>{{ counts.queued }}</b><span>queued to send</span></div>
+      <div class="countbox"><b>{{ counts.sent }}</b><span>sent</span></div>
+      <div class="countbox"><b>{{ counts.failed }}</b><span>failed</span></div>
+    </div>
+
+    <form method="post" id="automations-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="master">
+        <input type="checkbox" name="automation_enabled" id="master" value="1" {% if enabled %}checked{% endif %}>
+        <div>
+          <h2><label for="master" style="display:inline;font-size:inherit;color:inherit;font-weight:inherit">Let the agent send on its own</label></h2>
+          <p>
+            When this is off, the agent still drafts and schedules every message — it just
+            waits for your approval on all of them. When it's on, only the steps you tick
+            below send automatically; everything else still comes to you.
+          </p>
+        </div>
+      </div>
+
+      {% for seq in sequences %}
+      <div class="seq">
+        <div class="seq__head">
+          <h2>{{ seq.label }}</h2>
+          <p>{{ seq.blurb }}</p>
+        </div>
+        {% for step in seq.steps %}
+        <div class="step">
+          <div class="step__num">{{ loop.index }}</div>
+          <div class="step__body">
+            <div class="step__top">
+              <span class="step__name">{{ step.label }}</span>
+              <span class="step__when">
+                {% set h = step.offset_hours %}
+                {% if step.anchor == 'check_in' %}
+                  {% if h <= -24 %}{{ (-h / 24)|round(0, 'floor')|int }} day(s) before check-in
+                  {% elif h < 0 %}the evening before check-in
+                  {% elif h < 24 %}on check-in day
+                  {% else %}{{ (h / 24)|round(0, 'floor')|int }} day(s) after check-in{% endif %}
+                {% elif step.anchor == 'check_out' %}
+                  {{ (-h / 24)|round(0, 'floor')|int }} day(s) before checkout
+                {% elif h == 0 %}immediately
+                {% else %}{{ (h / 24)|round(0, 'floor')|int }} day(s) after last contact{% endif %}
+              </span>
+              {% if step.never_auto %}<span class="locked">· always needs approval</span>{% endif %}
+            </div>
+            <div class="step__guide">{{ step.guidance }}</div>
+          </div>
+          <label class="step__toggle">
+            {% if step.never_auto %}
+              <input type="checkbox" disabled>
+              <span>Manual only</span>
+            {% else %}
+              <input type="checkbox" name="auto_steps" value="{{ step.id }}"
+                     {% if step.id in auto_steps %}checked{% endif %}>
+              <span>Auto-send</span>
+            {% endif %}
+          </label>
+        </div>
+        {% endfor %}
+      </div>
+      {% endfor %}
+
+      <div class="savebar">
+        <button type="submit" class="btn btn--primary">Save automation settings</button>
+      </div>
+    </form>
+  </main>
+</body>
+</html>

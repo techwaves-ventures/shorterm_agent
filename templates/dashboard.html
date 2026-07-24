@@ -6,121 +6,137 @@
   <title>Dashboard — Shorterm</title>
   {% include "_theme.html" %}
   <style>
-    /* Dashboard-specific components. Class names are referenced by the inline
-       script below (JS-generated cards), so they are preserved verbatim. */
-    .connect-card { background: var(--surface); border: 1px solid var(--border);
-      border-radius: var(--radius-lg); padding: 32px; margin-top: 8px; text-align: center;
-      max-width: 520px; margin-left: auto; margin-right: auto; box-shadow: var(--shadow-md); }
-    .connect-card h2 { font-size: 1.25rem; margin-bottom: 10px; }
-    .connect-card p { color: var(--muted); margin: 0 auto 8px; max-width: 400px; }
-    .connect-card .muted { color: var(--faint); font-size: .85rem; }
-    .connect-form { text-align: left; max-width: 400px; margin: 20px auto 0; }
-    .connect-form .consent { margin: 12px 0 16px; }
+    /* ---- KPI strip ---------------------------------------------------- */
+    .kpis { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 22px; }
+    .kpi { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+      padding: 15px 17px; position: relative; overflow: hidden; }
+    .kpi__label { font-size: .74rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .05em; color: var(--faint); }
+    .kpi__value { font-size: 1.75rem; font-weight: 700; letter-spacing: -.028em;
+      margin-top: 5px; line-height: 1.1; font-variant-numeric: tabular-nums; }
+    .kpi__sub { font-size: .78rem; color: var(--muted); margin-top: 3px; }
+    .kpi--alert { border-color: var(--brand-line); background:
+      linear-gradient(180deg, var(--brand-soft) 0%, var(--surface) 62%); }
+    .kpi--alert .kpi__value { color: var(--brand-2); }
+    .kpi--zero .kpi__value { color: var(--muted); }
 
-    .banner { display: none; align-items: center; gap: 12px; padding: 12px 16px;
-      border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 22px;
-      background: var(--surface); }
-    .banner.show { display: flex; }
-    .spinner { width: 16px; height: 16px; border: 2px solid var(--border-2);
-      border-top-color: var(--brand); border-radius: 50%; animation: spin .8s linear infinite; flex: 0 0 auto; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    .banner.error { border-color: var(--err); background: var(--err-soft); }
-    .banner.error .spinner { display: none; }
-    .otp-row { display: none; gap: 8px; margin-left: auto; }
-    .otp-row.show { display: flex; }
-    .otp-row input { width: min(420px, 48vw); padding: 8px 12px; }
+    /* ---- Agent status banner ------------------------------------------ */
+    .agentbar { display: flex; align-items: center; gap: 13px; flex-wrap: wrap;
+      background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--brand);
+      border-radius: var(--radius); padding: 13px 17px; margin-bottom: 22px; }
+    .agentbar__txt { font-size: .89rem; color: var(--muted); flex: 1 1 320px; }
+    .agentbar__txt b { color: var(--text); }
+    .agentbar--live { border-left-color: var(--ok); }
 
-    section { margin-bottom: 38px; }
-    .sec-head { display: flex; align-items: baseline; gap: 10px; margin: 0 0 4px; flex-wrap: wrap; }
-    .sec-head h2 { font-size: 1.15rem; }
-    .sec-sub { color: var(--muted); font-size: .86rem; }
-    .count { color: var(--faint); font-weight: 400; font-size: .85rem; }
+    /* ---- Sections ------------------------------------------------------ */
+    section { margin-bottom: 30px; }
+    .sec-head { display: flex; align-items: baseline; gap: 11px; margin-bottom: 4px; flex-wrap: wrap; }
+    .sec-head h2 { font-size: 1.14rem; }
+    .sec-count { background: var(--surface-3); border: 1px solid var(--border-2); color: var(--muted);
+      border-radius: var(--radius-pill); padding: 1px 9px; font-size: .76rem; font-weight: 600; }
+    .sec-sub { color: var(--faint); font-size: .84rem; }
+    .sec-body { margin-top: 13px; display: flex; flex-direction: column; gap: 11px; }
 
-    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 14px 0 16px; }
-    .chip { background: var(--surface); color: var(--muted); border: 1px solid var(--border);
-      border-radius: var(--radius-pill); padding: 6px 13px; font-size: .82rem; cursor: pointer; font-weight: 500; }
-    .chip:hover { color: var(--text); border-color: var(--border-2); }
-    .chip.active { background: var(--brand-soft); color: var(--brand-2); border-color: var(--brand-line); }
-    .search { margin-left: auto; width: auto; min-width: 190px; padding: 8px 13px; font-size: .87rem; }
+    /* ---- Deal card ------------------------------------------------------ */
+    .deal { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-lg);
+      padding: 0; overflow: hidden; display: flex; transition: box-shadow .15s, border-color .15s; }
+    .deal:hover { box-shadow: var(--shadow-md); }
+    .deal__rail { width: 3px; flex: 0 0 3px; background: var(--border-2); }
+    .deal--hot   .deal__rail { background: var(--err); }
+    .deal--warm  .deal__rail { background: var(--warn); }
+    .deal--fresh .deal__rail { background: var(--ok); }
+    .deal__main { padding: 15px 18px; flex: 1; min-width: 0; }
+    .deal__top { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+    .deal__name { font-weight: 700; font-size: 1rem; letter-spacing: -.01em; }
+    .deal__age { margin-left: auto; font-size: .8rem; font-weight: 600; color: var(--muted);
+      font-variant-numeric: tabular-nums; }
+    .deal--hot .deal__age { color: var(--err); }
+    .deal__sub { color: var(--muted); font-size: .85rem; margin-top: 2px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-    .apikey-note { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
-      padding: 11px 15px; margin-bottom: 16px; color: var(--muted); font-size: .87rem; }
-    .apikey-note code { font-size: .82em; }
+    .deal__photo { width: 100%; max-width: 190px; height: 108px; object-fit: cover;
+      border-radius: 10px; border: 1px solid var(--border); margin-top: 11px;
+      background: var(--surface-2); display: block; }
+    .facts { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
+    .fact { background: var(--surface-2); border: 1px solid var(--border); border-radius: 7px;
+      padding: 3px 9px; font-size: .78rem; color: var(--muted); }
+    .fact b { color: var(--text); font-weight: 600; }
 
-    /* Lead/message card — professional list look with a left status rail.
-       The rail is drawn as an inset box-shadow (keyed to --rail) so the 1px
-       border and hover state never recolor it. Class names below are referenced
-       by the inline script, so they are preserved verbatim. */
-    .card { --rail: var(--border-2); background: var(--surface); border: 1px solid var(--border);
-      border-radius: 12px; padding: 15px 18px 15px 19px; margin-bottom: 12px;
-      box-shadow: inset 4px 0 0 0 var(--rail), var(--shadow-sm);
-      transition: border-color .15s, box-shadow .15s; }
-    .card:hover { border-color: var(--border-2); box-shadow: inset 4px 0 0 0 var(--rail), var(--shadow-md); }
-    .card--none  { --rail: var(--warn); }
-    .card--draft { --rail: var(--brand); }
-    .card--sent  { --rail: var(--ok); }
-    .card--skipped, .card--dismissed { --rail: var(--border-2); }
-    .card-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .who { font-weight: 700; font-size: 1rem; color: var(--text); letter-spacing: -.01em; }
-    .when { color: var(--faint); font-size: .8rem; }
-    .spacer { margin-left: auto; }
+    .verdict { margin-top: 12px; padding: 10px 12px; background: var(--brand-soft);
+      border: 1px solid var(--brand-line); border-radius: var(--radius); font-size: .84rem;
+      color: var(--text); }
+    .verdict__head { display: flex; gap: 7px; align-items: center; margin-bottom: 3px;
+      font-weight: 600; font-size: .78rem; color: var(--brand-2); }
 
-    .kind { font-size: .7rem; padding: 3px 10px; border-radius: 6px; font-weight: 600;
-      letter-spacing: .01em; }
-    .kind.lead { background: var(--brand-soft); color: var(--brand-2); }
-    .kind.message { background: var(--warn-soft); color: var(--warn); }
+    details.draft { margin-top: 11px; }
+    details.draft > summary { cursor: pointer; font-size: .83rem; font-weight: 600;
+      color: var(--brand-2); list-style: none; padding: 7px 0; user-select: none; }
+    details.draft > summary::-webkit-details-marker { display: none; }
+    details.draft > summary::before { content: "▸ "; }
+    details.draft[open] > summary::before { content: "▾ "; }
+    .draft-text { width: 100%; min-height: 150px; background: var(--bg-2);
+      border: 1px solid var(--border); border-radius: var(--radius); color: var(--text);
+      padding: 11px 13px; font: inherit; font-size: .89rem; line-height: 1.55; resize: vertical; }
+    .preview { font-size: .85rem; color: var(--muted); line-height: 1.5; margin-top: 8px;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 
-    .status { font-size: .72rem; padding: 3px 11px; border-radius: var(--radius-pill); font-weight: 600;
-      border: 1px solid transparent; }
-    .status.draft { background: var(--brand-soft); color: var(--brand-2); border-color: var(--brand-line); }
-    .status.sent { background: var(--ok-soft); color: var(--ok); border-color: rgba(23,122,69,.28); }
-    .status.skipped, .status.dismissed { background: var(--surface-3); color: var(--muted); border-color: var(--border); }
-    .status.none { background: var(--warn-soft); color: var(--warn); border-color: rgba(180,120,10,.30); }
-
-    .prop { color: var(--muted); font-size: .87rem; margin-top: 8px; }
-    .email-tag { color: var(--brand-2); font-size: .82rem; }
-    .facts { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 11px; }
-    .fact { font-size: .78rem; background: var(--surface-2); color: var(--text);
-      border: 1px solid var(--border); border-radius: 7px; padding: 3px 10px; }
-    .fact b { color: var(--muted); font-weight: 600; }
-    .inquiry-toggle { background: none; color: var(--brand-2); border: 0; padding: 9px 0 0;
-      font-size: .82rem; font-weight: 600; cursor: pointer; font-family: inherit; }
-    .inquiry-toggle:hover { text-decoration: underline; }
-    .inquiry { display: none; white-space: pre-wrap; background: var(--bg-2); border: 1px solid var(--border);
-      border-radius: var(--radius); padding: 11px 13px; margin-top: 8px; color: var(--text);
-      font-size: .86rem; max-height: 260px; overflow: auto; }
-    .inquiry.show { display: block; }
-
-    .reply { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 14px; }
-    .reply-head { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
-    .unit { font-size: .7rem; background: var(--grad-brand); color: #fff; padding: 2px 9px; border-radius: 6px; font-weight: 600; }
-    .conf { font-size: .7rem; background: var(--surface-3); color: var(--muted); padding: 2px 9px; border-radius: 6px; }
-    .reason { color: var(--muted); font-size: .82rem; }
-    .draft-text { width: 100%; min-height: 120px; background: var(--bg-2); border: 1px solid var(--border);
-      border-radius: var(--radius); color: var(--text); padding: 11px 13px; font: inherit; font-size: .9rem;
-      line-height: 1.55; resize: vertical; }
-    .actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; align-items: center; }
-    .mini { display: inline-flex; align-items: center; gap: 6px; background: var(--surface-3); color: var(--text);
-      border: 1px solid var(--border-2); border-radius: 8px; padding: 7px 13px; font-size: .83rem;
-      font-weight: 600; cursor: pointer; font-family: inherit; transition: background .15s; }
+    .actions { display: flex; gap: 7px; margin-top: 11px; flex-wrap: wrap; align-items: center; }
+    .mini { display: inline-flex; align-items: center; gap: 6px; background: var(--surface-3);
+      color: var(--text); border: 1px solid var(--border-2); border-radius: 8px; padding: 7px 13px;
+      font-size: .83rem; font-weight: 600; cursor: pointer; font-family: inherit; transition: background .15s; }
     .mini:hover { background: var(--surface-2); }
     .mini.primary { background: var(--grad-brand); color: #fff; border-color: transparent; }
     .mini.primary:hover { filter: brightness(1.06); }
+    .mini.danger { color: var(--err); border-color: rgba(192,54,44,.4); background: transparent; }
+    .mini.danger:hover { background: var(--err-soft); }
     .mini:disabled { opacity: .55; cursor: default; }
-    .send-note { color: var(--faint); font-size: .78rem; }
-    .spinner-sm { display: inline-block; width: 12px; height: 12px; vertical-align: -2px; margin-right: 4px;
-      border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%; animation: spin .7s linear infinite; }
-    button.busy { opacity: .8; cursor: default; }
-    .reply-msg { font-size: .82rem; margin-top: 8px; }
-    .reply-msg.err { color: var(--err); }
-    .reply-msg.ok { color: var(--ok); }
-    .draft-text:disabled { opacity: .6; }
-    .empty { color: var(--muted); padding: 32px; text-align: center; border: 1px dashed var(--border);
-      border-radius: var(--radius-lg); font-size: .9rem; }
+    .msg { font-size: .81rem; margin-top: 7px; }
+    .msg.err { color: var(--err); } .msg.ok { color: var(--ok); }
+    .spinner-sm { display: inline-block; width: 12px; height: 12px; vertical-align: -2px;
+      border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; border-radius: 50%;
+      animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ---- Compact rows (scheduled / arrivals / all) ---------------------- */
+    .rows { border: 1px solid var(--border); border-radius: var(--radius-lg);
+      background: var(--surface); overflow: hidden; }
+    .row { display: flex; align-items: center; gap: 12px; padding: 11px 16px;
+      border-bottom: 1px solid var(--border); font-size: .87rem; }
+    .row:last-child { border-bottom: none; }
+    .row__name { font-weight: 600; min-width: 130px; }
+    .row__mid { color: var(--muted); flex: 1; min-width: 0; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap; }
+    .row__when { color: var(--muted); font-size: .8rem; font-variant-numeric: tabular-nums;
+      white-space: nowrap; }
+
+    .empty { color: var(--muted); padding: 26px; text-align: center; border: 1px dashed var(--border);
+      border-radius: var(--radius-lg); font-size: .88rem; }
+
+    /* ---- Preserved: scrape banner / OTP / connect ----------------------- */
+    .banner { display: none; align-items: center; gap: 11px; flex-wrap: wrap; padding: 12px 16px;
+      border-radius: var(--radius); background: var(--brand-soft); border: 1px solid var(--brand-line);
+      color: var(--brand-strong); font-size: .89rem; margin-bottom: 18px; }
+    .banner.show { display: flex; }
+    .banner.error { background: var(--err-soft); border-color: rgba(192,54,44,.35); color: var(--err); }
+    .spinner { width: 15px; height: 15px; border: 2px solid var(--brand-line);
+      border-top-color: var(--brand); border-radius: 50%; animation: spin .8s linear infinite; }
+    .otp-row { display: none; gap: 8px; width: 100%; margin-top: 6px; }
+    .otp-row.show { display: flex; }
+    .otp-row input { flex: 1; }
+    .connect-card { background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); padding: 26px; max-width: 520px; }
+    .connect-card h2 { font-size: 1.2rem; margin-bottom: 8px; }
+    .connect-card p { color: var(--muted); font-size: .9rem; margin-bottom: 16px; }
+    .apikey-note { background: var(--warn-soft); border: 1px solid rgba(180,120,10,.3);
+      color: var(--text); border-radius: var(--radius); padding: 11px 15px; font-size: .86rem;
+      margin-bottom: 18px; }
+
+    @media (max-width: 900px) { .kpis { grid-template-columns: repeat(2, 1fr); } }
+    @media (max-width: 560px) { .kpis { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
-  {% set nav_active = 'dashboard' %}
+  {% set m = board.metrics %}
   {% set nav_extra %}
     {% if ff_status and ff_status.masked_email %}<span class="badge">FF · {{ ff_status.masked_email }}{% if not ff_status.connected %} · unverified{% endif %}</span>{% elif is_operator %}<span class="badge">FurnishedFinder</span>{% endif %}
     {% if can_scrape %}
@@ -133,13 +149,14 @@
 
   <main class="app-main">
     <div class="page-head">
-      <h1>Dashboard</h1>
-      <p>New leads and messages, triaged and drafted — you approve every send.</p>
+      <h1>Command center</h1>
+      <p>Every inquiry, follow-up and arrival in one place — the agent drafts, you approve.</p>
     </div>
 
-    {% with messages = get_flashed_messages() %}
-      {% for m in messages %}<div class="flash">{{ m }}</div>{% endfor %}
+    {% with flashes = get_flashed_messages() %}
+      {% for f in flashes %}<div class="flash">{{ f }}</div>{% endfor %}
     {% endwith %}
+
   {% if not can_scrape %}
     <div class="connect-card">
       <h2>Connect your FurnishedFinder account</h2>
@@ -147,7 +164,8 @@
          on your behalf. Login uses the email code FurnishedFinder sends you — we never
          ask for a password.</p>
       {% if crypto_ready %}
-      <form method="post" action="{{ url_for('connect') }}" class="connect-form">
+      <form method="post" action="{{ url_for('connect') }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <div class="field">
           <input name="ff_email" type="email" required placeholder="Your FurnishedFinder email">
         </div>
@@ -165,17 +183,18 @@
     </div>
   {% else %}
     {% if not is_operator and ff_status and ff_status.state != 'connected' %}
-    <div class="apikey-note" id="ff-verification-note" style="border-color: var(--warn-soft);">
+    <div class="apikey-note" id="ff-verification-note">
       {% if ff_status.state == 'error' %}
         {{ ff_status.last_error or 'The last connection attempt didn’t finish.' }}
         Click <b>Check now</b> to retry — you’ll paste the login code or magic link FurnishedFinder emails you.
       {% else %}
         Your FurnishedFinder email{% if ff_status.masked_email %} (<code>{{ ff_status.masked_email }}</code>){% endif %}
         is saved but <b>not verified yet</b>. Click <b>Check now</b> to log in, then paste the
-        <b>short code</b> or the <b>entire login link</b> FurnishedFinder emails you — your leads load once verification completes.
+        <b>short code</b> or the <b>entire login link</b> FurnishedFinder emails you.
       {% endif %}
     </div>
     {% endif %}
+
     <div id="banner" class="banner{% if state.status != 'idle' %} show{% endif %}{% if state.status == 'error' %} error{% endif %}">
       <div class="spinner" id="spinner" {% if state.status not in ['launching', 'checking', 'waiting_for_otp'] %}style="display:none"{% endif %}></div>
       <span id="banner-msg">{{ state.message or state.status or 'Idle' }}</span>
@@ -186,373 +205,450 @@
     </div>
 
     {% if not has_api_key %}
-    <div class="apikey-note">Set <code>ANTHROPIC_API_KEY</code> in <code>.env</code> and fill <code>units.json</code> to enable auto-drafted replies.</div>
+    <div class="apikey-note">Set <code>ANTHROPIC_API_KEY</code> in <code>.env</code> to enable drafting and the automated sequences.</div>
     {% endif %}
 
+    <!-- KPI strip: the four numbers that tell an owner how the business is doing -->
+    <div class="kpis">
+      <div class="kpi {% if m.needs_action %}kpi--alert{% else %}kpi--zero{% endif %}">
+        <div class="kpi__label">Needs you</div>
+        <div class="kpi__value">{{ m.needs_action }}</div>
+        <div class="kpi__sub">{% if m.needs_action %}guests waiting on a reply{% else %}all caught up{% endif %}</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi__label">Median reply</div>
+        <div class="kpi__value">{{ m.median_response_label }}</div>
+        <div class="kpi__sub">first response time</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi__label">Open pipeline</div>
+        <div class="kpi__value">{% if m.pipeline_value %}${{ "{:,}".format(m.pipeline_value) }}{% else %}{{ m.open_count }}{% endif %}</div>
+        <div class="kpi__sub">{{ m.open_count }} live deal{{ '' if m.open_count == 1 else 's' }}</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi__label">Booked</div>
+        <div class="kpi__value">{{ m.booked_count }}</div>
+        <div class="kpi__sub">{{ m.arrivals_30d }} arriving in 30d</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi__label">Agent queue</div>
+        <div class="kpi__value">{{ m.scheduled_count }}</div>
+        <div class="kpi__sub">touches scheduled</div>
+      </div>
+    </div>
+
+    <div class="agentbar {% if board.automation.enabled %}agentbar--live{% endif %}">
+      <span class="badge {% if board.automation.enabled %}badge--ok{% else %}badge--brand{% endif %}">
+        <span class="badge-dot"></span>{{ 'Agent live' if board.automation.enabled else 'Draft-only' }}
+      </span>
+      <span class="agentbar__txt">
+        {% if board.automation.enabled %}
+          Approved sequences send on their own. <b>{{ board.outbox_counts.pending }}</b> still need your approval.
+        {% else %}
+          The agent drafts every follow-up and pre-arrival message but <b>never sends without you</b>.
+          Turn on automated sending for the steps you trust.
+        {% endif %}
+      </span>
+      <button class="mini" onclick="runAgent(this)">Run agent now</button>
+      <a class="mini" href="{{ url_for('automations') }}">Configure</a>
+    </div>
+
+    <!-- 1. The queue: who is waiting on a human, longest wait first -->
     <section>
       <div class="sec-head">
-        <h2>Leads <span class="count" id="leads-count"></span></h2>
-        <span class="sec-sub">interested but haven't messaged — replies introduce your place</span>
+        <h2>Needs you now</h2>
+        <span class="sec-count">{{ board.needs_action|length }}</span>
+        <span class="sec-sub">unanswered guests, longest wait first</span>
       </div>
-      <div class="toolbar">
-        <span class="chip active" data-kind="lead" data-filter="all" onclick="setFilter('lead','all',this)">All</span>
-        <span class="chip" data-kind="lead" data-filter="action" onclick="setFilter('lead','action',this)">Needs action</span>
-        <span class="chip" data-kind="lead" data-filter="draft" onclick="setFilter('lead','draft',this)">Drafted</span>
-        <span class="chip" data-kind="lead" data-filter="sent" onclick="setFilter('lead','sent',this)">Sent</span>
-        <input class="search" id="lead-search" placeholder="Search leads…" oninput="rerender('lead')" />
+      <div class="sec-body">
+        {% for c in board.needs_action %}
+          {% set d = c.deal %}
+          {% set r = c.response %}
+          <article class="deal {% if c.age_hours and c.age_hours > 12 %}deal--hot{% elif c.age_hours and c.age_hours > 2 %}deal--warm{% else %}deal--fresh{% endif %}">
+            <div class="deal__rail"></div>
+            <div class="deal__main">
+              <div class="deal__top">
+                <span class="deal__name">{{ d.guest_name or 'Unnamed guest' }}</span>
+                <span class="badge">{{ c.stage_label }}</span>
+                {% if d.kind == 'message' %}<span class="badge badge--brand">Messaged you</span>{% endif %}
+                <span class="deal__age">waiting {{ c.age }}</span>
+              </div>
+              <div class="deal__sub">{{ c.title or c.item.title or '—' }}</div>
+
+              {% if c.item.images %}
+              {# The listing photo the guest was looking at — makes the card
+                 instantly recognisable. Drops itself if the CDN link expires. #}
+              <img class="deal__photo" src="{{ c.item.images[0] }}" alt=""
+                   loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()">
+              {% endif %}
+
+              <div class="facts">
+                {% if d.check_in %}<div class="fact"><b>{{ d.check_in }}</b>{% if d.check_out %} → {{ d.check_out }}{% endif %}</div>{% endif %}
+                {% if d.nights %}<div class="fact"><b>{{ d.nights }}</b> nights</div>{% endif %}
+                {% if c.item.occupants %}<div class="fact"><b>{{ c.item.occupants }}</b> guests</div>{% endif %}
+                {% if c.item.pets %}<div class="fact">Pets</div>{% endif %}
+                {% if c.item.budget %}<div class="fact">Budget <b>{{ c.item.budget }}</b></div>{% endif %}
+                {% if d.unit_id %}<div class="fact">Unit <b>{{ d.unit_id }}</b></div>{% endif %}
+              </div>
+
+              {% if r and r.reason %}
+              <div class="verdict">
+                <div class="verdict__head">Agent · {{ r.confidence or 'n/a' }} confidence{% if r.unit_id %} · best fit {{ r.unit_id }}{% endif %}</div>
+                {{ r.reason }}
+              </div>
+              {% endif %}
+
+              {% if r and r.draft %}
+              <details class="draft">
+                <summary>Review draft</summary>
+                <textarea class="draft-text" id="ta-{{ c.id }}">{{ r.draft }}</textarea>
+              </details>
+              <div class="actions">
+                <button class="mini primary" id="send-{{ c.id }}" onclick="sendReply('{{ c.id }}')">Approve &amp; send</button>
+                <button class="mini" id="draft-{{ c.id }}" onclick="draftItem('{{ c.id }}')">Re-draft</button>
+                <button class="mini" onclick="markBooked('{{ c.id }}')">Mark booked</button>
+                <button class="mini danger" onclick="markLost('{{ c.id }}')">Lost</button>
+              </div>
+              {% else %}
+              {% if not (r and r.reason) %}<div class="preview">No draft yet.</div>{% endif %}
+              <div class="actions">
+                <button class="mini primary" id="draft-{{ c.id }}" onclick="draftItem('{{ c.id }}')">Draft reply</button>
+                <button class="mini" onclick="markBooked('{{ c.id }}')">Mark booked</button>
+                <button class="mini danger" onclick="markLost('{{ c.id }}')">Lost</button>
+              </div>
+              {% endif %}
+              <div class="msg" id="msg-{{ c.id }}"></div>
+            </div>
+          </article>
+        {% else %}
+          <div class="empty">Nothing waiting on you. {% if board.stale_count %}{{ board.stale_count }} older deal{{ '' if board.stale_count == 1 else 's' }} below.{% else %}Click <b>Check now</b> to pull fresh leads.{% endif %}</div>
+        {% endfor %}
       </div>
-      <div id="leads-body"></div>
     </section>
 
+    <!-- 2. Agent-written follow-ups and pre-arrival messages awaiting approval -->
+    {% if board.awaiting_approval %}
     <section>
       <div class="sec-head">
-        <h2>Messages <span class="count" id="messages-count"></span></h2>
-        <span class="sec-sub">tenants who wrote to you — replies respond to their message</span>
+        <h2>Agent drafts awaiting approval</h2>
+        <span class="sec-count">{{ board.awaiting_approval|length }}</span>
+        <span class="sec-sub">follow-ups and arrival messages the agent prepared</span>
       </div>
-      <div class="toolbar">
-        <span class="chip active" data-kind="message" data-filter="all" onclick="setFilter('message','all',this)">All</span>
-        <span class="chip" data-kind="message" data-filter="action" onclick="setFilter('message','action',this)">Needs action</span>
-        <span class="chip" data-kind="message" data-filter="draft" onclick="setFilter('message','draft',this)">Drafted</span>
-        <span class="chip" data-kind="message" data-filter="sent" onclick="setFilter('message','sent',this)">Sent</span>
-        <input class="search" id="message-search" placeholder="Search messages…" oninput="rerender('message')" />
+      <div class="sec-body">
+        {% for c in board.awaiting_approval %}
+          {% set msg = c.pending %}
+          <article class="deal">
+            <div class="deal__rail"></div>
+            <div class="deal__main">
+              <div class="deal__top">
+                <span class="deal__name">{{ c.deal.guest_name or 'Guest' }}</span>
+                <span class="badge badge--brand">{{ msg.step_label }}</span>
+                <span class="deal__age">due {{ msg.scheduled_at[:16].replace('T', ' ') if msg.scheduled_at else '—' }}</span>
+              </div>
+              {% if msg.reason %}<div class="deal__sub">{{ msg.reason }}</div>{% endif %}
+              <details class="draft">
+                <summary>Review message</summary>
+                <textarea class="draft-text" id="ob-{{ msg.id }}">{{ msg.body }}</textarea>
+              </details>
+              <div class="preview">{{ msg.body }}</div>
+              <div class="actions">
+                <button class="mini primary" onclick="approveMsg({{ msg.id }})">Approve &amp; send</button>
+                <button class="mini danger" onclick="cancelMsg({{ msg.id }})">Don't send</button>
+              </div>
+              <div class="msg" id="msg-ob-{{ msg.id }}"></div>
+            </div>
+          </article>
+        {% endfor %}
       </div>
-      <div id="messages-body"></div>
     </section>
-  {% endif %}
-  </main>
+    {% endif %}
 
-  {% if can_scrape %}
-  <script>
-    const esc = (s) => (s == null ? "" : String(s).replace(/[&<>"']/g,
-      c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])));
-
-    // Full inquiry text: prefer scraped body/raw; fall back to title (older data
-    // stored messages as "Name (date): body" and leads as the pipe-joined row).
-    function fullText(it) {
-      if (it.kind === "message") {
-        if (it.body) return it.body;
-        const t = it.title || "";
-        const idx = t.indexOf("): ");
-        return idx >= 0 ? t.slice(idx + 3) : t;
-      }
-      // Leads: the travel-dates detail view has the full inquiry; fall back to
-      // the table row text for older data scraped before detail capture.
-      return it.detail || it.raw || it.title || "";
-    }
-
-    // Small quick-fact chips for a lead (parsed from the detail view). Returns
-    // "" when nothing is known, so old data renders unchanged.
-    function quickFacts(it) {
-      if (it.kind !== "lead") return "";
-      const chips = [];
-      if (it.move_in && it.move_out) chips.push(`<b>Dates:</b> ${esc(it.move_in)} – ${esc(it.move_out)}`);
-      else if (it.move_in) chips.push(`<b>Move-in:</b> ${esc(it.move_in)}`);
-      if (it.nights) chips.push(`<b>Nights:</b> ${it.nights}`);
-      if (it.occupants) chips.push(`<b>Guests:</b> ${it.occupants}`);
-      if (it.pets === true) chips.push(`<b>Pets:</b> Yes`);
-      if (it.budget) chips.push(`<b>Budget:</b> ${esc(it.budget)}`);
-      if (!chips.length) return "";
-      return `<div class="facts">` + chips.map(c => `<span class="fact">${c}</span>`).join("") + `</div>`;
-    }
-    function shortLine(it) {
-      const t = fullText(it).replace(/\s+/g, " ").trim();
-      return t.length > 140 ? t.slice(0, 140) + "…" : t;
-    }
-
-    // Sort key = the date the lead/message was RECEIVED.
-    //  - Leads carry `received` ("M/D/YY") — the last date in the row, i.e.
-    //    when the inquiry came in (NOT the tenant's move-in date).
-    //  - Messages carry `date` ("Mar. 26", no year).
-    // Falls back to first_seen (scrape timestamp) when unparseable.
-    const MONTHS = {jan:0,feb:1,mar:2,apr:3,may:4,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11};
-    function sortKey(it) {
-      const r = (it.received || "").trim();
-      if (r) {                                    // lead: "5/27/26" / "5/27/2026"
-        const m = r.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
-        if (m) { let y = +m[3]; if (y < 100) y += 2000;
-          return new Date(y, +m[1] - 1, +m[2]).getTime(); }
-      }
-      const d = (it.date || "").trim();
-      if (d) {                                    // message: "Apr. 15" (no year)
-        const m = d.match(/^([A-Za-z]{3})\.?\s+(\d{1,2})/);
-        if (m && m[1].toLowerCase() in MONTHS) {
-          const base = it.first_seen ? new Date(it.first_seen.replace(" ", "T")) : new Date(0);
-          const y = isNaN(base) ? 1970 : base.getFullYear();
-          return new Date(y, MONTHS[m[1].toLowerCase()], +m[2]).getTime();
-        }
-      }
-      const fs = it.first_seen ? new Date(it.first_seen.replace(" ", "T")).getTime() : 0;
-      return isNaN(fs) ? 0 : fs;
-    }
-
-    const data = { lead: [], message: [] };
-    const filters = { lead: "all", message: "all" };
-
-    function statusOf(it) {
-      const r = it.response;
-      if (!r) return "none";
-      return r.status || "none";
-    }
-    function needsAction(it) {
-      const s = statusOf(it);
-      return s === "none" || s === "draft";
-    }
-
-    function statusChip(it) {
-      const s = statusOf(it);
-      const label = { none: "Needs draft", draft: "Draft ready", sent: "Sent",
-                      skipped: "Skipped", dismissed: "Dismissed" }[s] || s;
-      return `<span class="status ${s}">${label}</span>`;
-    }
-
-    function replyArea(it) {
-      const r = it.response;
-      const id = esc(it.id || "");
-      if (!r || r.status === "none") {
-        return `<div class="reply">
-          <button class="mini" id="draft-btn-${id}" onclick="draftItem('${id}')">Draft reply</button>
-          <div class="reply-msg" id="msg-${id}"></div>
-        </div>`;
-      }
-      if (r.status === "sent") {
-        const em = r.emailed_at ? " · emailed" : "";
-        return `<div class="reply"><span class="reason">Sent ${esc(r.sent_at || "")}${em}.</span></div>`;
-      }
-      // draft / skipped / dismissed — all stay editable so a skip never blocks
-      // you. Skipped/dismissed just show why, then hand you an open textarea.
-      const skipped = r.status === "skipped" || r.status === "dismissed";
-      const verb = r.status === "skipped" ? "Skipped" : "Dismissed";
-      const note = skipped
-        ? `<div class="reply-head"><span class="status ${r.status}">${verb}</span><span class="reason">${esc(r.reason || "")} — edit below and send anyway.</span></div>`
-        : "";
-      const unit = r.unit_id ? `<span class="unit">${esc(r.unit_id)}</span>` : "";
-      const conf = r.confidence ? `<span class="conf">${esc(r.confidence)}</span>` : "";
-      const headLine = skipped ? "" :
-        `<div class="reply-head">${unit}${conf}<span class="reason">${esc(r.reason || "")}</span></div>`;
-      const hasEmail = !!r.tenant_email;
-      const sendNote = hasEmail
-        ? `<span class="send-note">→ platform + email (${esc(r.tenant_email)})</span>`
-        : `<span class="send-note">→ platform only (no email found)</span>`;
-      return `<div class="reply">
-        ${note}${headLine}
-        <textarea id="ta-${id}" class="draft-text" placeholder="Write your reply…">${esc(r.draft || "")}</textarea>
-        <div class="actions">
-          <button class="mini primary" id="send-btn-${id}" onclick="sendReply('${id}')">Send</button>
-          <button class="mini" id="draft-btn-${id}" onclick="draftItem('${id}')">Re-draft</button>
-          <button class="mini" onclick="dismissItem('${id}')">Dismiss</button>
-          ${sendNote}
+    <!-- 2b. Agent decided these aren't a fit — oversight, not a to-do list -->
+    {% if board.reviewable %}
+    <section>
+      <div class="sec-head">
+        <h2>Agent passed on these</h2>
+        <span class="sec-count">{{ board.reviewable|length }}</span>
+        <span class="sec-sub">not a fit — open one only if you disagree</span>
+      </div>
+      <div class="rows">
+        {% for c in board.reviewable %}
+        <div class="row">
+          <span class="row__name">{{ c.deal.guest_name or 'Guest' }}</span>
+          <span class="row__mid">{{ c.response.reason if c.response else '' }}</span>
+          <span class="row__when">
+            <button class="mini" onclick="draftItem('{{ c.id }}')">Draft anyway</button>
+          </span>
         </div>
-        <div class="reply-msg" id="msg-${id}"></div>
-      </div>`;
-    }
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
 
-    function card(it) {
-      const id = esc(it.id || "");
-      const who = esc(it.traveler || it.sender || "Unknown");
-      const when = esc(it.received || it.date || it.first_seen || "");
-      const prop = it.kind === "lead" ? esc(it.title || "") : "";
-      const email = it.response && it.response.tenant_email
-        ? ` · <span class="email-tag">${esc(it.response.tenant_email)}</span>` : "";
-      return `<div class="card card--${statusOf(it)}">
-        <div class="card-top">
-          <span class="who">${who}</span>
-          <span class="kind ${it.kind}">${it.kind === "lead" ? "New lead" : "Message"}</span>
-          <span class="spacer"></span>
-          <span class="when">${when}</span>
-          ${statusChip(it)}
+    <!-- 3. The post-booking half of the lifecycle -->
+    {% if board.arrivals %}
+    <section>
+      <div class="sec-head">
+        <h2>Arriving soon</h2>
+        <span class="sec-count">{{ board.arrivals|length }}</span>
+        <span class="sec-sub">booked guests — the agent handles pre-arrival</span>
+      </div>
+      <div class="rows">
+        {% for c in board.arrivals %}
+        <div class="row">
+          <span class="row__name">{{ c.deal.guest_name or 'Guest' }}</span>
+          <span class="row__mid">{{ c.stage_label }}{% if c.deal.unit_id %} · Unit {{ c.deal.unit_id }}{% endif %}{% if c.deal.next_action_step %} · next: {{ c.deal.next_action_step.replace('_', ' ') }}{% endif %}</span>
+          <span class="row__when">check-in {{ c.deal.check_in }}</span>
         </div>
-        <div class="prop">${prop}${prop && email ? "" : ""}${shortLine(it) ? (prop ? " — " : "") + esc(shortLine(it)) : ""}${email}</div>
-        ${quickFacts(it)}
-        <button class="inquiry-toggle" onclick="toggleInquiry('${id}')">Show full inquiry ▾</button>
-        <div class="inquiry" id="inq-${id}">${esc(fullText(it))}</div>
-        ${replyArea(it)}
-      </div>`;
-    }
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
 
-    function visibleRows(kind) {
-      const f = filters[kind];
-      const q = (document.getElementById(kind + "-search").value || "").toLowerCase().trim();
-      return data[kind].filter(it => {
-        if (f === "action" && !needsAction(it)) return false;
-        if (f === "draft" && statusOf(it) !== "draft") return false;
-        if (f === "sent" && statusOf(it) !== "sent") return false;
-        if (q) {
-          const hay = ((it.traveler || it.sender || "") + " " + fullText(it)).toLowerCase();
-          if (!hay.includes(q)) return false;
+    <!-- 4. What the agent will do next, without being asked -->
+    {% if board.scheduled %}
+    <section>
+      <div class="sec-head">
+        <h2>Scheduled by the agent</h2>
+        <span class="sec-count">{{ board.scheduled|length }}</span>
+        <span class="sec-sub">upcoming automated touches</span>
+      </div>
+      <div class="rows">
+        {% for c in board.scheduled %}
+        <div class="row">
+          <span class="row__name">{{ c.deal.guest_name or 'Guest' }}</span>
+          <span class="row__mid">{{ (c.deal.next_action_step or '').replace('_', ' ')|title }} · {{ c.stage_label }}</span>
+          <span class="row__when">{{ c.deal.next_action_at[:16].replace('T', ' ') if c.deal.next_action_at }}</span>
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+    <!-- 5. Everything, including deals past the live window -->
+    <section>
+      <div class="sec-head">
+        <h2>All deals</h2>
+        <span class="sec-count">{{ board.all|length }}</span>
+        <span class="sec-sub">newest inquiry first</span>
+      </div>
+      <div class="rows">
+        {% for c in board.all %}
+        <div class="row">
+          <span class="row__name">{{ c.deal.guest_name or 'Guest' }}</span>
+          <span class="row__mid">{{ c.stage_label }}{% if c.deal.check_in %} · {{ c.deal.check_in }}{% endif %}{% if c.deal.monthly_value %} · ${{ "{:,}".format(c.deal.monthly_value) }}/mo{% endif %}</span>
+          <span class="row__when">{{ c.age }} ago</span>
+        </div>
+        {% else %}
+        <div class="row"><span class="row__mid">No deals yet — click <b>Check now</b>.</span></div>
+        {% endfor %}
+      </div>
+    </section>
+
+    <script>
+      // Every POST from this page is a state-changing, cookie-authenticated
+      // request, so it carries the CSRF token the same way the forms do.
+      const CSRF_TOKEN = {{ csrf_token() | tojson }};
+
+      async function postForm(url, payload) {
+        const fd = new FormData();
+        for (const [k, v] of Object.entries(payload || {})) fd.append(k, v);
+        fd.append("csrf_token", CSRF_TOKEN);
+        const r = await fetch(url, {
+          method: "POST",
+          body: fd,
+          headers: { "X-CSRFToken": CSRF_TOKEN },
+        });
+        return r.json();
+      }
+      function setMsg(id, text, cls) {
+        const el = document.getElementById("msg-" + id);
+        if (el) { el.textContent = text || ""; el.className = "msg" + (cls ? " " + cls : ""); }
+      }
+      function setBusy(btn, on, label) {
+        if (!btn) return;
+        if (on) {
+          btn.dataset.label = btn.dataset.label || btn.innerHTML;
+          btn.disabled = true;
+          btn.innerHTML = `<span class="spinner-sm"></span>${label || "Working…"}`;
+        } else {
+          btn.disabled = false;
+          if (btn.dataset.label) btn.innerHTML = btn.dataset.label;
         }
-        return true;
-      }).sort((a, b) => sortKey(b) - sortKey(a));   // newest received first
-    }
-
-    function rerender(kind) {
-      const rows = visibleRows(kind);
-      const total = data[kind].length;
-      const action = data[kind].filter(needsAction).length;
-      document.getElementById(kind + "s-count").textContent =
-        `(${total} · ${action} need action)`;
-      const body = document.getElementById(kind + "s-body");
-      const noun = kind === "lead" ? "leads" : "messages";
-      if (!rows.length) {
-        body.innerHTML = `<div class="empty">${total ? "No " + noun + " match this filter." : "No " + noun + " yet — click “Check now”."}</div>`;
-        return;
       }
-      body.innerHTML = rows.map(card).join("");
-    }
 
-    function setFilter(kind, f, el) {
-      filters[kind] = f;
-      document.querySelectorAll(`.chip[data-kind="${kind}"]`).forEach(c => c.classList.remove("active"));
-      el.classList.add("active");
-      rerender(kind);
-    }
-
-    function toggleInquiry(id) {
-      const el = document.getElementById("inq-" + id);
-      if (el) el.classList.toggle("show");
-    }
-
-    async function postForm(url, payload) {
-      const fd = new FormData();
-      for (const [k, v] of Object.entries(payload)) fd.append(k, v);
-      const r = await fetch(url, { method: "POST", body: fd });
-      return r.json();
-    }
-
-    // Inline per-card feedback helpers (replace blocking alert/confirm).
-    function setMsg(id, text, cls) {
-      const el = document.getElementById("msg-" + id);
-      if (el) { el.textContent = text || ""; el.className = "reply-msg" + (cls ? " " + cls : ""); }
-    }
-    function setBusy(btn, on, busyLabel) {
-      if (!btn) return;
-      if (on) {
-        btn.dataset.label = btn.dataset.label || btn.innerHTML;
-        btn.classList.add("busy");
-        btn.disabled = true;
-        btn.innerHTML = `<span class="spinner-sm"></span>${busyLabel || "Working…"}`;
-      } else {
-        btn.classList.remove("busy");
-        btn.disabled = false;
-        if (btn.dataset.label) btn.innerHTML = btn.dataset.label;
+      async function draftItem(id) {
+        const btn = document.getElementById("draft-" + id);
+        setBusy(btn, true, "Drafting…");
+        setMsg(id, "Drafting…", "");
+        try {
+          const res = await postForm("/responder/draft", { item_id: id });
+          if (!res.ok) { setBusy(btn, false); setMsg(id, res.error || "Draft failed", "err"); return; }
+          location.reload();
+        } catch (e) { setBusy(btn, false); setMsg(id, "Draft failed: " + e, "err"); }
       }
-    }
 
-    async function draftItem(id) {
-      const btn = document.getElementById("draft-btn-" + id);
-      setBusy(btn, true, "Drafting…");
-      setMsg(id, "Drafting your reply…", "");
-      try {
-        const res = await postForm("/responder/draft", { item_id: id });
-        if (!res.ok) { setBusy(btn, false); setMsg(id, res.error || "Draft failed", "err"); return; }
-        // loadData() re-renders the card from scratch, so no need to reset btn.
-        await loadData();
-      } catch (e) {
-        setBusy(btn, false);
-        setMsg(id, "Draft failed: " + e, "err");
-      }
-    }
-
-    async function sendReply(id) {
-      const ta = document.getElementById("ta-" + id);
-      const text = ta ? ta.value.trim() : "";
-      if (!text) { setMsg(id, "Reply is empty — write something first.", "err"); if (ta) ta.focus(); return; }
-      const btn = document.getElementById("send-btn-" + id);
-      setBusy(btn, true, "Sending…");
-      if (ta) ta.disabled = true;
-      setMsg(id, "Sending reply… watch the bar up top for progress.", "");
-      try {
-        const res = await postForm("/responder/send", { item_id: id, text });
-        if (!res.ok) {
-          setBusy(btn, false); if (ta) ta.disabled = false;
-          setMsg(id, res.error || "Send failed", "err");
-          return;
+      // Sending is fire-and-forget: the POST only queues the message, and a
+      // background drainer drives the browser. The card tracks the outcome, so
+      // the user can keep working (or leave) instead of watching a spinner.
+      async function sendReply(id) {
+        const ta = document.getElementById("ta-" + id);
+        const text = ta ? ta.value.trim() : "";
+        if (!text) { setMsg(id, "Draft is empty.", "err"); return; }
+        const btn = document.getElementById("send-" + id);
+        setBusy(btn, true, "Queued…");
+        setMsg(id, "Queued — sending in the background. You can carry on.", "");
+        try {
+          const res = await postForm("/responder/send", { item_id: id, text });
+          if (!res.ok) {
+            setBusy(btn, false);
+            setMsg(id, res.error || "Could not queue the reply", "err");
+            return;
+          }
+          trackSends();
+        } catch (e) {
+          setBusy(btn, false);
+          setMsg(id, "Could not queue the reply: " + e, "err");
         }
-        // Send runs in a background thread; the status banner + poll report the
-        // outcome and loadData() (on completion) re-renders this card as "Sent".
+      }
+
+      // ---- delivery tracking ----
+      let sendPoll = null;
+
+      function renderSendState(id, s) {
+        const btn = document.getElementById("send-" + id);
+        if (s.status === "sent") {
+          setBusy(btn, false);
+          if (btn) { btn.disabled = true; btn.textContent = "Sent ✓"; }
+          setMsg(id, "Sent to the guest.", "ok");
+        } else if (s.status === "failed") {
+          setBusy(btn, false);
+          if (btn) { btn.disabled = false; btn.textContent = "Retry send"; }
+          setMsg(id, "Send failed: " + (s.error || "unknown error"), "err");
+        } else if (s.in_flight) {
+          setBusy(btn, true, s.status === "sending" ? "Sending…" : "Queued…");
+          setMsg(id, s.label, "");
+        }
+      }
+
+      async function trackSends() {
+        if (sendPoll) return;
+        const tick = async () => {
+          try {
+            const states = await (await fetch("/api/send-states")).json();
+            let anyInFlight = false;
+            for (const [id, s] of Object.entries(states)) {
+              renderSendState(id, s);
+              if (s.in_flight) anyInFlight = true;
+            }
+            if (!anyInFlight) { clearInterval(sendPoll); sendPoll = null; }
+          } catch (e) { /* transient */ }
+        };
+        sendPoll = setInterval(tick, 3000);
+        tick();
+      }
+
+      async function markBooked(id) {
+        await postForm(`/deal/${id}/booked`, {});
+        location.reload();
+      }
+      async function markLost(id) {
+        await postForm(`/deal/${id}/lost`, {});
+        location.reload();
+      }
+
+      async function approveMsg(mid) {
+        const ta = document.getElementById("ob-" + mid);
+        const res = await postForm(`/outbox/${mid}/approve`, { text: ta ? ta.value : "" });
+        if (res.ok) location.reload();
+      }
+      async function cancelMsg(mid) {
+        const res = await postForm(`/outbox/${mid}/cancel`, {});
+        if (res.ok) location.reload();
+      }
+
+      async function runAgent(btn) {
+        setBusy(btn, true, "Running…");
+        try {
+          const res = await postForm("/automation/run", {});
+          if (!res.ok) { setBusy(btn, false); alert(res.error || "Agent run failed"); return; }
+          location.reload();
+        } catch (e) { setBusy(btn, false); }
+      }
+
+      // ---- scrape status polling (unchanged behaviour) ----
+      const ACTIVE = ["launching", "checking", "waiting_for_otp"];
+      let polling = null, wasActive = false;
+
+      function applyState(s) {
+        const banner = document.getElementById("banner");
+        const msg = document.getElementById("banner-msg");
+        const otpRow = document.getElementById("otp-row");
+        const btn = document.getElementById("refresh-btn");
+        const spinner = document.getElementById("spinner");
+        const note = document.getElementById("ff-verification-note");
+        if (!banner) return false;
+        const active = ACTIVE.includes(s.status);
+        banner.classList.toggle("show", s.status !== "idle");
+        banner.classList.toggle("error", s.status === "error");
+        spinner.style.display = active ? "block" : "none";
+        msg.textContent = s.message || s.status;
+        otpRow.classList.toggle("show", s.status === "waiting_for_otp");
+        if (note) note.style.display = active ? "none" : "";
+        if (btn) { btn.disabled = active; btn.textContent = active ? "Checking…" : "Check now"; }
+        if (s.status === "waiting_for_otp") document.getElementById("otp-input").focus();
+        // Only a finished *scrape* refreshes the board (there are new leads to
+        // show). A finished background send must not reload — the user is
+        // probably mid-edit on another card.
+        if (wasActive && !active && s.kind !== "send") location.reload();
+        wasActive = active;
+        return active;
+      }
+
+      async function pollStatus() {
+        try {
+          const r = await fetch("/api/status");
+          const active = applyState(await r.json());
+          if (!active && polling) { clearInterval(polling); polling = null; }
+        } catch (e) { /* transient */ }
+      }
+      async function startRefresh() {
+        await fetch("/refresh", { method: "POST", headers: { "X-CSRFToken": CSRF_TOKEN } });
         if (!polling) polling = setInterval(pollStatus, 2000);
         pollStatus();
-      } catch (e) {
-        setBusy(btn, false); if (ta) ta.disabled = false;
-        setMsg(id, "Send failed: " + e, "err");
       }
-    }
-    async function dismissItem(id) {
-      await postForm("/responder/dismiss", { item_id: id });
-      loadData();
-    }
-
-    async function loadData() {
-      const r = await fetch("/api/data");
-      const d = await r.json();
-      data.lead = d.leads || [];
-      data.message = d.messages || [];
-      rerender("lead");
-      rerender("message");
-    }
-
-    const ACTIVE = ["launching", "checking", "waiting_for_otp"];
-    let polling = null;
-    let wasActive = false;
-
-    function applyState(s) {
-      const banner = document.getElementById("banner");
-      const msg = document.getElementById("banner-msg");
-      const otpRow = document.getElementById("otp-row");
-      const btn = document.getElementById("refresh-btn");
-      const spinner = document.getElementById("spinner");
-      const verificationNote = document.getElementById("ff-verification-note");
-
-      const active = ACTIVE.includes(s.status);
-      banner.classList.toggle("show", s.status !== "idle");
-      banner.classList.toggle("error", s.status === "error");
-      spinner.style.display = active ? "block" : "none";
-      msg.textContent = s.message || s.status;
-      otpRow.classList.toggle("show", s.status === "waiting_for_otp");
-      if (verificationNote) verificationNote.style.display = active ? "none" : "";
-      btn.disabled = active;
-      btn.textContent = active ? "Checking…" : "Check now";
-      if (s.status === "waiting_for_otp") document.getElementById("otp-input").focus();
-      if (wasActive && !active) {
-        loadData();
-        if (s.ff_status && s.ff_status.connected) window.location.reload();
+      async function submitOtp(ev) {
+        ev.preventDefault();
+        const input = document.getElementById("otp-input");
+        const code = input.value.trim();
+        if (!code) return;
+        const fd = new FormData();
+        fd.append("code", code);
+        fd.append("csrf_token", CSRF_TOKEN);
+        await fetch("/otp", { method: "POST", body: fd, headers: { "X-CSRFToken": CSRF_TOKEN } });
+        input.value = "";
+        pollStatus();
       }
-      wasActive = active;
-      return active;
-    }
 
-    async function pollStatus() {
-      try {
-        const r = await fetch("/api/status");
-        const s = await r.json();
-        const active = applyState(s);
-        if (!active && polling) { clearInterval(polling); polling = null; }
-      } catch (e) { /* ignore transient errors */ }
-    }
+      applyState({{ state | tojson }});
+      if (ACTIVE.includes({{ state.status | tojson }})) polling = setInterval(pollStatus, 2000);
 
-    async function startRefresh() {
-      await fetch("/refresh", { method: "POST" });
-      if (!polling) polling = setInterval(pollStatus, 2000);
-      pollStatus();
-    }
-
-    async function submitOtp(ev) {
-      ev.preventDefault();
-      const input = document.getElementById("otp-input");
-      const code = input.value.trim();
-      if (!code) return;
-      const fd = new FormData();
-      fd.append("code", code);
-      await fetch("/otp", { method: "POST", body: fd });
-      input.value = "";
-      pollStatus();
-    }
-
-    loadData();
-    applyState({{ state | tojson }});
-    if (ACTIVE.includes({{ state.status | tojson }})) {
-      polling = setInterval(pollStatus, 2000);
-    }
-  </script>
+      // Resume tracking on load so a send that's still in flight (or failed
+      // while the page was closed) shows its state without any user action.
+      {% if board.all | selectattr('send') | selectattr('send.in_flight') | list %}
+      trackSends();
+      {% else %}
+      (async () => {
+        try {
+          const states = await (await fetch("/api/send-states")).json();
+          for (const [id, s] of Object.entries(states)) {
+            if (s.status === "failed" || s.status === "sent") renderSendState(id, s);
+          }
+        } catch (e) { /* transient */ }
+      })();
+      {% endif %}
+    </script>
   {% endif %}
+  </main>
 </body>
 </html>

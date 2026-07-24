@@ -123,10 +123,19 @@ DATABASE_URL='postgres://…?sslmode=require' \
   python worker.py            # polls forever; --once drains the queue and exits
 ```
 
-If FurnishedFinder blocks the worker host's server/datacenter egress, run the
-browser through an approved proxy by setting `BROWSER_PROXY_SERVER` plus optional
-`BROWSER_PROXY_USERNAME` / `BROWSER_PROXY_PASSWORD` in the worker-only
-environment. Keep proxy credentials out of repo files.
+**Prefer email ingestion over scraping.** Forwarding FurnishedFinder's own
+notification emails to the app (see "Inbound email" in the README) reads leads
+without any automated access to their site, and is the default for new tenants.
+The browser path below remains only for sending replies and for hosts who
+haven't set forwarding up.
+
+`BROWSER_PROXY_SERVER` (with `BROWSER_PROXY_USERNAME` / `BROWSER_PROXY_PASSWORD`)
+routes browser traffic through a proxy — for a corporate egress policy or a fixed
+IP you've agreed with your own network. It now also requires `BROWSER_PROXY_ACK=1`,
+because a proxy must **not** be used to evade a site's IP block: that is
+circumvention of a technical access control, not automation. If FurnishedFinder
+blocks the host, stop and resolve it with them. Keep proxy credentials out of
+repo files.
 
 The `Procfile` declares this as the `worker:` process; a Render/Fly worker
 service or a systemd unit can run the same command. Until a worker is online the

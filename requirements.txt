@@ -7,6 +7,7 @@ python-dotenv>=1.0.0
 requests>=2.31.0
 flask>=3.0
 flask-login>=0.6
+flask-wtf>=1.2          # CSRF protection for every state-changing form/POST
 cryptography>=42
 anthropic>=0.40
 stripe>=9.0

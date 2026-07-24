@@ -307,12 +307,16 @@ def webhook():
     payload = request.get_data()
     secret = (os.getenv("STRIPE_WEBHOOK_SECRET") or "").strip()
     sig = request.headers.get("Stripe-Signature", "")
+    # Fail closed. An unverified webhook grants subscriptions, so a missing
+    # secret must be a hard error rather than "trust whatever was posted" —
+    # otherwise anyone who finds this URL can activate their own plan.
+    if not secret:
+        current_app.logger.error(
+            "STRIPE_WEBHOOK_SECRET is not set — refusing to process webhooks."
+        )
+        return ("webhook secret not configured", 503)
     try:
-        if secret:
-            event = stripe.Webhook.construct_event(payload, sig, secret)
-        else:  # no secret configured — accept unverified (dev only)
-            import json
-            event = json.loads(payload or b"{}")
+        event = stripe.Webhook.construct_event(payload, sig, secret)
     except Exception as e:
         current_app.logger.warning("Bad Stripe webhook: %s", e)
         return ("bad signature", 400)

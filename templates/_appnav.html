@@ -15,6 +15,7 @@
     </a>
     <nav class="appbar__nav">
       <a href="{{ url_for('index') }}" class="{{ 'active' if nav_active == 'dashboard' }}">Dashboard</a>
+      <a href="{{ url_for('automations') }}" class="{{ 'active' if nav_active == 'automations' }}">Automations</a>
       <a href="{{ url_for('settings') }}" class="{{ 'active' if nav_active == 'settings' }}">Settings</a>
       <a href="{{ url_for('billing.billing_home') }}" class="{{ 'active' if nav_active == 'billing' }}">Billing</a>
     </nav>
@@ -22,6 +23,7 @@
       {{ nav_extra|safe if nav_extra }}
       {% if account %}<span class="appbar__acct">Signed in as <b>{{ account }}</b></span>{% endif %}
       <form method="post" action="{{ url_for('logout') }}" style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button type="submit" class="btn btn--ghost btn--sm">Log out</button>
       </form>
     </div>
