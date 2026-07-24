@@ -1,0 +1,17 @@
+.git
+.venv
+.venv-worker
+venv
+__pycache__
+*.pyc
+*.db
+*.db.bak
+*.log
+browser_profile/
+browser_profiles/
+data/
+.env
+.env.*
+!.env.example
+OTP_CODE
+docs/

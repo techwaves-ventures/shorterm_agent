@@ -1,0 +1,74 @@
+# Local dev/testing. Two modes:
+#
+#   docker compose up
+#     Just the dashboard, SQLite, in-process Playwright scraping — the
+#     single-instance topology (same as `python dashboard.py` locally).
+#
+#   docker compose --profile worker up
+#     Adds Postgres + worker.py, mirroring the production split in DEPLOY.md
+#     (dashboard enqueues scrape jobs, worker.py drains them). Requires
+#     DATABASE_URL and FORCE_WORKER_QUEUE=1 set in .env — see the comments
+#     below and DEPLOY.md's "Vercel can't run the browser" section.
+#
+# Either way: `cp .env.example .env` and fill in SECRET_KEY / FF_CRED_KEY /
+# OPERATOR_EMAIL / OPERATOR_PASSWORD first (see README / DEPLOY.md).
+
+services:
+  dashboard:
+    build: .
+    # Real Google Chrome (the "chrome" channel the app requests) only ships for
+    # linux/amd64 — there's no Linux ARM64 build. Force amd64 so this also works
+    # on Apple Silicon (via emulation) and matches typical x86_64 Linux hosts.
+    platform: linux/amd64
+    ports:
+      - "5050:5050"
+    env_file:
+      - .env
+    environment:
+      DASHBOARD_HOST: 0.0.0.0
+      DASHBOARD_PORT: "5050"
+      HEADLESS: "1"
+      # SQLite path inside the container; ignored once DATABASE_URL (Postgres)
+      # is set in .env for the worker-queue mode above.
+      SQLITE_PATH: /app/data/leads.db
+    volumes:
+      - ./data:/app/data
+      - browser_profile:/app/browser_profile
+      - browser_profiles:/app/browser_profiles
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: shorterm
+      POSTGRES_PASSWORD: shorterm
+      POSTGRES_DB: shorterm
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shorterm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    profiles: ["worker"]
+
+  worker:
+    build: .
+    platform: linux/amd64
+    command: python worker.py
+    env_file:
+      - .env
+    environment:
+      HEADLESS: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - browser_profiles:/app/browser_profiles
+    restart: unless-stopped
+    profiles: ["worker"]
+
+volumes:
+  browser_profile:
+  browser_profiles:
+  pgdata:
