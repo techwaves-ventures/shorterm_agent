@@ -5,6 +5,7 @@ the only gate between a draft and a guest's inbox, the scheduler decides when
 the system acts unattended, and pipeline decides what the owner is shown as
 needing them. A regression here is a wrong message to a customer's customer.
 """
+import hashlib
 import json
 import os
 import tempfile
@@ -44,10 +45,22 @@ def tenant(tmp_path, monkeypatch):
     return tid
 
 
-def _lead(tenant_id, item_id="L1", received="July 20, 2026", **extra):
+def _days_ago(n: int) -> str:
+    """A `received_at` stamp n days before today, in the format FF emits.
+
+    These fixtures used to hardcode calendar dates. `pipeline.LIVE_WINDOW_DAYS`
+    drops a lead out of the "needs you" queue once it's been waiting that long,
+    so a fixed date silently ages past the window and the test starts failing on
+    a date nobody changed any code on. Anchoring to today keeps the *relative*
+    age — which is the thing under test — constant.
+    """
+    return (datetime.now() - timedelta(days=n)).strftime("%B %-d, %Y")
+
+
+def _lead(tenant_id, item_id="L1", received=None, **extra):
     item = {"id": item_id, "kind": "lead", "traveler": "Dana R.",
             "title": "Unit 1 | Washington, District of Columbia | Dana R.",
-            "received_at": received, **extra}
+            "received_at": received or _days_ago(2), **extra}
     storage.filter_new(tenant_id, SITE, "lead", [item])
     pipeline.ensure(tenant_id, SITE, item, None)
     return item
@@ -84,15 +97,15 @@ def test_needs_action_excludes_clean_skips_but_keeps_draft_errors(tenant):
 
 
 def test_needs_action_sorted_oldest_waiting_first(tenant):
-    _lead(tenant, "new", received="July 20, 2026")
-    _lead(tenant, "old", received="July 12, 2026")
+    _lead(tenant, "new", received=_days_ago(2))
+    _lead(tenant, "old", received=_days_ago(10))
     deals = pipeline.all_deals(tenant, SITE)
     order = [d["item_id"] for d in pipeline.needs_action(deals, {})]
     assert order == ["old", "new"], "longest-waiting guest must come first"
 
 
 def test_stale_leads_drop_out_of_the_queue(tenant):
-    _lead(tenant, "ancient", received="January 15, 2026")
+    _lead(tenant, "ancient", received=_days_ago(pipeline.LIVE_WINDOW_DAYS + 30))
     deals = pipeline.all_deals(tenant, SITE)
     assert pipeline.needs_action(deals, {}) == []
 
@@ -427,6 +440,120 @@ def test_same_notification_twice_dedups(inbox, tenant):
     _tid, again = inbox.accept(_payload(inbox), "provider-secret")
     assert again["id"] == item["id"], "id must be stable across re-forwards"
     assert inbox.store(tenant, again, SITE) is False
+
+
+FF_MESSAGE_EMAIL = """You have a new message from your traveler.
+
+Property: Quiet Spacious Home in NW DC - Unit 1
+Traveler: Emma M.
+Date received: {received}
+
+{text}
+
+Reply to this message in your account.
+"""
+
+
+def _message_payload(inbound_mod, text, received="July 19, 2026"):
+    return _payload(
+        inbound_mod,
+        body=FF_MESSAGE_EMAIL.format(received=received, text=text),
+        subject="New message from Emma M.",
+    )
+
+
+def test_message_email_carries_no_dates_to_key_on(inbox):
+    """The precondition that made replies collide: on the message template the
+    date fields the id used to hash are simply absent."""
+    _tid, item = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                              "provider-secret")
+    assert item["kind"] == "message"
+    assert not item.get("move_in") and not item.get("move_out")
+
+
+def test_guest_prose_is_never_mistaken_for_a_requested_date(inbox):
+    """A traveler writing "can I move in a week earlier?" used to set
+    move_in="a week earlier?" — the label matcher doesn't know it left the
+    template and entered the guest's own sentence. Junk like that lands on the
+    deal and reads as a real requested date in the UI."""
+    _tid, item = inbox.accept(
+        _message_payload(inbox, "Great — can I move in a week earlier?"),
+        "provider-secret")
+    assert not item.get("move_in")
+
+    # The real labelled field is still read.
+    _tid, lead = inbox.accept(_payload(inbox), "provider-secret")
+    assert lead["move_in"] == "8/16/26"
+
+
+def test_second_message_from_one_guest_is_not_swallowed_as_a_duplicate(inbox, tenant):
+    """Regression: every message from a guest used to hash to the same id.
+
+    The id was derived from name + move-in + move-out + property + kind. A
+    message email carries no dates (see the test above), so a guest's second,
+    third and fourth messages all produced the *first* message's id and
+    `storage.filter_new` dropped them as already-seen. The agent could read an
+    opening message and never the reply to its own answer — which is the whole
+    conversation.
+    """
+    _tid, first = inbox.accept(
+        _message_payload(inbox, "Is parking included?", received="July 19, 2026"),
+        "provider-secret")
+    _tid, second = inbox.accept(
+        _message_payload(inbox, "Great — could I start a week earlier?",
+                         received="July 21, 2026"),
+        "provider-secret")
+
+    assert first["id"] != second["id"], "two different messages must be two items"
+    assert inbox.store(tenant, first, SITE) is True
+    assert inbox.store(tenant, second, SITE) is True, "the reply must reach the agent"
+
+
+def test_two_messages_sent_the_same_day_are_still_distinct(inbox, tenant):
+    """The received stamp alone is only day-granular, so the body has to count
+    too — otherwise a guest who writes twice in one day loses the second one."""
+    _tid, first = inbox.accept(
+        _message_payload(inbox, "Is parking included?"), "provider-secret")
+    _tid, second = inbox.accept(
+        _message_payload(inbox, "Sorry, also: is the unit furnished?"), "provider-secret")
+    assert first["id"] != second["id"]
+    assert inbox.store(tenant, first, SITE) is True
+    assert inbox.store(tenant, second, SITE) is True
+
+
+def test_the_same_message_re_forwarded_still_dedups(inbox, tenant):
+    """Distinguishing messages must not cost us re-forward dedup: the id is
+    derived from the email's own text, never from arrival time, so the same
+    message arriving twice is still one item."""
+    _tid, item = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                              "provider-secret")
+    _tid, again = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                               "provider-secret")
+    assert again["id"] == item["id"]
+    assert inbox.store(tenant, item, SITE) is True
+    assert inbox.store(tenant, again, SITE) is False
+
+
+def test_re_forward_through_a_different_text_converter_still_dedups(inbox, tenant):
+    """HTML-to-text conversion re-wraps lines and pads table cells. That is the
+    same message, so it must not read as a new one."""
+    _tid, item = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                              "provider-secret")
+    rewrapped = _message_payload(inbox, "Is  parking\n  included?")
+    _tid, again = inbox.accept(rewrapped, "provider-secret")
+    assert again["id"] == item["id"]
+    assert inbox.store(tenant, item, SITE) is True
+    assert inbox.store(tenant, again, SITE) is False
+
+
+def test_lead_ids_are_unchanged_by_the_message_fix(inbox):
+    """Leads still key on who + when + which property — existing rows keep
+    their ids, so the fix can't orphan a deal that is already open."""
+    _tid, item = inbox.accept(_payload(inbox), "provider-secret")
+    assert item["id"] == hashlib.sha1(
+        "||".join(["Emma M.", "8/16/26", "7/16/27",
+                   "Quiet Spacious Home in NW DC - Unit 1", "lead"]).encode()
+    ).hexdigest()[:16]
 
 
 def test_email_mode_is_never_scheduled_for_a_scrape(tenant):

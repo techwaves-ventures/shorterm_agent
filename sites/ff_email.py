@@ -82,6 +82,18 @@ def _label(text: str, *labels: str) -> str:
     return ""
 
 
+def _body_fingerprint(body: str) -> str:
+    """Whitespace-insensitive digest of a message body, for id derivation.
+
+    Collapsed rather than raw so the same message re-forwarded through a
+    different HTML-to-text conversion (which re-wraps lines and pads cells)
+    still fingerprints identically and dedups, while genuinely different
+    messages from the same guest stay distinct.
+    """
+    collapsed = re.sub(r"\s+", " ", (body or "")).strip().lower()
+    return hashlib.sha1(collapsed.encode()).hexdigest()[:16]
+
+
 def _kind_from_subject(subject: str) -> str:
     low = (subject or "").lower()
     if any(h in low for h in _MESSAGE_HINTS) and not any(h in low for h in _LEAD_HINTS):
@@ -118,7 +130,20 @@ def _dates(text: str) -> tuple[str, str]:
         return _norm_date(rng.group(1)), _norm_date(rng.group(2))
     move_in = _label(text, "Move in", "Move-in", "Check in", "Check-in", "Start date", "Arrival")
     move_out = _label(text, "Move out", "Move-out", "Check out", "Check-out", "End date", "Departure")
-    return _norm_date(move_in), _norm_date(move_out)
+    return _only_if_a_date(move_in), _only_if_a_date(move_out)
+
+
+def _only_if_a_date(value: str) -> str:
+    """Normalize a labelled value, or drop it if it isn't actually a date.
+
+    `_label` matches anywhere in the text, including inside a guest's own prose.
+    A traveler writing "can I move in a week earlier?" would otherwise set
+    move_in to "a week earlier?" — junk that lands on the deal, fails date
+    parsing downstream, and reads as a real requested date in the UI. A value
+    that doesn't normalize to a calendar date is not one.
+    """
+    normalized = _norm_date(value)
+    return normalized if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{2}", normalized or "") else ""
 
 
 def parse(subject: str, body: str) -> dict | None:
@@ -204,7 +229,17 @@ def parse(subject: str, body: str) -> dict | None:
 
     # Stable id from the facts that identify this inquiry, so the same
     # notification arriving twice (a re-forward) dedups against itself.
-    item["id"] = hashlib.sha1(
-        "||".join([name, move_in, move_out, property_name, kind]).encode()
-    ).hexdigest()[:16]
+    #
+    # A lead is identified by who + when + which property. A *message* is not:
+    # the date fields are empty on the message template, so hashing the same
+    # five fields made every message from one guest collide onto a single id and
+    # `storage.filter_new` discarded all but the first as already-seen — the
+    # agent could read a guest's opening message and never their reply. Messages
+    # therefore hash over what actually distinguishes them: the received stamp
+    # and the body. Both are read out of the email text (not the delivery clock),
+    # so a re-forward of the same message still hashes identically and dedups.
+    parts = [name, move_in, move_out, property_name, kind]
+    if kind == "message":
+        parts += [received, _body_fingerprint(body)]
+    item["id"] = hashlib.sha1("||".join(parts).encode()).hexdigest()[:16]
     return item
