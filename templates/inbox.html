@@ -159,8 +159,10 @@
       {% endfor %}
 
       {% if pages > 1 %}
+        {# per_page rides along, or paging out of a custom page size silently
+           snaps back to the default and the row you were looking at moves. #}
         {% set p = {'state': filters.state, 'kind': filters.kind,
-                    'unit': filters.unit, 'q': filters.q} %}
+                    'unit': filters.unit, 'q': filters.q, 'per_page': per_page} %}
         <nav class="pager" aria-label="Pagination">
           {% if page > 1 %}
             <a class="btn btn--ghost btn--sm" href="{{ url_for('inbox', page=page-1, **p) }}">← Previous</a>

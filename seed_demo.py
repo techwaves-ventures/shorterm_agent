@@ -99,10 +99,14 @@ DEMO_LIFECYCLE = [
         "_state": "scheduled", "_unit": "unit-2",
     },
     {
+        # Check-in stays in the future on purpose: advance_lifecycle moves a
+        # booked deal whose check-in has passed straight on to staying, so a
+        # past date here would make the seeded "booked" example close itself the
+        # first time the worker ran.
         "id": "lead-1006", "traveler": "Robin (demo)", "received": "9 days ago",
-        "title": "Relocating in the spring", "move_in": "Mar 1",
-        "move_out": "Aug 31", "nights": 183, "occupants": 2,
-        "detail": "Confirmed and signed — arriving in the spring.",
+        "title": "Relocating for a new role", "move_in": "Nov 1",
+        "move_out": "Apr 30", "nights": 180, "occupants": 2,
+        "detail": "Confirmed and signed — arriving in November.",
         "_state": "booked", "_unit": "unit-1",
     },
     {

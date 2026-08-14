@@ -639,6 +639,7 @@ def inbox():
         page=result["page"],
         pages=result["pages"],
         total=result["total"],
+        per_page=result["per_page"],
         filters={"state": state, "kind": kind, "unit": unit, "q": q},
         states=[(s, pipeline.LEAD_STATE_LABELS[s]) for s in pipeline.LEAD_STATES],
         units=config.get_units(tenant_id) or [],
