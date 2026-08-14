@@ -252,6 +252,16 @@ def _anchor_dt(deal: dict, anchor: str) -> datetime | None:
         return None
 
 
+def next_send_time(now: datetime | None = None) -> str:
+    """The soonest moment a message may go out — now, or the next waking hour.
+
+    An immediate send still has to respect quiet hours: "reply instantly" is the
+    product's advantage right up until it wakes a prospect at 3am, at which
+    point it reads as a bot and burns the trust the product is selling.
+    """
+    return _clamp_quiet_hours(now or datetime.now()).isoformat(timespec="seconds")
+
+
 def _clamp_quiet_hours(dt: datetime) -> datetime:
     """Nudge a send time into waking hours (see QUIET_START/QUIET_END)."""
     if dt.time() < QUIET_START:

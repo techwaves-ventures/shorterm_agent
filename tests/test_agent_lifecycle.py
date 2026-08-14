@@ -18,6 +18,7 @@ os.environ.setdefault("SQLITE_PATH", tempfile.mktemp(suffix=".db"))
 os.environ.setdefault("FF_CRED_KEY", "c9jwUi0L-fUjf3wjbq74M0lK3ah7fmEfGhjxZ7RehQk=")
 os.environ.setdefault("SECRET_KEY", "test-secret")
 
+import automation  # noqa: E402
 import config  # noqa: E402
 import digest  # noqa: E402
 import models  # noqa: E402
@@ -667,6 +668,150 @@ def test_thread_key_treats_one_guest_as_one_person(tenant):
     assert len(keys) == 1
     assert pipeline.thread_key({"traveler": "", "property_name": "Unit 1"}) == "", \
         "no name means no thread — never a key that matches other blanks"
+
+
+# --- the lifecycle closes itself ---------------------------------------------
+
+
+def _days_from_today(n: int) -> str:
+    return (datetime.now() + timedelta(days=n)).date().isoformat()
+
+
+def test_a_booked_guest_moves_to_prearrival_then_staying_then_completed(tenant):
+    """STAYING and COMPLETED were declared, filtered on and labelled, but no code
+    path ever wrote them — a booked guest stayed "booked" through arrival, their
+    whole stay and checkout."""
+    _lead(tenant, "D1")
+    pipeline.mark_booked(tenant, SITE, "D1",
+                         check_in=_days_from_today(3), check_out=_days_from_today(60))
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "D1")["stage"] == pipeline.PRE_ARRIVAL
+
+    pipeline.update(tenant, SITE, "D1", check_in=_days_from_today(0))
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "D1")["stage"] == pipeline.STAYING
+
+    pipeline.update(tenant, SITE, "D1", check_out=_days_from_today(-1))
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "D1")["stage"] == pipeline.COMPLETED
+
+
+def test_a_booking_added_after_checkout_lands_on_completed_not_staying(tenant):
+    """Backfilling an old booking must not park a finished stay in `staying`."""
+    _lead(tenant, "D1")
+    pipeline.mark_booked(tenant, SITE, "D1",
+                         check_in=_days_from_today(-90), check_out=_days_from_today(-30))
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "D1")["stage"] == pipeline.COMPLETED
+
+
+def test_a_deal_that_went_cold_closes_itself(tenant):
+    """mark_lost was reachable only from a human click, so the pipeline had no
+    terminal state that didn't require someone to remember to press something."""
+    _lead(tenant, "cold")
+    old = (datetime.now() - timedelta(days=pipeline.STALE_CLOSE_DAYS + 5)
+           ).isoformat(timespec="seconds")
+    pipeline.update(tenant, SITE, "cold", stage=pipeline.NURTURING,
+                    last_contact_at=old, next_action_at=None)
+    with pipeline._conn() as c:
+        c.execute("UPDATE deals SET inquiry_at=? WHERE tenant_id=? AND item_id=?",
+                  (old, tenant, "cold"))
+
+    assert pipeline.advance_lifecycle(tenant, SITE)["lost"] == 1
+    deal = pipeline.get(tenant, SITE, "cold")
+    assert deal["stage"] == pipeline.LOST
+    assert deal["closed_reason"], "a close the owner didn't make must say why"
+
+
+def test_a_deal_with_a_follow_up_still_queued_is_never_closed(tenant):
+    """Closing it would cancel the very message that might have won it."""
+    _lead(tenant, "pending")
+    old = (datetime.now() - timedelta(days=pipeline.STALE_CLOSE_DAYS + 5)
+           ).isoformat(timespec="seconds")
+    pipeline.update(tenant, SITE, "pending", stage=pipeline.NURTURING,
+                    last_contact_at=old, next_action_at="2099-01-01T09:00:00")
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "pending")["stage"] == pipeline.NURTURING
+
+
+def test_a_guest_waiting_on_us_is_never_written_off_as_lost(tenant):
+    """The guest spoke last. That deal is waiting on the owner, not dead."""
+    _lead(tenant, "waiting")
+    old = (datetime.now() - timedelta(days=pipeline.STALE_CLOSE_DAYS + 5)
+           ).isoformat(timespec="seconds")
+    pipeline.update(tenant, SITE, "waiting", stage=pipeline.NURTURING,
+                    last_contact_at=old, last_guest_reply_at=old[:10] + "T23:59:59",
+                    next_action_at=None)
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "waiting")["stage"] != pipeline.LOST
+
+
+def test_a_fresh_deal_is_left_alone(tenant):
+    _lead(tenant, "fresh")
+    assert pipeline.advance_lifecycle(tenant, SITE) == {
+        "pre_arrival": 0, "staying": 0, "completed": 0, "lost": 0}
+
+
+def test_the_lifecycle_sweep_is_safe_to_run_every_pass(tenant):
+    """The worker calls this on every cycle; a second run must change nothing."""
+    _lead(tenant, "D1")
+    pipeline.mark_booked(tenant, SITE, "D1",
+                         check_in=_days_from_today(-1), check_out=_days_from_today(30))
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.advance_lifecycle(tenant, SITE) == {
+        "pre_arrival": 0, "staying": 0, "completed": 0, "lost": 0}
+
+
+# --- autopilot may not launder its sends through the approval record ---------
+
+
+def test_autopilot_does_not_record_a_human_approval_that_never_happened(tenant):
+    """The outbox is the audit record of who authorized contact with a guest.
+    Autopilot stamped every send `reason="Approved by you"` with `approved_at`
+    set, so the one path that sends without review was the one path whose record
+    claimed a person had reviewed it."""
+    _lead(tenant, "L1")
+    config.save_settings(tenant, automation_enabled="0")
+    msg = automation.enqueue_autopilot_reply(tenant, SITE, "L1", "Hi there!")
+    assert "approved by you" not in (msg["reason"] or "").lower()
+    assert msg["status"] == outbox.PENDING, "unarmed autopilot must still ask"
+    assert msg["approved_at"] is None
+
+
+def test_autopilot_respects_the_step_rails_it_used_to_skip(tenant):
+    """It called enqueue_send directly, so it never consulted can_auto_send: the
+    intro step is not auto-send-eligible by default precisely because a weak
+    first impression to a live prospect is expensive and hard to undo."""
+    _lead(tenant, "L1")
+    # Master switch on, but the intro step not armed → still needs approval.
+    config.save_settings(tenant, automation_enabled="1", auto_steps="followup_1")
+    assert automation.enqueue_autopilot_reply(
+        tenant, SITE, "L1", "Hi!")["status"] == outbox.PENDING
+
+    # Owner explicitly arms the intro step → it may send unattended, and says so.
+    config.save_settings(tenant, automation_enabled="1", auto_steps="intro")
+    msg = automation.enqueue_autopilot_reply(tenant, SITE, "L1", "Hi!")
+    assert msg["status"] == outbox.QUEUED
+    assert "autopilot" in msg["reason"].lower()
+
+
+def test_the_human_send_button_still_records_a_human(tenant):
+    """The honest case must keep saying so."""
+    _lead(tenant, "L1")
+    msg = automation.enqueue_send(tenant, SITE, "L1", "Hi there!")
+    assert msg["status"] == outbox.QUEUED
+    assert msg["reason"] == "Approved by you"
+
+
+def test_a_send_scheduled_for_the_morning_is_not_delivered_at_night(tenant):
+    """The quiet-hours clamp only ever ordered the queue — it never gated it, so
+    a send pushed to a civilised hour went out the moment a drainer woke."""
+    _lead(tenant, "L1")
+    outbox.add(tenant, SITE, "L1", sequence="presale", step_id="intro",
+               step_label="First reply", body="Morning!", auto=True,
+               scheduled_at="2026-08-20T08:00:00")
+    assert outbox.next_queued(tenant, now_iso="2026-08-20T03:00:00") is None
+    assert outbox.next_queued(tenant, now_iso="2026-08-20T09:00:00") is not None
 
 
 # --- the one derived state ---------------------------------------------------

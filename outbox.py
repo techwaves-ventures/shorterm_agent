@@ -213,10 +213,17 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
     return requeued
 
 
-def next_queued(tenant_id: str | None = None) -> dict | None:
-    """The oldest message ready to send (optionally scoped to one tenant)."""
-    sql = f"{_SELECT} WHERE status=?"
-    params: list = [QUEUED]
+def next_queued(tenant_id: str | None = None,
+                now_iso: str | None = None) -> dict | None:
+    """The oldest message that is ready to send *now*.
+
+    `scheduled_at` used to order the queue without gating it, so a send that had
+    been deliberately pushed to a civilised hour went out the moment a drainer
+    woke up — the quiet-hours clamp computed upstream had no effect on delivery
+    at all. A message is due only once its scheduled time has arrived.
+    """
+    sql = f"{_SELECT} WHERE status=? AND scheduled_at<=?"
+    params: list = [QUEUED, now_iso or _now()]
     if tenant_id is not None:
         sql += " AND tenant_id=?"
         params.append(str(tenant_id))

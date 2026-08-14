@@ -148,8 +148,15 @@ def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]
             log.exception("Could not open deal for %s", it.get("id"))
 
         # Autopilot: the owner has explicitly granted autonomy, so a good-fit
-        # lead is answered now rather than waiting for them to open the app —
-        # speed is the whole advantage. Poor fits are skipped and never sent.
+        # lead is answered without waiting for them to open the app — speed is
+        # the whole advantage. Poor fits are skipped and never sent.
+        #
+        # Routed through enqueue_autopilot_reply rather than enqueue_send: the
+        # latter stamps "Approved by you" on the outbox row, which was a lie on
+        # this path and made the audit record useless for the one kind of send
+        # that most needs one. That helper also applies the auto-send rails and
+        # quiet hours, so a message only goes out unattended if the tenant armed
+        # the intro step; otherwise it waits for approval like any other draft.
         # Imported lazily to keep runner free of an import cycle.
         if decision and decision.get("fit") and (decision.get("draft") or "").strip():
             try:
@@ -157,11 +164,11 @@ def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]
                 import scheduler
 
                 if scheduler.is_on(tenant_id):
-                    automation.enqueue_send(
+                    msg = automation.enqueue_autopilot_reply(
                         tenant_id, site, it["id"], decision["draft"],
-                        step_label="First reply (autopilot)",
                     )
-                    log.info("Autopilot queued first reply for %s", it.get("id"))
+                    log.info("Autopilot drafted first reply for %s (status=%s)",
+                             it.get("id"), (msg or {}).get("status"))
             except Exception:
                 log.exception("Autopilot auto-reply failed for %s", it.get("id"))
 

@@ -182,6 +182,17 @@ def run_agent_pass() -> None:
     except Exception:
         log.exception("Daily digest pass failed")
 
+    # Advance the stages a calendar decides — arrival, checkout, going cold.
+    # Runs over every tenant with deals rather than only those with a step due:
+    # a stay that needs closing has no next action by definition.
+    for tenant_id in pipeline.tenants_with_deals():
+        try:
+            moved = pipeline.advance_lifecycle(tenant_id, SITE)
+            if any(moved.values()):
+                log.info("Lifecycle pass for tenant %s: %s", tenant_id, moved)
+        except Exception:
+            log.exception("Lifecycle pass failed for tenant %s", tenant_id)
+
     for tenant_id in pipeline.tenants_with_due():
         try:
             summary = automation.run_due(tenant_id, SITE)
@@ -189,6 +200,19 @@ def run_agent_pass() -> None:
                 log.info("Agent pass for tenant %s: %s", tenant_id, summary)
         except Exception:
             log.exception("Agent drafting pass failed for tenant %s", tenant_id)
+
+    # Requeue sends stranded by a crashed process. This only ever ran from a
+    # dashboard page view, so an unattended host — the exact deployment this
+    # worker exists for — could strand a message indefinitely: no longer
+    # `queued` so no drainer takes it, but never delivered to the guest either.
+    try:
+        import outbox
+
+        reclaimed = outbox.reclaim_stuck_sending()
+        if reclaimed:
+            log.info("Requeued %d send(s) stranded mid-flight", reclaimed)
+    except Exception:
+        log.exception("Could not reclaim stuck sends")
 
     # Deliver approved/armed messages one at a time; send_next blocks until each
     # browser send reaches a terminal state, so the loop stays serialized.

@@ -512,6 +512,18 @@ def tenants_with_due(now_iso: str | None = None) -> list[str]:
     return [str(r[0]) for r in rows]
 
 
+def tenants_with_deals() -> list[str]:
+    """Every tenant that has a deal at all.
+
+    `tenants_with_due` only finds tenants with a *scheduled* step, which is the
+    wrong work list for the lifecycle sweep: a stay that needs closing has no
+    next action by definition, so those tenants would never be visited.
+    """
+    with _conn() as c:
+        rows = c.execute("SELECT DISTINCT tenant_id FROM deals").fetchall()
+    return [str(r[0]) for r in rows]
+
+
 def all_deals(tenant_id: str, site: str) -> list[dict]:
     with _conn() as c:
         rows = c.execute(
@@ -581,9 +593,88 @@ def mark_booked(tenant_id: str, site: str, item_id: str,
     update(tenant_id, site, item_id, **fields)
 
 
-def mark_lost(tenant_id: str, site: str, item_id: str) -> None:
-    update(tenant_id, site, item_id, stage=LOST,
+def mark_lost(tenant_id: str, site: str, item_id: str,
+              reason: str | None = None) -> None:
+    update(tenant_id, site, item_id, stage=LOST, closed_reason=reason,
            next_action_at=None, next_action_step=None)
+
+
+# A deal nobody has touched for this long, with no follow-ups left to send, is
+# over. Deliberately well past LIVE_WINDOW_DAYS (which only drops a lead out of
+# the "needs you now" queue): dropping out of the queue is a display decision and
+# recoverable, closing the deal is a lifecycle decision and shows as a loss.
+STALE_CLOSE_DAYS = 21
+
+# Booked deals enter the pre-arrival stream this far ahead of check-in.
+PRE_ARRIVAL_DAYS = 7
+
+
+def advance_lifecycle(tenant_id: str, site: str, today: str | None = None) -> dict:
+    """Move deals through the stages that a calendar — not a human — decides.
+
+    `STAYING` and `COMPLETED` were declared, filtered on and labelled, but no
+    code path ever wrote them: a booked guest stayed "booked" through their
+    arrival, their stay and their checkout, and `mark_lost` was reachable only
+    from a human click. So the pipeline had no terminal state that didn't
+    require someone to remember to press something, and "closed" was never true
+    of anything the owner hadn't personally closed.
+
+    Returns a per-transition count. Idempotent: re-running on the same day is a
+    no-op, so it is safe to call from every worker pass.
+    """
+    today = today or datetime.now().date().isoformat()
+    horizon = (datetime.fromisoformat(today).date()
+               + timedelta(days=PRE_ARRIVAL_DAYS)).isoformat()
+    stale_before = (datetime.fromisoformat(today) - timedelta(days=STALE_CLOSE_DAYS)
+                    ).isoformat(timespec="seconds")
+    moved = {"pre_arrival": 0, "staying": 0, "completed": 0, "lost": 0}
+
+    for deal in all_deals(tenant_id, site):
+        stage = deal.get("stage")
+        item_id = deal["item_id"]
+        check_in, check_out = deal.get("check_in"), deal.get("check_out")
+
+        if stage == STAYING and check_out and check_out < today:
+            update(tenant_id, site, item_id, stage=COMPLETED,
+                   next_action_at=None, next_action_step=None)
+            moved["completed"] += 1
+        elif stage in (BOOKED, PRE_ARRIVAL) and check_in and check_in <= today:
+            # Only if the stay hasn't already ended — a deal booked and
+            # backfilled after checkout should land on completed, not staying.
+            if check_out and check_out < today:
+                update(tenant_id, site, item_id, stage=COMPLETED,
+                       next_action_at=None, next_action_step=None)
+                moved["completed"] += 1
+            else:
+                update(tenant_id, site, item_id, stage=STAYING)
+                moved["staying"] += 1
+        elif stage == BOOKED and check_in and check_in <= horizon:
+            update(tenant_id, site, item_id, stage=PRE_ARRIVAL)
+            moved["pre_arrival"] += 1
+        elif stage in OPEN_STAGES:
+            if _is_abandoned(deal, stale_before):
+                mark_lost(tenant_id, site, item_id,
+                          reason=f"No reply for {STALE_CLOSE_DAYS} days")
+                moved["lost"] += 1
+    return moved
+
+
+def _is_abandoned(deal: dict, stale_before: str) -> bool:
+    """Whether an open deal has gone cold with nothing left to try.
+
+    Requires the sequence to be *exhausted* (`next_action_at` cleared), not just
+    quiet — closing a deal that still has a follow-up queued would cancel the
+    very message that might have won it. And a deal where the guest is the last
+    one to have spoken is never abandoned; that one is waiting on us.
+    """
+    if deal.get("next_action_at"):
+        return False
+    if _guest_is_waiting(deal):
+        return False
+    last = max(str(deal.get("last_guest_reply_at") or ""),
+               str(deal.get("last_contact_at") or ""),
+               str(deal.get("inquiry_at") or ""))
+    return bool(last) and last < stale_before
 
 
 # --- The one state the operator actually thinks in --------------------------
