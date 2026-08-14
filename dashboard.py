@@ -568,6 +568,160 @@ def api_board():
 
 
 # ---------------------------------------------------------------------------
+# Inbox — one filterable list of every lead and message
+# ---------------------------------------------------------------------------
+
+
+def _int_arg(value, default: int) -> int:
+    """A query-string integer, or the default. Never raises on hand-typed URLs."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _failed_item_ids(tenant_id: str) -> tuple:
+    """Items whose last send failed — they need the owner, whatever their stage."""
+    return tuple(m["item_id"]
+                 for m in outbox.for_tenant(tenant_id, SITE, (outbox.FAILED,)))
+
+
+@app.route("/inbox")
+@login_required
+def inbox():
+    """The list the operator manages from: every lead and message, filterable.
+
+    Deliberately side-effect free. `_board()` mutates on read — it backfills
+    deals and starts the send drainer — which is defensible for one dashboard
+    but not for a list the operator will page and re-filter constantly, where it
+    would turn every click into a write.
+    """
+    tenant_id = current_user.tenant_id
+    kind = request.args.get("kind") or "all"
+    state = request.args.get("state") or ""
+    unit = request.args.get("unit") or ""
+    q = (request.args.get("q") or "").strip()
+
+    result = pipeline.inbox_page(
+        tenant_id, SITE,
+        state=state,
+        kind=kind if kind in ("lead", "message") else None,
+        unit=unit or None,
+        q=q or None,
+        page=_int_arg(request.args.get("page"), 1),
+        per_page=_int_arg(request.args.get("per_page"), pipeline.DEFAULT_PER_PAGE),
+        failed_item_ids=_failed_item_ids(tenant_id),
+    )
+
+    # Payloads for this page only — never the whole mailbox.
+    items = storage.items_by_ids(
+        tenant_id, SITE, [r["deal"]["item_id"] for r in result["rows"]])
+    rows = []
+    for row in result["rows"]:
+        deal = row["deal"]
+        item = items.get(deal["item_id"], {})
+        rows.append({
+            **row,
+            "item": item,
+            "id": deal["item_id"],
+            "title": item.get("title") or deal.get("guest_name") or deal["item_id"],
+            "age": pipeline.humanize_age(deal.get("inquiry_at")),
+            "stage_label": pipeline.STAGE_LABELS.get(deal.get("stage"), deal.get("stage")),
+            "state_label": pipeline.LEAD_STATE_LABELS.get(row["state"], row["state"]),
+        })
+
+    return render_template(
+        "inbox.html",
+        nav_active="inbox",
+        account=current_user.email,
+        rows=rows,
+        counts=result["counts"],
+        page=result["page"],
+        pages=result["pages"],
+        total=result["total"],
+        filters={"state": state, "kind": kind, "unit": unit, "q": q},
+        states=[(s, pipeline.LEAD_STATE_LABELS[s]) for s in pipeline.LEAD_STATES],
+        units=config.get_units(tenant_id) or [],
+        billing_label=billing.status_label(billing.get_subscription(tenant_id)),
+    )
+
+
+@app.route("/thread/<item_id>")
+@login_required
+def thread(item_id):
+    """One conversation: the guest's messages and ours, in order.
+
+    This is the surface "I want to see all the messages" reduces to. Everything
+    the guest sent lives in `seen`; everything we sent lives in the outbox.
+    Neither alone is the conversation.
+    """
+    tenant_id = current_user.tenant_id
+    deal = _deal_or_404(tenant_id, item_id)
+    key = deal.get("thread_key") or ""
+
+    # Threading matches on guest identity rather than an indexed id, so this
+    # reads the tenant's items and filters in Python. Acceptable for a single
+    # conversation; it is the reason /inbox deliberately does not do the same.
+    inbound_items = pipeline.thread_items(key, storage.all_items(tenant_id, SITE))
+    if not inbound_items:
+        item = storage.get_item(tenant_id, SITE, item_id)
+        inbound_items = [item] if item else []
+
+    entries = [{
+        "who": "guest",
+        "name": deal.get("guest_name") or "Guest",
+        "at": it.get("first_seen") or "",
+        "body": it.get("body") or it.get("raw") or it.get("title") or "",
+        "kind": it.get("kind") or "lead",
+    } for it in inbound_items]
+
+    for msg in outbox.for_tenant(tenant_id, SITE, (outbox.SENT,)):
+        if msg["item_id"] == item_id:
+            entries.append({"who": "us", "name": "You", "at": msg.get("sent_at") or "",
+                            "body": msg.get("body") or "", "kind": "reply"})
+    entries.sort(key=lambda e: str(e["at"]))
+
+    response = storage.get_responses(tenant_id, SITE).get(item_id)
+    state = pipeline.lead_state(
+        deal, response, has_failed_send=item_id in _failed_item_ids(tenant_id))
+    return render_template(
+        "thread.html",
+        nav_active="inbox",
+        account=current_user.email,
+        deal=deal,
+        entries=entries,
+        response=response,
+        state=state,
+        state_label=pipeline.LEAD_STATE_LABELS.get(state, state),
+        stage_label=pipeline.STAGE_LABELS.get(deal.get("stage"), deal.get("stage")),
+        can_scrape=_can_scrape(),
+        billing_label=billing.status_label(billing.get_subscription(tenant_id)),
+    )
+
+
+@app.route("/deal/<item_id>/notes", methods=["POST"])
+@login_required
+def deal_notes(item_id):
+    """Free-text notes on a deal — the context that never fits a stage."""
+    tenant_id = current_user.tenant_id
+    _deal_or_404(tenant_id, item_id)
+    (notes,) = _form("notes")
+    pipeline.update(tenant_id, SITE, item_id, notes=(notes or "").strip()[:4000])
+    return jsonify({"ok": True})
+
+
+@app.route("/deal/<item_id>/reopen", methods=["POST"])
+@login_required
+def deal_reopen(item_id):
+    """Undo a close. A one-click close nobody can undo is a trap."""
+    tenant_id = current_user.tenant_id
+    _deal_or_404(tenant_id, item_id)
+    pipeline.update(tenant_id, SITE, item_id, stage=pipeline.CONTACTED,
+                    closed_reason=None)
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
 # Deal lifecycle actions
 # ---------------------------------------------------------------------------
 

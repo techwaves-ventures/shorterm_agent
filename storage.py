@@ -204,6 +204,33 @@ def all_items(tenant_id: str, site: str) -> dict[str, dict]:
     return out
 
 
+def items_by_ids(tenant_id: str, site: str, item_ids) -> dict[str, dict]:
+    """Stored items for a specific set of ids, keyed by item_id.
+
+    The inbox renders one page at a time, so it wants 25 payloads — not the
+    tenant's entire mailbox (`all_items`) and not 25 round-trips (`get_item` in
+    a loop). Ids come from our own query, never from the request.
+    """
+    ids = [str(i) for i in item_ids]
+    if not ids:
+        return {}
+    out: dict[str, dict] = {}
+    placeholders = ",".join("?" * len(ids))
+    with _conn() as c:
+        rows = c.execute(
+            f"""SELECT item_id, payload, first_seen, kind FROM seen
+                WHERE tenant_id=? AND site=? AND item_id IN ({placeholders})""",
+            [tenant_id, site] + ids,
+        ).fetchall()
+    for item_id, payload, first_seen, kind in rows:
+        item = _parse_payload(payload)
+        item["first_seen"] = first_seen
+        item.setdefault("kind", kind)
+        item.setdefault("id", item_id)
+        out[item_id] = item
+    return out
+
+
 def get_item(tenant_id: str, site: str, item_id: str) -> dict | None:
     """One stored item by id, regardless of kind (tagged with its kind).
 

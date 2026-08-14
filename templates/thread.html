@@ -1,0 +1,170 @@
+{# One conversation, in order: what the guest sent and what we sent back. #}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ deal.guest_name or 'Conversation' }} — Shorterm</title>
+  {% include "_theme.html" %}
+  <style>
+    .backlink { display: inline-block; color: var(--muted); font-size: .87rem;
+      margin-bottom: 14px; }
+    .head { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); padding: 18px 22px; margin-bottom: 20px; }
+    .head__main { flex: 1; min-width: 220px; }
+    .head h1 { font-size: 1.35rem; }
+    .head__facts { display: flex; gap: 16px; flex-wrap: wrap; color: var(--muted);
+      font-size: .84rem; margin-top: 8px; }
+    .head__side { display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
+
+    .pill { display: inline-flex; align-items: center; padding: 3px 10px;
+      border-radius: var(--radius-pill); font-size: .76rem; font-weight: 650;
+      border: 1px solid var(--border); background: var(--surface-2); color: var(--muted); }
+    .pill--needs_you     { background: var(--warn-soft);  color: var(--warn);
+                           border-color: rgba(180,120,10,.35); }
+    .pill--guest_replied { background: var(--brand-soft); color: var(--brand-2);
+                           border-color: var(--brand-line); }
+    .pill--closed        { background: var(--ok-soft); color: var(--ok);
+                           border-color: rgba(23,122,69,.30); }
+
+    .msg { display: flex; margin-bottom: 12px; }
+    .msg--us { justify-content: flex-end; }
+    .bubble { max-width: 76%; border: 1px solid var(--border);
+      border-radius: var(--radius-lg); padding: 13px 16px; background: var(--surface); }
+    .msg--us .bubble { background: var(--brand-soft); border-color: var(--brand-line); }
+    .bubble__who { font-size: .76rem; font-weight: 650; color: var(--faint);
+      margin-bottom: 5px; display: flex; gap: 8px; }
+    .bubble__body { font-size: .9rem; line-height: 1.55; white-space: pre-wrap;
+      word-break: break-word; }
+
+    .panel { background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); padding: 18px 22px; margin-top: 22px; }
+    .panel h2 { font-size: 1rem; margin-bottom: 4px; }
+    .panel p.hint { color: var(--muted); font-size: .84rem; margin-bottom: 12px; }
+    .panel textarea { min-height: 120px; font-family: inherit; }
+    .actions { display: flex; gap: 9px; flex-wrap: wrap; margin-top: 10px; }
+    .empty { text-align: center; padding: 40px 24px; color: var(--muted);
+      background: var(--surface); border: 1px dashed var(--border-2);
+      border-radius: var(--radius-lg); }
+    @media (max-width: 640px) { .bubble { max-width: 92%; } }
+  </style>
+</head>
+<body>
+  {% include "_appnav.html" %}
+  <main class="app-main">
+
+    <a class="backlink" href="{{ url_for('inbox') }}">← Back to inbox</a>
+
+    <header class="head">
+      <div class="head__main">
+        <h1>{{ deal.guest_name or 'Unknown guest' }}</h1>
+        <div class="head__facts">
+          <span>{{ stage_label }}</span>
+          {% if deal.check_in %}<span>Check-in {{ deal.check_in }}</span>{% endif %}
+          {% if deal.check_out %}<span>Check-out {{ deal.check_out }}</span>{% endif %}
+          {% if deal.unit_id %}<span>{{ deal.unit_id }}</span>{% endif %}
+          {% if deal.monthly_value %}<span>${{ deal.monthly_value }}/mo</span>{% endif %}
+        </div>
+      </div>
+      <div class="head__side">
+        <span class="pill pill--{{ state }}">{{ state_label }}</span>
+        {% if state == 'closed' %}
+          <button class="btn btn--ghost btn--sm" data-reopen>Reopen</button>
+        {% endif %}
+      </div>
+    </header>
+
+    {% if entries %}
+      {% for e in entries %}
+        <div class="msg msg--{{ e.who }}">
+          <div class="bubble">
+            <div class="bubble__who">
+              <span>{{ e.name }}</span>
+              {% if e.at %}<span class="faint">{{ e.at }}</span>{% endif %}
+            </div>
+            <div class="bubble__body">{{ e.body }}</div>
+          </div>
+        </div>
+      {% endfor %}
+    {% else %}
+      <div class="empty">No message text was captured for this conversation yet.</div>
+    {% endif %}
+
+    {% if response and response.draft %}
+      <section class="panel">
+        <h2>Suggested reply</h2>
+        <p class="hint">
+          Drafted by the agent{% if response.confidence %} ({{ response.confidence }} confidence){% endif %}.
+          Nothing is sent until you approve it.
+        </p>
+        <textarea id="draft" aria-label="Suggested reply">{{ response.draft }}</textarea>
+        <div class="actions">
+          <button class="btn btn--primary" data-send {{ 'disabled' if not can_scrape }}>
+            Approve &amp; send
+          </button>
+          {% if not can_scrape %}
+            <span class="faint" style="font-size:.8rem; align-self:center">
+              Connect your FurnishedFinder account to send.
+            </span>
+          {% endif %}
+        </div>
+      </section>
+    {% elif response and response.reason %}
+      <section class="panel">
+        <h2>Agent decision</h2>
+        <p class="hint">{{ response.reason }}</p>
+      </section>
+    {% endif %}
+
+    <section class="panel">
+      <h2>Notes</h2>
+      <p class="hint">Context that doesn't fit a stage. Only you see this.</p>
+      <textarea id="notes" aria-label="Notes">{{ deal.notes or '' }}</textarea>
+      <div class="actions">
+        <button class="btn btn--ghost" data-notes>Save note</button>
+        <span id="notes-said" class="faint" style="font-size:.8rem; align-self:center"></span>
+      </div>
+    </section>
+
+  </main>
+
+  <script>
+    // Vanilla fetch + reload, matching the rest of the app.
+    const ITEM = {{ deal.item_id|tojson }};
+    const CSRF = {{ csrf_token()|tojson }};
+
+    async function post(url, body) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'X-CSRFToken': CSRF},
+        body: JSON.stringify(body || {}),
+      });
+      return res.json().catch(() => ({ok: false}));
+    }
+
+    document.querySelector('[data-notes]')?.addEventListener('click', async (ev) => {
+      ev.target.disabled = true;
+      await post(`/deal/${encodeURIComponent(ITEM)}/notes`,
+                 {notes: document.getElementById('notes').value});
+      document.getElementById('notes-said').textContent = 'Saved';
+      ev.target.disabled = false;
+    });
+
+    document.querySelector('[data-send]')?.addEventListener('click', async (ev) => {
+      ev.target.disabled = true;
+      ev.target.textContent = 'Queueing…';
+      const out = await post('/responder/send',
+                             {item_id: ITEM, text: document.getElementById('draft').value});
+      if (out.ok) { location.reload(); }
+      else { ev.target.disabled = false; ev.target.textContent = 'Approve & send'; }
+    });
+
+    document.querySelector('[data-reopen]')?.addEventListener('click', async (ev) => {
+      ev.target.disabled = true;
+      await post(`/deal/${encodeURIComponent(ITEM)}/reopen`);
+      location.reload();
+    });
+  </script>
+</body>
+</html>

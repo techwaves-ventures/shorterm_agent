@@ -15,6 +15,7 @@
     </a>
     <nav class="appbar__nav">
       <a href="{{ url_for('index') }}" class="{{ 'active' if nav_active == 'dashboard' }}">Dashboard</a>
+      <a href="{{ url_for('inbox') }}" class="{{ 'active' if nav_active == 'inbox' }}">Inbox</a>
       <a href="{{ url_for('automations') }}" class="{{ 'active' if nav_active == 'automations' }}">Automations</a>
       <a href="{{ url_for('settings') }}" class="{{ 'active' if nav_active == 'settings' }}">Settings</a>
       <a href="{{ url_for('billing.billing_home') }}" class="{{ 'active' if nav_active == 'billing' }}">Billing</a>

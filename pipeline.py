@@ -466,6 +466,17 @@ def backfill(tenant_id: str, site: str, items: dict[str, dict],
                        responses.get(item_id), units=units)
             continue
         item = {**item, "id": item_id}
+        # A message belonging to a conversation we already have joins it rather
+        # than opening a second deal — the same rule the live ingest path uses.
+        # Without this, backfilling a mailbox re-creates exactly the duplicate
+        # deals that threading exists to prevent.
+        if item.get("kind") == "message":
+            parent = find_thread(tenant_id, site, thread_key(item),
+                                 exclude_item_id=item_id)
+            if parent:
+                record_guest_reply(tenant_id, site, parent["item_id"],
+                                   at=str(item.get("first_seen") or "") or None)
+                continue
         deal = ensure(tenant_id, site, item, responses.get(item_id), units=units)
         # A reply already went out before the pipeline existed: reflect that so
         # the deal doesn't reappear in "needs you" and skew response metrics.
@@ -645,6 +656,135 @@ def state_counts(rows: list[dict]) -> dict[str, int]:
             counts[state] += 1
     counts["all"] = len(rows)
     return counts
+
+
+# --- The inbox query --------------------------------------------------------
+# The dashboard's read path funnels through storage.all_items(), which loads
+# every stored payload for the tenant into memory and filters in Python. That is
+# fine for six hard-coded sections; it is not fine for a filterable list, where
+# the whole point is that the operator can ask for one slice of a large mailbox.
+# So the inbox filters, counts and paginates in SQL over the small columns, and
+# the caller loads payloads for only the page it is about to render.
+#
+# `_STATE_SQL` mirrors `lead_state()` branch for branch. Two implementations of
+# one rule is exactly the drift this workstream exists to remove, so
+# `test_inbox_filters.py` asserts they agree across a matrix of deals — that
+# test is what keeps them honest.
+def _state_sql(failed_count: int) -> str:
+    failed = (f"d.item_id IN ({','.join('?' * failed_count)})"
+              if failed_count else "1=0")
+    return f"""CASE
+        WHEN d.stage IN ('{BOOKED}','{PRE_ARRIVAL}','{STAYING}','{COMPLETED}','{LOST}')
+            THEN '{CLOSED}'
+        WHEN r.status = 'dismissed' THEN '{CLOSED}'
+        WHEN d.last_guest_reply_at IS NOT NULL
+             AND d.last_guest_reply_at > COALESCE(d.last_contact_at, '')
+            THEN '{GUEST_REPLIED}'
+        WHEN {failed} THEN '{NEEDS_YOU}'
+        WHEN r.status = 'skipped'
+             AND LOWER(COALESCE(r.reason, '')) LIKE 'draft error%' THEN '{NEEDS_YOU}'
+        WHEN r.status = 'draft' OR r.status IS NULL THEN '{NEEDS_YOU}'
+        WHEN r.status = 'skipped' THEN '{CLOSED}'
+        WHEN d.next_action_at IS NOT NULL THEN '{SCHEDULED}'
+        ELSE '{AWAITING_GUEST}'
+    END"""
+
+
+_RESPONSE_COLS = ("status", "unit_id", "reason", "draft", "confidence",
+                  "created_at", "sent_at")
+
+DEFAULT_PER_PAGE = 25
+MAX_PER_PAGE = 100
+
+
+def inbox_page(tenant_id: str, site: str, *, state: str | None = None,
+               kind: str | None = None, unit: str | None = None,
+               q: str | None = None, page: int = 1,
+               per_page: int = DEFAULT_PER_PAGE,
+               failed_item_ids: tuple = ()) -> dict:
+    """One page of the inbox, plus the per-state counts for the tab bar.
+
+    `failed_item_ids` is supplied by the caller rather than joined here: a failed
+    send lives in the outbox, which is a layer above this one, and failures are
+    rare enough that passing the (small) id set in beats a correlated subquery.
+
+    Counts are computed over the *unpaginated* filtered set — the tab bar has to
+    say how many are in each state, not how many are on this page.
+    """
+    tenant_id, site = str(tenant_id), site
+    failed = [str(i) for i in failed_item_ids]
+    page = max(1, int(page or 1))
+    per_page = max(1, min(int(per_page or DEFAULT_PER_PAGE), MAX_PER_PAGE))
+
+    state_expr = _state_sql(len(failed))
+    where = ["d.tenant_id=?", "d.site=?"]
+    # The CASE sits in the SELECT list, so its parameters bind before the WHERE
+    # clause's — order here is load-bearing.
+    args: list = list(failed) + [tenant_id, site]
+    if kind in ("lead", "message"):
+        where.append("d.kind=?")
+        args.append(kind)
+    if unit:
+        where.append("d.unit_id=?")
+        args.append(str(unit))
+    if q:
+        where.append("(LOWER(COALESCE(d.guest_name,'')) LIKE ? "
+                     "OR LOWER(COALESCE(d.thread_key,'')) LIKE ?)")
+        needle = f"%{q.strip().lower()}%"
+        args += [needle, needle]
+
+    deal_cols = ", ".join(f"d.{c}" for c in _COLS)
+    resp_cols = ", ".join(f"r.{c}" for c in _RESPONSE_COLS)
+    base = (f"FROM deals d LEFT JOIN responses r "
+            f"ON r.tenant_id=d.tenant_id AND r.site=d.site AND r.item_id=d.item_id "
+            f"WHERE {' AND '.join(where)}")
+    select = f"SELECT {deal_cols}, {resp_cols}, {state_expr} AS lead_state {base}"
+
+    with _conn() as c:
+        counted = c.execute(
+            f"SELECT {state_expr} AS lead_state, COUNT(*) {base} GROUP BY 1",
+            args,
+        ).fetchall()
+        counts = {s: 0 for s in LEAD_STATES}
+        for value, n in counted:
+            if value in counts:
+                counts[value] = int(n)
+        counts["all"] = sum(counts[s] for s in LEAD_STATES)
+
+        if state in LEAD_STATES:
+            # The CASE has to be repeated in the WHERE clause: neither engine
+            # lets a WHERE reference a SELECT alias. Its parameters therefore
+            # bind a second time, after every existing WHERE parameter.
+            select_filtered = f"{select} AND {state_expr} = ?"
+            rows_args = args + failed + [state]
+            total = counts.get(state, 0)
+        else:
+            select_filtered = select
+            rows_args = list(args)
+            total = counts["all"]
+        offset = (page - 1) * per_page
+        rows = c.execute(
+            f"{select_filtered} ORDER BY d.inquiry_at DESC, d.id DESC "
+            f"LIMIT ? OFFSET ?",
+            rows_args + [per_page, offset],
+        ).fetchall()
+
+    out = []
+    for row in rows:
+        deal = dict(zip(_COLS, row[:len(_COLS)]))
+        resp_values = row[len(_COLS):len(_COLS) + len(_RESPONSE_COLS)]
+        response = dict(zip(_RESPONSE_COLS, resp_values))
+        out.append({
+            "deal": deal,
+            # A deal with no responder row yet has an all-None join; that is
+            # "the agent hasn't looked", not an empty decision.
+            "response": response if response.get("status") else None,
+            "state": row[-1],
+        })
+
+    pages = max(1, (total + per_page - 1) // per_page)
+    return {"rows": out, "counts": counts, "total": total,
+            "page": page, "pages": pages, "per_page": per_page}
 
 
 # --- Views the dashboard is built from --------------------------------------

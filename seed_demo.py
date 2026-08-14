@@ -69,17 +69,95 @@ DEMO_MESSAGES = [
         "body": "Hi! Loved the photos. Is there off-street parking, and could I move in a few days early?",
         "move_in": "Aug 20", "nights": 60, "occupants": 1,
     },
+    {
+        # Dana's second message. Before the id-collision fix this one hashed
+        # identically to the first and was silently dropped, so the demo could
+        # never show a conversation with more than one guest turn in it.
+        "id": "msg-2002", "sender": "Dana (demo)", "date": "20 minutes ago",
+        "title": "Re: Is parking included?",
+        "body": "That works for me — could you send the lease over? I can put a deposit down this week.",
+    },
+]
+
+# Conversations that exercise the rest of the lifecycle. Without these the inbox
+# can only be reviewed in the three states a fresh scrape produces, and the
+# filters that matter most — "who is waiting on me", "who have I answered" —
+# have nothing to show. `_state` is the state each one is seeded into.
+DEMO_LIFECYCLE = [
+    {
+        "id": "lead-1004", "traveler": "Sam (demo)", "received": "3 days ago",
+        "title": "6-month stay near the hospital", "move_in": "Oct 1",
+        "move_out": "Mar 31", "nights": 182, "occupants": 1,
+        "detail": "Residency placement, needs a quiet desk.",
+        "_state": "awaiting_guest", "_unit": "unit-2",
+    },
+    {
+        "id": "lead-1005", "traveler": "Alex (demo)", "received": "6 days ago",
+        "title": "Studio for a winter rotation", "move_in": "Dec 1",
+        "move_out": "Feb 28", "nights": 90, "occupants": 1,
+        "detail": "Winter contract, flexible on exact dates.",
+        "_state": "scheduled", "_unit": "unit-2",
+    },
+    {
+        "id": "lead-1006", "traveler": "Robin (demo)", "received": "9 days ago",
+        "title": "Relocating in the spring", "move_in": "Mar 1",
+        "move_out": "Aug 31", "nights": 183, "occupants": 2,
+        "detail": "Confirmed and signed — arriving in the spring.",
+        "_state": "booked", "_unit": "unit-1",
+    },
+    {
+        "id": "lead-1007", "traveler": "Casey (demo)", "received": "12 days ago",
+        "title": "Short notice stay", "move_in": "Aug 25", "nights": 45,
+        "occupants": 1, "detail": "Went quiet after two follow-ups.",
+        "_state": "lost", "_unit": "unit-1",
+    },
 ]
 
 
 def _reset_sample_data(tenant_id: str) -> None:
-    """Clear this tenant's seen/response rows so re-seeding is idempotent.
+    """Clear this tenant's seen/response/deal rows so re-seeding is idempotent.
 
     Uses storage._conn so the tables are created/migrated if they don't exist yet.
     """
+    import pipeline
+
     with storage._conn() as c:
         c.execute("DELETE FROM seen WHERE tenant_id=? AND site=?", (tenant_id, SITE))
         c.execute("DELETE FROM responses WHERE tenant_id=? AND site=?", (tenant_id, SITE))
+    # Deals outlive a scrape, so clearing only seen/responses left the previous
+    # run's deals behind and re-seeding accumulated duplicates.
+    with pipeline._conn() as c:
+        c.execute("DELETE FROM deals WHERE tenant_id=? AND site=?", (tenant_id, SITE))
+
+
+def _seed_lifecycle(tenant_id: str) -> None:
+    """Open a deal per lifecycle sample and move it into its intended state."""
+    import pipeline
+
+    items = [{k: v for k, v in d.items() if not k.startswith("_")}
+             for d in DEMO_LIFECYCLE]
+    storage.filter_new(tenant_id, SITE, "lead", items)
+    for sample, item in zip(DEMO_LIFECYCLE, items):
+        unit = sample["_unit"]
+        storage.save_response(
+            tenant_id, SITE, "lead", item["id"], status="sent", unit_id=unit,
+            confidence="high", reason="Seeded demo conversation.",
+            draft="Thanks for reaching out — happy to help with dates and details.",
+        )
+        pipeline.ensure(tenant_id, SITE, item,
+                        storage.get_responses(tenant_id, SITE).get(item["id"]),
+                        units=DEMO_UNITS)
+        pipeline.record_contact(tenant_id, SITE, item["id"])
+
+        state = sample["_state"]
+        if state == "scheduled":
+            pipeline.update(tenant_id, SITE, item["id"], stage=pipeline.NURTURING,
+                            next_action_at="2026-12-01T09:00:00",
+                            next_action_step="presale_followup_1")
+        elif state == "booked":
+            pipeline.mark_booked(tenant_id, SITE, item["id"])
+        elif state == "lost":
+            pipeline.mark_lost(tenant_id, SITE, item["id"])
 
 
 def _seed_items(tenant_id: str) -> None:
@@ -152,6 +230,7 @@ def seed_demo() -> tuple[str, str]:
 
     _reset_sample_data(tenant_id)
     _seed_items(tenant_id)
+    _seed_lifecycle(tenant_id)
     return DEMO_EMAIL, tenant_id
 
 
