@@ -273,25 +273,34 @@ def find_thread(tenant_id: str, site: str, key: str,
     starting a new conversation, not continuing a finished one. Newest first, so
     a repeat guest attaches to their current deal rather than an ancient one.
 
-    Falls back to the guest half of the key when the fully-qualified one misses.
-    The two ingest paths don't always agree on the property — a notification
-    email names it, a scraped row often doesn't — so requiring both halves to
-    match would leave a reply orphaned from the lead it answers, which is the
-    exact failure this is here to prevent. Guest-only is scoped to one tenant's
-    open deals, so the blast radius is two open conversations with the same
-    normalized name; attaching to the newest is the right guess there anyway.
+    Falls back on the guest alone when — and only when — one of the two sides
+    has no property to key on. The ingest paths don't always agree about the
+    property (a notification email names it, a scraped row often doesn't), so
+    requiring both halves to match would orphan the reply this exists to
+    rescue. But falling back whenever the exact key misses is worse: a guest
+    asking about Unit B would be swallowed into their open Unit A deal, which
+    the key's own definition says is a different conversation.
+
+    So: an unqualified incoming item may attach to any of that guest's open
+    deals, and a qualified one may attach only to a deal that is itself
+    unqualified. Two qualified keys that disagree are two conversations.
     """
     if not key:
         return None
     exact = _find_thread_where(tenant_id, site, "thread_key=?", [key],
                                exclude_item_id)
-    if exact or "|" not in key:
+    if exact:
         return exact
-    guest = key.split("|", 1)[0]
+    guest, _, prop = key.partition("|")
     if not guest:
         return None
-    return _find_thread_where(tenant_id, site, "thread_key LIKE ?",
-                              [guest + "|%"], exclude_item_id)
+    if not prop:
+        # We don't know which unit this is about — any open deal for this guest.
+        return _find_thread_where(tenant_id, site, "thread_key LIKE ?",
+                                  [guest + "|%"], exclude_item_id)
+    # We know the unit; only join a deal that never recorded one.
+    return _find_thread_where(tenant_id, site, "thread_key=?",
+                              [guest + "|"], exclude_item_id)
 
 
 def _find_thread_where(tenant_id: str, site: str, clause: str, params: list,
@@ -311,16 +320,25 @@ def _find_thread_where(tenant_id: str, site: str, clause: str, params: list,
 def thread_items(key: str, items: dict[str, dict]) -> list[dict]:
     """Every stored inbound item belonging to one conversation, oldest first.
 
-    Matches on the guest half of the key for the same reason `find_thread` falls
-    back to it: the lead and the replies to it can carry different property text.
+    Same rule as `find_thread`, and for the same reason: the guest must match,
+    and the property may differ only when one side didn't state one. Matching on
+    the guest alone would render another unit's messages inside this deal's
+    conversation — the operator would read someone's Unit B enquiry as part of
+    their Unit A thread, and reply to the wrong one.
     """
     if not key:
         return []
-    guest = key.split("|", 1)[0]
+    guest, _, prop = key.partition("|")
     if not guest:
         return []
-    out = [it for it in items.values()
-           if thread_key(it).split("|", 1)[0] == guest]
+    out = []
+    for it in items.values():
+        item_guest, _, item_prop = thread_key(it).partition("|")
+        if not item_guest or item_guest != guest:
+            continue
+        if prop and item_prop and prop != item_prop:
+            continue
+        out.append(it)
     out.sort(key=lambda it: str(it.get("first_seen") or ""))
     return out
 
@@ -474,8 +492,20 @@ def backfill(tenant_id: str, site: str, items: dict[str, dict],
             parent = find_thread(tenant_id, site, thread_key(item),
                                  exclude_item_id=item_id)
             if parent:
-                record_guest_reply(tenant_id, site, parent["item_id"],
-                                   at=str(item.get("first_seen") or "") or None)
+                # Only stamp a reply *newer* than the one already recorded.
+                # A threaded message never gets a deal row of its own, so it is
+                # never in `existing` and this branch re-runs on every backfill
+                # — and backfill runs on every dashboard load. Re-stamping
+                # unconditionally would re-clear next_action_at each time, so
+                # any deal that had ever received a guest message could never
+                # hold a scheduled follow-up again. That is the opposite of what
+                # threading is for.
+                at = str(item.get("first_seen") or "")
+                seen_at = str(parent.get("last_guest_reply_at") or "")
+                if at and at > seen_at:
+                    record_guest_reply(tenant_id, site, parent["item_id"], at=at)
+                elif not at and not seen_at:
+                    record_guest_reply(tenant_id, site, parent["item_id"])
                 continue
         deal = ensure(tenant_id, site, item, responses.get(item_id), units=units)
         # A reply already went out before the pipeline existed: reflect that so
@@ -634,20 +664,18 @@ def advance_lifecycle(tenant_id: str, site: str, today: str | None = None) -> di
         item_id = deal["item_id"]
         check_in, check_out = deal.get("check_in"), deal.get("check_out")
 
-        if stage == STAYING and check_out and check_out < today:
+        # Checkout is the strongest signal and is checked first, for every
+        # booked stage and without requiring a check-in. Gating this on
+        # check_in — as an earlier version did — left a booking recorded with
+        # only a check-out date stuck in `booked` forever, permanently
+        # inflating booked_count and the arrivals list.
+        if stage in BOOKED_STAGES and check_out and check_out < today:
             update(tenant_id, site, item_id, stage=COMPLETED,
                    next_action_at=None, next_action_step=None)
             moved["completed"] += 1
         elif stage in (BOOKED, PRE_ARRIVAL) and check_in and check_in <= today:
-            # Only if the stay hasn't already ended — a deal booked and
-            # backfilled after checkout should land on completed, not staying.
-            if check_out and check_out < today:
-                update(tenant_id, site, item_id, stage=COMPLETED,
-                       next_action_at=None, next_action_step=None)
-                moved["completed"] += 1
-            else:
-                update(tenant_id, site, item_id, stage=STAYING)
-                moved["staying"] += 1
+            update(tenant_id, site, item_id, stage=STAYING)
+            moved["staying"] += 1
         elif stage == BOOKED and check_in and check_in <= horizon:
             update(tenant_id, site, item_id, stage=PRE_ARRIVAL)
             moved["pre_arrival"] += 1

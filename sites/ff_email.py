@@ -190,7 +190,14 @@ def _guest_name(subject: str, body: str) -> str:
 
 
 def _dates(text: str) -> tuple[str, str]:
-    """(move_in, move_out) from a range or separate labels."""
+    """(move_in, move_out) as stated, normalized but NOT validated.
+
+    "As stated" matters: the caller uses these to decide whether the email is a
+    real notification at all, and to derive the item id. A traveler who writes
+    "ASAP" or "Flexible" in the move-in field has still stated something, and
+    two leads that differ only there are still two leads. Use `_only_if_a_date`
+    on the way to storage, where a non-date is worse than nothing.
+    """
     rng = re.search(
         r"([A-Za-z]{3}[a-z]*\.?\s+\d{1,2},?\s*\d{4}|\d{1,2}/\d{1,2}/\d{2,4})"
         r"\s*(?:-|–|—|to|through|until)\s*"
@@ -201,7 +208,7 @@ def _dates(text: str) -> tuple[str, str]:
         return _norm_date(rng.group(1)), _norm_date(rng.group(2))
     move_in = _label(text, "Move in", "Move-in", "Check in", "Check-in", "Start date", "Arrival")
     move_out = _label(text, "Move out", "Move-out", "Check out", "Check-out", "End date", "Departure")
-    return _only_if_a_date(move_in), _only_if_a_date(move_out)
+    return _norm_date(move_in), _norm_date(move_out)
 
 
 def _only_if_a_date(value: str) -> str:
@@ -230,12 +237,20 @@ def parse(subject: str, body: str) -> dict | None:
 
     kind = _kind_from_subject(subject)
     name = _guest_name(subject, body)
-    move_in, move_out = _dates(body)
+    # `stated_*` is what the email said; `move_*` is what we're willing to store
+    # as a date. They differ for ordinary FurnishedFinder values like "ASAP" and
+    # "Flexible": those are not dates, but they are evidence that this is a real
+    # lead notification, and they still distinguish one lead from another. The
+    # gate and the id below therefore use the stated values — validating first
+    # would silently discard a lead whose guest typed "Flexible", and would
+    # collapse two such leads onto one id.
+    stated_in, stated_out = _dates(body)
+    move_in, move_out = _only_if_a_date(stated_in), _only_if_a_date(stated_out)
     property_name = _label(body, "Property", "Listing", "Your property")
 
     # Require enough to be a real notification: someone to talk to, plus at
     # least one concrete fact. Otherwise this is a newsletter or a digest.
-    if not name or not (move_in or property_name or kind == "message"):
+    if not name or not (stated_in or property_name or kind == "message"):
         log.info("Inbound email didn't look like a lead/message (subject=%r)", subject[:80])
         return None
 
@@ -312,7 +327,11 @@ def parse(subject: str, body: str) -> dict | None:
     # therefore hash over what actually distinguishes them: the received stamp
     # and the body. Both are read out of the email text (not the delivery clock),
     # so a re-forward of the same message still hashes identically and dedups.
-    parts = [name, move_in, move_out, property_name, kind]
+    # Hashed on the *stated* dates, not the validated ones, for two reasons:
+    # ids stay byte-identical to what this parser produced before validation
+    # existed (so no open deal is orphaned), and two leads from one guest that
+    # differ only in an unlabelled move-in stay two leads.
+    parts = [name, stated_in, stated_out, property_name, kind]
     if kind == "message":
         parts += [received, _body_fingerprint(body)]
     item["id"] = hashlib.sha1("||".join(parts).encode()).hexdigest()[:16]

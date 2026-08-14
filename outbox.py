@@ -240,6 +240,15 @@ def set_status(msg_id: int, status: str, *, error: str | None = None,
     if status == QUEUED:
         sets.append("approved_at=?")
         vals.append(_now())
+        # Releasing a message means send it, so pull a future send time forward.
+        # Every route into QUEUED is an explicit "go now" — a human approving, a
+        # human retrying a failure, or reclaiming one stranded mid-flight — and
+        # delivery now waits for scheduled_at. Leaving tomorrow morning's stamp
+        # in place would make the operator click Send, see success, and watch
+        # nothing happen for hours. GREATEST-style clamp, so a message that is
+        # already due keeps its position and can't jump the queue.
+        sets.append("scheduled_at=CASE WHEN scheduled_at>? THEN ? ELSE scheduled_at END")
+        vals += [_now(), _now()]
     if status == SENT:
         sets.append("sent_at=?")
         vals.append(_now())
@@ -255,7 +264,11 @@ def set_status(msg_id: int, status: str, *, error: str | None = None,
 
 
 def approve(msg_id: int, body: str | None = None) -> dict | None:
-    """Human approved (optionally after editing the text) — release it to send."""
+    """Human approved (optionally after editing the text) — release it to send.
+
+    `set_status` pulls a future `scheduled_at` forward, so approving a message
+    the agent had scheduled for tomorrow morning sends it now.
+    """
     set_status(msg_id, QUEUED, body=body)
     return get(msg_id)
 

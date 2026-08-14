@@ -472,6 +472,35 @@ def test_message_email_carries_no_dates_to_key_on(inbox):
     assert not item.get("move_in") and not item.get("move_out")
 
 
+def test_a_lead_whose_move_in_is_asap_is_still_a_lead(inbox):
+    """"ASAP" and "Flexible" are ordinary FurnishedFinder move-in values. They
+    are not dates, so they must not be stored as one — but they are still
+    evidence that this is a real lead, and validating before the "is this a
+    notification" gate silently discarded the whole lead at the webhook."""
+    for stated in ("ASAP", "Flexible", "Negotiable"):
+        body = (f"You have a new tenant lead.\n\nTraveler: Jordan K.\n"
+                f"Move in: {stated}\nTravelers: 1\n")
+        _tid, item = inbox.accept(
+            _payload(inbox, body=body, subject="New lead from Jordan K."),
+            "provider-secret")
+        assert item["traveler"] == "Jordan K."
+        assert not item.get("move_in"), "a non-date must not be stored as a date"
+
+
+def test_two_leads_differing_only_in_an_unlabelled_move_in_stay_distinct(inbox):
+    """Same collision class B1 fixed for messages: if the id hashed the
+    validated date, both would hash to an empty move-in and the second lead
+    would be dropped as already-seen."""
+    def lead(stated):
+        body = (f"You have a new tenant lead.\n\nProperty: Unit 1\n"
+                f"Traveler: Jordan K.\nMove in: {stated}\n")
+        return inbox.accept(_payload(inbox, body=body,
+                                     subject="New lead from Jordan K."),
+                            "provider-secret")[1]
+
+    assert lead("ASAP")["id"] != lead("Flexible")["id"]
+
+
 def test_guest_prose_is_never_mistaken_for_a_requested_date(inbox):
     """A traveler writing "can I move in a week earlier?" used to set
     move_in="a week earlier?" — the label matcher doesn't know it left the
@@ -698,6 +727,75 @@ def test_threading_survives_the_two_paths_disagreeing_about_the_property(tenant)
     assert found and found["item_id"] == "L9"
 
 
+def test_backfill_does_not_re_cancel_the_follow_up_on_every_page_load(tenant):
+    """A threaded message never gets a deal row of its own, so it is never in
+    `existing` and backfill's message branch re-runs on every dashboard load.
+    Re-stamping the reply unconditionally re-cleared next_action_at each time,
+    so any deal that had ever received a guest message could never hold a
+    scheduled follow-up again — the opposite of what threading is for."""
+    lead = {"id": "L1", "kind": "lead", "traveler": "Emma M.",
+            "property_name": "Unit 1", "received_at": _days_ago(2)}
+    reply = {"id": "M1", "kind": "message", "sender": "Emma M.",
+             "property_name": "Unit 1", "body": "Still interested!"}
+    storage.filter_new(tenant, SITE, "lead", [lead])
+    storage.filter_new(tenant, SITE, "message", [reply])
+    items = storage.all_items(tenant, SITE)
+
+    pipeline.backfill(tenant, SITE, items, {})
+    assert len(pipeline.all_deals(tenant, SITE)) == 1
+
+    # The operator answers, and the agent schedules the next nurture touch.
+    pipeline.update(tenant, SITE, "L1", next_action_at="2099-01-01T09:00:00",
+                    next_action_step="presale_followup_1")
+
+    pipeline.backfill(tenant, SITE, items, {})
+    deal = pipeline.get(tenant, SITE, "L1")
+    assert deal["next_action_at"] == "2099-01-01T09:00:00", \
+        "a page load must not erase the scheduled follow-up"
+    assert deal["next_action_step"] == "presale_followup_1"
+
+
+def test_a_message_about_another_unit_is_a_separate_conversation(tenant):
+    """thread_key's own definition says one guest asking about two units is two
+    conversations. Falling back to guest-only whenever the exact key missed
+    swallowed the second unit's enquiry into the first unit's deal, losing its
+    dates, value and unit entirely."""
+    lead = {"id": "A1", "kind": "lead", "traveler": "Emma M.",
+            "property_name": "Unit A", "received_at": _days_ago(2)}
+    storage.filter_new(tenant, SITE, "lead", [lead])
+    pipeline.ensure(tenant, SITE, lead, None)
+
+    other_unit = {"id": "B1", "kind": "message", "sender": "Emma M.",
+                  "property_name": "Unit B"}
+    assert pipeline.find_thread(tenant, SITE, pipeline.thread_key(other_unit),
+                                exclude_item_id="B1") is None
+
+    # ...but a reply that names the same unit still threads.
+    same_unit = {"id": "A2", "kind": "message", "sender": "Emma M.",
+                 "property_name": "Unit A"}
+    found = pipeline.find_thread(tenant, SITE, pipeline.thread_key(same_unit),
+                                 exclude_item_id="A2")
+    assert found and found["item_id"] == "A1"
+
+
+def test_a_thread_never_shows_another_units_messages(tenant):
+    """The operator would otherwise read a Unit B enquiry as part of the Unit A
+    conversation, and reply to the wrong one."""
+    items = {
+        "A1": {"id": "A1", "kind": "lead", "traveler": "Emma M.",
+               "property_name": "Unit A", "first_seen": "2026-08-01"},
+        "B1": {"id": "B1", "kind": "message", "sender": "Emma M.",
+               "property_name": "Unit B", "first_seen": "2026-08-02"},
+        "A2": {"id": "A2", "kind": "message", "sender": "Emma M.",
+               "property_name": "Unit A", "first_seen": "2026-08-03"},
+        # No property stated — belongs to whichever conversation is asking.
+        "U1": {"id": "U1", "kind": "message", "sender": "Emma M.",
+               "first_seen": "2026-08-04"},
+    }
+    key = pipeline.thread_key(items["A1"])
+    assert [i["id"] for i in pipeline.thread_items(key, items)] == ["A1", "A2", "U1"]
+
+
 def test_thread_key_treats_one_guest_as_one_person(tenant):
     """FurnishedFinder renders the same traveler three different ways."""
     keys = {pipeline.thread_key({"traveler": n, "property_name": "Unit 1"})
@@ -783,6 +881,29 @@ def test_a_guest_waiting_on_us_is_never_written_off_as_lost(tenant):
     assert pipeline.get(tenant, SITE, "waiting")["stage"] != pipeline.LOST
 
 
+def test_a_booking_with_only_a_checkout_date_still_closes(tenant):
+    """mark_booked takes check_in and check_out independently. Gating the close
+    on check_in left such a booking in `booked` forever, permanently inflating
+    booked_count and the arrivals list."""
+    _lead(tenant, "D1")
+    pipeline.mark_booked(tenant, SITE, "D1", check_out=_days_from_today(-2))
+    assert pipeline.get(tenant, SITE, "D1")["check_in"] is None
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "D1")["stage"] == pipeline.COMPLETED
+
+
+def test_a_stay_that_has_ended_closes_from_any_booked_stage(tenant):
+    for stage in (pipeline.BOOKED, pipeline.PRE_ARRIVAL, pipeline.STAYING):
+        item_id = f"D-{stage}"
+        _lead(tenant, item_id)
+        pipeline.update(tenant, SITE, item_id, stage=stage,
+                        check_in=_days_from_today(-30),
+                        check_out=_days_from_today(-1))
+    pipeline.advance_lifecycle(tenant, SITE)
+    for stage in (pipeline.BOOKED, pipeline.PRE_ARRIVAL, pipeline.STAYING):
+        assert pipeline.get(tenant, SITE, f"D-{stage}")["stage"] == pipeline.COMPLETED
+
+
 def test_a_fresh_deal_is_left_alone(tenant):
     _lead(tenant, "fresh")
     assert pipeline.advance_lifecycle(tenant, SITE) == {
@@ -838,6 +959,30 @@ def test_the_human_send_button_still_records_a_human(tenant):
     msg = automation.enqueue_send(tenant, SITE, "L1", "Hi there!")
     assert msg["status"] == outbox.QUEUED
     assert msg["reason"] == "Approved by you"
+
+
+def test_approving_a_future_scheduled_message_sends_it_now(tenant):
+    """A person pressing approve means "send this", not "send this at the hour
+    some sequence picked". With delivery gated on scheduled_at, leaving a future
+    stamp would hold the message back — the operator clicks, nothing happens,
+    and they click again."""
+    _lead(tenant, "L1")
+    msg = outbox.add(tenant, SITE, "L1", sequence="presale", step_id="intro",
+                     step_label="First reply", body="Morning!", auto=False,
+                     scheduled_at="2099-01-01T08:00:00")
+    outbox.approve(msg["id"])
+    assert outbox.next_queued(tenant) is not None, "approve must release it now"
+
+
+def test_approving_an_already_due_message_keeps_its_place_in_the_queue(tenant):
+    """Pulling the time forward must not let a just-approved message jump ahead
+    of one that has been waiting longer."""
+    _lead(tenant, "L1")
+    old = outbox.add(tenant, SITE, "L1", sequence="presale", step_id="intro",
+                     step_label="First reply", body="Older", auto=False,
+                     scheduled_at="2020-01-01T09:00:00")
+    outbox.approve(old["id"])
+    assert outbox.get(old["id"])["scheduled_at"] == "2020-01-01T09:00:00"
 
 
 def test_a_send_scheduled_for_the_morning_is_not_delivered_at_night(tenant):
