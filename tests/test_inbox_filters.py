@@ -101,6 +101,59 @@ def test_sql_and_python_state_agree(tenant, fields, response, failed):
     assert row["state"] == expected
 
 
+def test_sql_and_python_agree_with_every_filter_combined(tenant):
+    """The matrix above checks one deal at a time with no filters. This checks
+    the parameter binding, which is where this query can silently go wrong.
+
+    The state CASE appears in the SELECT list *and* again in the WHERE clause
+    when filtering by state, so its parameters bind twice, around the parameters
+    for kind/unit/search. Get that order wrong and the query still runs — it
+    just answers a different question than the one asked.
+    """
+    import itertools
+
+    stages = [pipeline.NEW, pipeline.CONTACTED, pipeline.NURTURING,
+              pipeline.BOOKED, pipeline.LOST]
+    statuses = [None, "draft", "sent", "skipped", "dismissed"]
+    n = 0
+    for stage, status, kind, unit in itertools.product(
+            stages, statuses, ("lead", "message"), ("unit-1", "unit-2")):
+        n += 1
+        item_id = f"i{n}"
+        fields = {"stage": stage, "unit_id": unit}
+        if n % 3 == 0:  # some guests have written back since our last message
+            fields["last_guest_reply_at"] = "2026-08-01T11:00:00"
+            fields["last_contact_at"] = "2026-08-01T10:00:00"
+        if n % 5 == 0:
+            fields["next_action_at"] = "2099-01-01T09:00:00"
+        response = {"status": status,
+                    "reason": "draft error: boom" if n % 7 == 0 else "ok"}
+        _deal(tenant, item_id, kind=kind, guest=f"Guest {n % 7}",
+              response=response if status else None, **fields)
+        # unit has to be set after ensure(), which derives it from the response
+        pipeline.update(tenant, SITE, item_id, unit_id=unit)
+
+    failed = tuple(f"i{i}" for i in range(1, n + 1) if i % 11 == 0)
+    checked = 0
+    for state, kind, unit, q in itertools.product(
+            [None, *pipeline.LEAD_STATES], [None, "lead", "message"],
+            [None, "unit-1"], [None, "guest 3"]):
+        page = pipeline.inbox_page(tenant, SITE, state=state, kind=kind,
+                                   unit=unit, q=q, per_page=100,
+                                   failed_item_ids=failed)
+        for row in page["rows"]:
+            checked += 1
+            deal = row["deal"]
+            assert row["state"] == pipeline.lead_state(
+                deal, row["response"],
+                has_failed_send=deal["item_id"] in failed)
+            # Every filter must actually hold on every returned row.
+            assert not state or row["state"] == state
+            assert not kind or deal["kind"] == kind
+            assert not unit or deal["unit_id"] == unit
+    assert checked > 500, "the sweep has to actually return rows to prove anything"
+
+
 # --- filtering ---------------------------------------------------------------
 
 
