@@ -215,6 +215,12 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
 
     Deliberately the same path a scrape uses — dedup, deal creation and drafting
     behave identically no matter how the lead arrived.
+
+    A *message* that belongs to a conversation we already have joins that deal
+    rather than opening a second one beside it. Without this a guest's reply
+    became a new deal: the owner saw the same person twice, the reply carried
+    none of the original's booking facts, and the nurture sequence on the
+    original kept chasing someone who had just written back.
     """
     import config
     import pipeline
@@ -225,7 +231,16 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
     if not new_items:
         return False
     try:
-        pipeline.ensure(tenant_id, site, item, None, units=config.get_units(tenant_id))
+        parent = None
+        if kind == "message":
+            parent = pipeline.find_thread(
+                tenant_id, site, pipeline.thread_key(item),
+                exclude_item_id=item.get("id"))
+        if parent:
+            pipeline.record_guest_reply(tenant_id, site, parent["item_id"])
+        else:
+            pipeline.ensure(tenant_id, site, item, None,
+                            units=config.get_units(tenant_id))
     except Exception:
         log.exception("Could not open a deal for ingested item %s", item.get("id"))
     return True

@@ -59,9 +59,20 @@ _COLS = (
     "inquiry_at", "first_reply_at", "last_contact_at",
     "sequence", "step_index", "next_action_at", "next_action_step",
     "auto_send", "created_at", "updated_at",
+    "thread_key", "last_guest_reply_at", "notes", "closed_reason",
 )
 
 _SELECT = f"SELECT {', '.join(_COLS)} FROM deals"
+
+# Columns added after the deals table shipped. Applied as idempotent ALTERs so an
+# existing install gains them without a migration step (same posture as
+# storage._migrate_tenant_id).
+_ADDED_COLS = (
+    ("thread_key", "TEXT"),
+    ("last_guest_reply_at", "TEXT"),
+    ("notes", "TEXT"),
+    ("closed_reason", "TEXT"),
+)
 
 
 def _conn() -> db.Conn:
@@ -89,12 +100,30 @@ def _conn() -> db.Conn:
             next_action_step TEXT,
             auto_send INTEGER NOT NULL DEFAULT 0,
             created_at TEXT,
-            updated_at TEXT
+            updated_at TEXT,
+            thread_key TEXT,
+            last_guest_reply_at TEXT,
+            notes TEXT,
+            closed_reason TEXT
         )"""
     )
+    have = db.table_columns(c, "deals")
+    for col, decl in _ADDED_COLS:
+        if col not in have:
+            c.execute(f"ALTER TABLE deals ADD COLUMN {col} {decl}")
     c.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS deals_tenant_item "
         "ON deals (tenant_id, site, item_id)"
+    )
+    # The inbox filters and sorts on these; without indexes every page load is a
+    # full scan of the tenant's deals.
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS deals_thread "
+        "ON deals (tenant_id, site, thread_key)"
+    )
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS deals_tenant_stage "
+        "ON deals (tenant_id, site, stage, inquiry_at)"
     )
     return c
 
@@ -206,6 +235,119 @@ def humanize_age(value: str | None) -> str:
     return f"{int(h / 24)}d"
 
 
+# --- Thread identity --------------------------------------------------------
+# Deals key on (tenant_id, site, item_id), and every inbound item has its own
+# id. Left alone that means a guest's reply opens a *second* deal beside the one
+# it is answering: the history splits, the owner sees the same person twice, and
+# the nurture sequence on the original keeps firing at someone who already
+# wrote back. `thread_key` is the stable "who is this conversation with" handle
+# that lets an inbound message find the deal it belongs to.
+_THREAD_STRIP = re.compile(r"[^a-z0-9]+")
+
+
+def thread_key(item: dict) -> str:
+    """Stable identity for the conversation an item belongs to.
+
+    Guest name plus property, both aggressively normalized: FurnishedFinder
+    renders the same traveler as "Emma M.", "Emma M", and "emma m." across its
+    lead email, message email and detail page, and a key that treats those as
+    three people would defeat the purpose. Property is included because the same
+    traveler enquiring about two different units is genuinely two conversations.
+
+    Returns "" when there is no name to key on — callers must treat an empty key
+    as "no thread", never as a key that matches other empty ones.
+    """
+    guest = (item.get("traveler") or item.get("sender") or item.get("guest_name") or "")
+    prop = (item.get("property_name") or item.get("unit_id") or "")
+    name = _THREAD_STRIP.sub("", guest.lower())
+    if not name:
+        return ""
+    return f"{name}|{_THREAD_STRIP.sub('', str(prop).lower())}"
+
+
+def find_thread(tenant_id: str, site: str, key: str,
+                exclude_item_id: str | None = None) -> dict | None:
+    """The open deal this conversation already has, if any.
+
+    Closed deals are excluded: a guest writing in months after a stay ended is
+    starting a new conversation, not continuing a finished one. Newest first, so
+    a repeat guest attaches to their current deal rather than an ancient one.
+
+    Falls back to the guest half of the key when the fully-qualified one misses.
+    The two ingest paths don't always agree on the property — a notification
+    email names it, a scraped row often doesn't — so requiring both halves to
+    match would leave a reply orphaned from the lead it answers, which is the
+    exact failure this is here to prevent. Guest-only is scoped to one tenant's
+    open deals, so the blast radius is two open conversations with the same
+    normalized name; attaching to the newest is the right guess there anyway.
+    """
+    if not key:
+        return None
+    exact = _find_thread_where(tenant_id, site, "thread_key=?", [key],
+                               exclude_item_id)
+    if exact or "|" not in key:
+        return exact
+    guest = key.split("|", 1)[0]
+    if not guest:
+        return None
+    return _find_thread_where(tenant_id, site, "thread_key LIKE ?",
+                              [guest + "|%"], exclude_item_id)
+
+
+def _find_thread_where(tenant_id: str, site: str, clause: str, params: list,
+                       exclude_item_id: str | None) -> dict | None:
+    args: list = [str(tenant_id), site] + params + [LOST, COMPLETED]
+    sql = (f"{_SELECT} WHERE tenant_id=? AND site=? AND {clause} "
+           "AND stage NOT IN (?, ?)")
+    if exclude_item_id:
+        sql += " AND item_id<>?"
+        args.append(str(exclude_item_id))
+    sql += " ORDER BY id DESC"
+    with _conn() as c:
+        row = c.execute(sql, args).fetchone()
+    return _row(row)
+
+
+def thread_items(key: str, items: dict[str, dict]) -> list[dict]:
+    """Every stored inbound item belonging to one conversation, oldest first.
+
+    Matches on the guest half of the key for the same reason `find_thread` falls
+    back to it: the lead and the replies to it can carry different property text.
+    """
+    if not key:
+        return []
+    guest = key.split("|", 1)[0]
+    if not guest:
+        return []
+    out = [it for it in items.values()
+           if thread_key(it).split("|", 1)[0] == guest]
+    out.sort(key=lambda it: str(it.get("first_seen") or ""))
+    return out
+
+
+def record_guest_reply(tenant_id: str, site: str, item_id: str,
+                       at: str | None = None) -> dict | None:
+    """A guest wrote back. Stamp it and stand the follow-up machine down.
+
+    `last_contact_at` only ever recorded *our* sends, so nothing in the system
+    could tell "silent for four days" from "answered us an hour ago" — nurture
+    steps kept firing at people who had already replied. Cancelling the pending
+    step is the point: the guest's message supersedes whatever we had queued,
+    and the deal moves to the owner's "needs you" queue instead.
+    """
+    deal = get(tenant_id, site, item_id)
+    if not deal:
+        return None
+    fields: dict = {"last_guest_reply_at": at or _now(),
+                    "next_action_at": None, "next_action_step": None}
+    # Nurturing means "chasing silence" — a reply ends that, but we don't touch
+    # a booked/pre-arrival deal's stage, where follow-ups are logistics not chase.
+    if deal.get("stage") in (NEW, CONTACTED, NURTURING):
+        fields["stage"] = CONTACTED
+    update(tenant_id, site, item_id, **fields)
+    return get(tenant_id, site, item_id)
+
+
 # --- Deriving a deal from a scraped item ------------------------------------
 def _estimate_value(item: dict, units: list[dict] | None, unit_id: str | None) -> int:
     """Rough monthly value, used only to size the pipeline for the owner.
@@ -239,6 +381,7 @@ def derive(item: dict, response: dict | None, units: list[dict] | None = None) -
         "kind": kind,
         "guest_name": guest,
         "unit_id": unit_id,
+        "thread_key": thread_key(item),
         "check_in": parse_date(item.get("move_in")),
         "check_out": parse_date(item.get("move_out")),
         "nights": item.get("nights") if isinstance(item.get("nights"), int) else None,
@@ -267,14 +410,19 @@ def ensure(tenant_id: str, site: str, item: dict, response: dict | None = None,
         inquiry = existing.get("inquiry_at")
         if inquiry_date(item) or (inquiry and str(inquiry) > now):
             inquiry = fields["inquiry_at"]
+        # An existing deal keeps the thread it was filed under unless it never
+        # had one (a row created before thread_key existed) — re-keying a live
+        # conversation would strand the messages already attached to it.
+        key = existing.get("thread_key") or fields["thread_key"]
         with _conn() as c:
             c.execute(
                 """UPDATE deals SET guest_name=?, unit_id=?, check_in=?, check_out=?,
-                       nights=?, monthly_value=?, inquiry_at=?, updated_at=?
+                       nights=?, monthly_value=?, inquiry_at=?, thread_key=?,
+                       updated_at=?
                    WHERE tenant_id=? AND site=? AND item_id=?""",
                 (fields["guest_name"], fields["unit_id"], fields["check_in"],
                  fields["check_out"], fields["nights"], fields["monthly_value"],
-                 inquiry, now, tenant_id, site, item_id),
+                 inquiry, key, now, tenant_id, site, item_id),
             )
         return get(tenant_id, site, item_id)
 
@@ -282,12 +430,12 @@ def ensure(tenant_id: str, site: str, item: dict, response: dict | None = None,
         c.execute(
             """INSERT INTO deals (tenant_id, site, item_id, kind, stage, guest_name,
                    unit_id, check_in, check_out, nights, monthly_value, inquiry_at,
-                   sequence, step_index, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   sequence, step_index, thread_key, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (tenant_id, site, item_id, fields["kind"], NEW, fields["guest_name"],
              fields["unit_id"], fields["check_in"], fields["check_out"],
              fields["nights"], fields["monthly_value"], fields["inquiry_at"],
-             "presale", 0, now, now),
+             "presale", 0, fields["thread_key"], now, now),
         )
     return get(tenant_id, site, item_id)
 
@@ -373,6 +521,7 @@ def update(tenant_id: str, site: str, item_id: str, **fields) -> None:
         "stage", "guest_name", "unit_id", "check_in", "check_out", "nights",
         "monthly_value", "first_reply_at", "last_contact_at", "sequence",
         "step_index", "next_action_at", "next_action_step", "auto_send",
+        "thread_key", "last_guest_reply_at", "notes", "closed_reason",
     }
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:
@@ -424,6 +573,78 @@ def mark_booked(tenant_id: str, site: str, item_id: str,
 def mark_lost(tenant_id: str, site: str, item_id: str) -> None:
     update(tenant_id, site, item_id, stage=LOST,
            next_action_at=None, next_action_step=None)
+
+
+# --- The one state the operator actually thinks in --------------------------
+# "Open / closed / responded" was previously smeared across three tables that
+# could disagree: deals.stage, responses.status and outbox.status. Anything that
+# wanted to answer "what still needs me?" had to re-derive it, and the UI and the
+# automation each did so slightly differently. `lead_state` is the single answer,
+# consumed by both, so they cannot drift apart.
+NEEDS_YOU = "needs_you"            # a draft to approve, a failed send, or unlooked-at
+GUEST_REPLIED = "guest_replied"    # they wrote back after our last message
+AWAITING_GUEST = "awaiting_guest"  # we replied; the ball is with them
+SCHEDULED = "scheduled"            # an automated step is queued
+CLOSED = "closed"                  # booked, completed, lost or dismissed
+
+LEAD_STATES = (NEEDS_YOU, GUEST_REPLIED, AWAITING_GUEST, SCHEDULED, CLOSED)
+
+LEAD_STATE_LABELS = {
+    NEEDS_YOU: "Needs you",
+    GUEST_REPLIED: "Guest replied",
+    AWAITING_GUEST: "Awaiting guest",
+    SCHEDULED: "Scheduled",
+    CLOSED: "Closed",
+}
+
+CLOSED_STAGES = (BOOKED, PRE_ARRIVAL, STAYING, COMPLETED, LOST)
+
+
+def lead_state(deal: dict, response: dict | None = None,
+               has_failed_send: bool = False) -> str:
+    """Which of the five states this deal is in, most-urgent interpretation first.
+
+    `guest_replied` deliberately outranks `needs_you`: both want the owner, but a
+    person who is waiting on an answer right now outranks a draft that has been
+    sitting patiently. `scheduled` outranks `awaiting_guest` because "we will
+    chase them on Thursday" is more informative than "they're quiet".
+    """
+    resp = response or {}
+    status = resp.get("status")
+
+    if deal.get("stage") in CLOSED_STAGES or status == "dismissed":
+        return CLOSED
+    if _guest_is_waiting(deal):
+        return GUEST_REPLIED
+    if has_failed_send or is_draft_failure(resp):
+        return NEEDS_YOU
+    if status == "draft" or status is None:
+        return NEEDS_YOU
+    if status == "skipped":
+        # The agent decided not to pursue it and said why — handled, not work.
+        return CLOSED
+    if deal.get("next_action_at"):
+        return SCHEDULED
+    return AWAITING_GUEST
+
+
+def _guest_is_waiting(deal: dict) -> bool:
+    """True when the guest's last message came after our last one."""
+    replied = str(deal.get("last_guest_reply_at") or "")
+    if not replied:
+        return False
+    return replied > str(deal.get("last_contact_at") or "")
+
+
+def state_counts(rows: list[dict]) -> dict[str, int]:
+    """Per-state totals for the inbox tab bar. `rows` carry a `state` key."""
+    counts = {s: 0 for s in LEAD_STATES}
+    for r in rows:
+        state = r.get("state")
+        if state in counts:
+            counts[state] += 1
+    counts["all"] = len(rows)
+    return counts
 
 
 # --- Views the dashboard is built from --------------------------------------

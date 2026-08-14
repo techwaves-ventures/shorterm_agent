@@ -486,6 +486,17 @@ def test_guest_prose_is_never_mistaken_for_a_requested_date(inbox):
     assert lead["move_in"] == "8/16/26"
 
 
+def test_template_prose_does_not_hijack_the_name_label(inbox):
+    """The message template opens "You have a new message from your traveler."
+    That sentence matched the *Traveler* label ahead of the real field, so the
+    guest's name parsed as "." — no name to thread on, and "." written onto the
+    deal as who the owner is talking to. A label must win from the start of its
+    own line before it wins from the middle of a sentence."""
+    _tid, item = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                              "provider-secret")
+    assert item["sender"] == "Emma M."
+
+
 def test_second_message_from_one_guest_is_not_swallowed_as_a_duplicate(inbox, tenant):
     """Regression: every message from a guest used to hash to the same id.
 
@@ -554,6 +565,150 @@ def test_lead_ids_are_unchanged_by_the_message_fix(inbox):
         "||".join(["Emma M.", "8/16/26", "7/16/27",
                    "Quiet Spacious Home in NW DC - Unit 1", "lead"]).encode()
     ).hexdigest()[:16]
+
+
+# --- threading: a reply joins the conversation it answers --------------------
+
+
+def _ingest_lead(inbox, tenant):
+    _tid, item = inbox.accept(_payload(inbox), "provider-secret")
+    inbox.store(tenant, item, SITE)
+    return item
+
+
+def _ingest_message(inbox, tenant, text, received="July 21, 2026"):
+    _tid, item = inbox.accept(_message_payload(inbox, text, received=received),
+                              "provider-secret")
+    inbox.store(tenant, item, SITE)
+    return item
+
+
+def test_a_guest_reply_joins_the_deal_instead_of_opening_a_second_one(inbox, tenant):
+    """Deals key on item_id and every message has its own, so a reply used to
+    become a brand-new deal: the owner saw Emma twice, and the second row
+    carried none of the dates or value from the inquiry it was answering."""
+    lead = _ingest_lead(inbox, tenant)
+    _ingest_message(inbox, tenant, "Is parking included?")
+
+    deals = pipeline.all_deals(tenant, SITE)
+    assert len(deals) == 1, "one guest, one conversation"
+    assert deals[0]["item_id"] == lead["id"]
+    assert deals[0]["check_in"] == "2026-08-16", "the booking facts survive"
+
+
+def test_the_reply_is_stamped_so_the_system_knows_they_answered(inbox, tenant):
+    """`last_contact_at` only ever recorded our own sends, so nothing could tell
+    'silent for four days' from 'answered us an hour ago'."""
+    lead = _ingest_lead(inbox, tenant)
+    assert pipeline.get(tenant, SITE, lead["id"])["last_guest_reply_at"] is None
+    _ingest_message(inbox, tenant, "Is parking included?")
+    assert pipeline.get(tenant, SITE, lead["id"])["last_guest_reply_at"]
+
+
+def test_a_reply_stands_the_follow_up_machine_down(inbox, tenant):
+    """The nurture cadence chases silence. A guest who has written back is not
+    silent, and must not be chased."""
+    lead = _ingest_lead(inbox, tenant)
+    pipeline.update(tenant, SITE, lead["id"], stage=pipeline.NURTURING,
+                    next_action_at="2099-01-01T09:00:00",
+                    next_action_step="presale_followup_1")
+
+    _ingest_message(inbox, tenant, "Sorry for the slow reply — still interested!")
+
+    deal = pipeline.get(tenant, SITE, lead["id"])
+    assert deal["next_action_at"] is None, "queued chase must be cancelled"
+    assert deal["next_action_step"] is None
+    assert deal["stage"] == pipeline.CONTACTED, "no longer chasing silence"
+
+
+def test_a_different_guest_still_gets_their_own_deal(inbox, tenant):
+    """Threading must not merge strangers."""
+    _ingest_lead(inbox, tenant)
+    body = FF_MESSAGE_EMAIL.format(received="July 21, 2026",
+                                   text="Hi, is the unit still free?")
+    body = body.replace("Traveler: Emma M.", "Traveler: Priya S.")
+    _tid, other = inbox.accept(
+        _payload(inbox, body=body, subject="New message from Priya S."),
+        "provider-secret")
+    inbox.store(tenant, other, SITE)
+
+    names = {d["guest_name"] for d in pipeline.all_deals(tenant, SITE)}
+    assert names == {"Emma M.", "Priya S."}
+
+
+def test_a_finished_stay_does_not_swallow_a_new_enquiry(inbox, tenant):
+    """A guest writing in months after checkout is starting a conversation, not
+    continuing a closed one."""
+    lead = _ingest_lead(inbox, tenant)
+    pipeline.update(tenant, SITE, lead["id"], stage=pipeline.COMPLETED)
+    _ingest_message(inbox, tenant, "Hi again — do you have anything for spring?")
+    assert len(pipeline.all_deals(tenant, SITE)) == 2
+
+
+def test_threading_survives_the_two_paths_disagreeing_about_the_property(tenant):
+    """A notification email names the property; a scraped row often doesn't.
+    Requiring both halves of the key to match would orphan the reply."""
+    lead = {"id": "L9", "kind": "lead", "traveler": "Emma M.",
+            "title": "Emma M.", "received_at": "July 19, 2026"}
+    storage.filter_new(tenant, SITE, "lead", [lead])
+    pipeline.ensure(tenant, SITE, lead, None)
+
+    reply = {"id": "M9", "kind": "message", "sender": "Emma M.",
+             "property_name": "Quiet Spacious Home in NW DC - Unit 1"}
+    found = pipeline.find_thread(tenant, SITE, pipeline.thread_key(reply),
+                                 exclude_item_id="M9")
+    assert found and found["item_id"] == "L9"
+
+
+def test_thread_key_treats_one_guest_as_one_person(tenant):
+    """FurnishedFinder renders the same traveler three different ways."""
+    keys = {pipeline.thread_key({"traveler": n, "property_name": "Unit 1"})
+            for n in ("Emma M.", "Emma M", "emma  m.")}
+    assert len(keys) == 1
+    assert pipeline.thread_key({"traveler": "", "property_name": "Unit 1"}) == "", \
+        "no name means no thread — never a key that matches other blanks"
+
+
+# --- the one derived state ---------------------------------------------------
+
+
+def test_lead_state_answers_open_closed_responded_from_one_place(tenant):
+    unlooked = {"stage": pipeline.NEW}
+    assert pipeline.lead_state(unlooked, None) == pipeline.NEEDS_YOU
+    assert pipeline.lead_state(unlooked, {"status": "draft"}) == pipeline.NEEDS_YOU
+    assert pipeline.lead_state(
+        {"stage": pipeline.CONTACTED}, {"status": "sent"}) == pipeline.AWAITING_GUEST
+    assert pipeline.lead_state(
+        {"stage": pipeline.NURTURING, "next_action_at": "2099-01-01T09:00:00"},
+        {"status": "sent"}) == pipeline.SCHEDULED
+    assert pipeline.lead_state(
+        {"stage": pipeline.BOOKED}, {"status": "sent"}) == pipeline.CLOSED
+    assert pipeline.lead_state(
+        {"stage": pipeline.CONTACTED}, {"status": "dismissed"}) == pipeline.CLOSED
+    # A clean agent skip is a handled decision, not work sitting in the queue.
+    assert pipeline.lead_state(
+        {"stage": pipeline.NEW}, {"status": "skipped",
+                                  "reason": "Budget below the unit price."}) == pipeline.CLOSED
+    # A drafting *failure* is not a decision — it still needs a human.
+    assert pipeline.lead_state(
+        {"stage": pipeline.NEW},
+        {"status": "skipped", "reason": "draft error: API key missing"}) == pipeline.NEEDS_YOU
+    assert pipeline.lead_state(
+        {"stage": pipeline.CONTACTED}, {"status": "sent"},
+        has_failed_send=True) == pipeline.NEEDS_YOU
+
+
+def test_a_waiting_guest_outranks_a_patient_draft(tenant):
+    """Both want the owner. The person actually waiting on an answer wins."""
+    replied = {"stage": pipeline.CONTACTED,
+               "last_contact_at": "2026-08-01T10:00:00",
+               "last_guest_reply_at": "2026-08-01T11:00:00",
+               "next_action_at": "2099-01-01T09:00:00"}
+    assert pipeline.lead_state(replied, {"status": "draft"}) == pipeline.GUEST_REPLIED
+    # Our reply going out after theirs hands the ball back to them.
+    answered = {**replied, "last_contact_at": "2026-08-01T12:00:00",
+                "next_action_at": None}
+    assert pipeline.lead_state(answered, {"status": "sent"}) == pipeline.AWAITING_GUEST
 
 
 def test_email_mode_is_never_scheduled_for_a_scrape(tenant):

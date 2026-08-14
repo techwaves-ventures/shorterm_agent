@@ -67,19 +67,42 @@ def _label(text: str, *labels: str) -> str:
     """Value for a 'Label: value' or 'Label\\nvalue' pair, whichever appears.
 
     Tolerant of the whitespace mangling that HTML-to-text conversion produces.
+
+    A label is looked for at the start of a line first, and only then anywhere in
+    the text. Order matters because these words also occur in the template's own
+    prose and in the guest's message: "You have a new message from your
+    traveler." matched the *Traveler* label and yielded "." as the guest's name,
+    which then became the deal's guest_name and left the conversation with no
+    identity to thread on. The loose pass is kept because HTML-to-text
+    conversion does sometimes run a label into the previous cell, so requiring
+    the anchor outright would lose real fields.
     """
-    for label in labels:
-        pattern = re.compile(
-            rf"{re.escape(label)}\s*:?\s*\n?\s*(.+)", re.I
-        )
-        for line in pattern.finditer(text):
-            value = line.group(1).strip()
-            # A label sitting alone on its line means the value is the next one.
-            if value and not value.lower().startswith(tuple(l.lower() for l in labels)):
+    for anchored in (True, False):
+        for label in labels:
+            for match in _label_re(label, anchored).finditer(text):
+                value = match.group(1).strip()
+                # A label sitting alone on its line means the value is the next one.
+                if not value or value.lower().startswith(
+                        tuple(l.lower() for l in labels)):
+                    continue
                 # Trim layout punctuation but keep a trailing period — it's the
                 # surname initial in FurnishedFinder's "Emma M." format.
-                return value.split("\n")[0].strip().strip("·|-").strip()
+                value = value.split("\n")[0].strip().strip("·|-").strip()
+                # Bare punctuation is the tail of a sentence, not a value.
+                if value and re.search(r"[A-Za-z0-9]", value):
+                    return value
     return ""
+
+
+def _label_re(label: str, anchored: bool) -> re.Pattern:
+    """Matcher for one label, optionally required to start its own line.
+
+    The anchor tolerates the quote markers and bullet padding that forwarding
+    and HTML-to-text conversion prepend to a line.
+    """
+    prefix = r"^[ \t>*|·-]*" if anchored else ""
+    flags = re.I | (re.M if anchored else 0)
+    return re.compile(rf"{prefix}{re.escape(label)}\s*:?\s*\n?\s*(.+)", flags)
 
 
 def _body_fingerprint(body: str) -> str:
