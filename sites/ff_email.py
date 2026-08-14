@@ -105,6 +105,54 @@ def _label_re(label: str, anchored: bool) -> re.Pattern:
     return re.compile(rf"{prefix}{re.escape(label)}\s*:?\s*\n?\s*(.+)", flags)
 
 
+# Lines that belong to FurnishedFinder's wrapper rather than to the guest.
+_TEMPLATE_LABELS = (
+    "property", "listing", "your property", "traveler", "tenant", "guest",
+    "from", "name", "date received", "received", "sent", "move in", "move-in",
+    "move out", "move-out", "check in", "check-in", "check out", "check-out",
+    "travelers", "occupants", "guests", "number of guests", "budget",
+    "max budget", "price range", "traveling with pets", "pets", "nights",
+    "reason for travel", "occupation", "work location", "start date",
+    "end date", "arrival", "departure", "requested travel dates", "subject",
+)
+_BOILERPLATE = re.compile(
+    r"^(you have a new|reply to this|view this|log ?in to|click here|"
+    r"this message was sent|do not reply|unsubscribe|sent from)",
+    re.I,
+)
+
+
+def _guest_text(body: str) -> str:
+    """Just what the guest actually wrote, without the notification wrapper.
+
+    The whole email used to be stored as the message body, so the thread view
+    would show the guest saying "You have a new message from your traveler.
+    Property: ... Traveler: ..." before getting to their actual sentence. That
+    is the wrapper talking, not them.
+
+    Conservative on purpose: it drops lines that are a known template field or
+    recognisable boilerplate and keeps everything else, so an unfamiliar layout
+    degrades to showing too much rather than swallowing the message. If nothing
+    survives, the caller still has the untrimmed text.
+    """
+    kept = []
+    for line in (body or "").split("\n"):
+        stripped = line.strip().strip("·|").strip()
+        if not stripped:
+            kept.append("")
+            continue
+        if _BOILERPLATE.match(stripped):
+            continue
+        label = stripped.split(":", 1)[0].strip().lower() if ":" in stripped else ""
+        if label and label in _TEMPLATE_LABELS:
+            continue
+        if stripped.lower() in _TEMPLATE_LABELS:
+            continue
+        kept.append(stripped)
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    return text or (body or "").strip()
+
+
 def _body_fingerprint(body: str) -> str:
     """Whitespace-insensitive digest of a message body, for id derivation.
 
@@ -248,7 +296,10 @@ def parse(subject: str, body: str) -> dict | None:
         item["phone"] = phone.group(0).strip()
 
     if kind == "message":
-        item["body"] = body[:4000]
+        item["body"] = _guest_text(body)[:4000]
+        # Keep the untrimmed notification too — if the trim ever eats something
+        # it shouldn't, the original is still there to fall back on.
+        item["raw"] = body[:4000]
 
     # Stable id from the facts that identify this inquiry, so the same
     # notification arriving twice (a re-forward) dedups against itself.

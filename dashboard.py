@@ -647,6 +647,22 @@ def inbox():
     )
 
 
+def _entry_text(item: dict) -> str:
+    """What to show in a thread bubble for one inbound item.
+
+    Deliberately does not fall back to `raw`: that is the entire notification
+    email, so a lead's bubble would render "You have a new tenant lead.
+    Property: ... Traveler: ..." as though the guest had typed it. The facts in
+    that wrapper are already on the header of this page. A message has the
+    guest's own text in `body`; a lead's substance is its detail line.
+    """
+    for key in ("body", "detail", "title"):
+        value = (item.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 @app.route("/thread/<item_id>")
 @login_required
 def thread(item_id):
@@ -672,7 +688,7 @@ def thread(item_id):
         "who": "guest",
         "name": deal.get("guest_name") or "Guest",
         "at": it.get("first_seen") or "",
-        "body": it.get("body") or it.get("raw") or it.get("title") or "",
+        "body": _entry_text(it),
         "kind": it.get("kind") or "lead",
     } for it in inbound_items]
 

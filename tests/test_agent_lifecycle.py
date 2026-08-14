@@ -498,6 +498,43 @@ def test_template_prose_does_not_hijack_the_name_label(inbox):
     assert item["sender"] == "Emma M."
 
 
+def test_the_thread_shows_what_the_guest_wrote_not_the_wrapper(inbox):
+    """The whole notification email was stored as the message body, so the
+    thread view had the guest apparently saying "You have a new message from
+    your traveler. Property: ... Traveler: ..." before reaching their sentence.
+    That is FurnishedFinder talking, not them."""
+    _tid, item = inbox.accept(
+        _message_payload(inbox, "Is parking included?\nAlso, is it furnished?"),
+        "provider-secret")
+    assert item["body"] == "Is parking included?\nAlso, is it furnished?"
+    # The untrimmed notification is still kept, so nothing is unrecoverable.
+    assert "Property:" in item["raw"]
+
+
+def test_an_unfamiliar_layout_shows_too_much_rather_than_nothing(inbox):
+    """Failing open matters here: swallowing the message is worse than showing
+    a line of chrome alongside it."""
+    weird = _payload(
+        inbox,
+        body="Traveler: Emma M.\nHELLO THIS IS THE WHOLE MESSAGE",
+        subject="New message from Emma M.")
+    _tid, item = inbox.accept(weird, "provider-secret")
+    assert "HELLO THIS IS THE WHOLE MESSAGE" in item["body"]
+
+
+def test_trimming_the_body_does_not_change_the_message_id(inbox, tenant):
+    """The id fingerprints the raw notification. If it fingerprinted the trimmed
+    text instead, tightening the trimmer later would re-open every message in
+    the mailbox as new and re-notify the owner about old conversations."""
+    _tid, first = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                               "provider-secret")
+    assert inbox.store(tenant, first, SITE) is True
+    _tid, again = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                               "provider-secret")
+    assert again["id"] == first["id"]
+    assert inbox.store(tenant, again, SITE) is False
+
+
 def test_second_message_from_one_guest_is_not_swallowed_as_a_duplicate(inbox, tenant):
     """Regression: every message from a guest used to hash to the same id.
 
