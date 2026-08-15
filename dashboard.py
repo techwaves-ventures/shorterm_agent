@@ -453,9 +453,18 @@ def inbound_rejected_retry(rid):
     # silently absorbed while the operator was told it had been recovered.
     #
     # `received_at` is our own write time rather than the mail date, so it is
-    # only the fallback for rows captured before `mail_date` was stored. It is
-    # not equivalent — but two such rows still get two different stamps, and
-    # separating them wrongly beats collapsing them silently.
+    # only the fallback for rows captured before `mail_date` was stored, and it
+    # is a weak one: it is written to second precision, so two rows captured in
+    # the same second — an ordinary bulk forward — still collapse onto one id.
+    # There is no way to recover a mail Date that was never kept, so the residual
+    # case is logged rather than left silent. It is bounded to rows predating the
+    # column, and this table ships in the same change, so no deployed row has it.
+    if not row.get("mail_date"):
+        app.logger.warning(
+            "Retrying rejected inbound row %s captured before mail_date existed; "
+            "its message id falls back to our write time and may collide with "
+            "another row captured in the same second", rid,
+        )
     item = ff_email.parse(row["subject"] or "", row["body"] or "",
                           received_at=row.get("mail_date") or row["received_at"])
     if not item:
