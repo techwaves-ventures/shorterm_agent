@@ -430,7 +430,7 @@ def _session_ok(page: Page) -> bool:
     return True
 
 
-_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+\.[\w.-]+")
 _MONTHS = {
     m: i
     for i, m in enumerate(
