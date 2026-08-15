@@ -23,8 +23,17 @@ the message than the provider sent.
 
 Bounds, because these rows hold guest PII and arrive from outside: body
 truncated to `MAX_STORED_BODY`, at most `MAX_ROWS_PER_TENANT` rows per
-tenant+site (newest kept), and identical replays collapse onto one row with a
-bumped `seen_count` rather than a new row.
+tenant+site, and identical replays collapse onto one row with a bumped
+`seen_count` rather than a new row.
+
+At the cap the survivors are chosen by usefulness, not recency — see `_KEEP_IDS`
+for what that ordering can and cannot separate. Known bound: FurnishedFinder's
+own digests and reminders come *from the allowed sender* and so land in the same
+`unparsed` bucket as a lead we failed to read. A tenant who reaches 200 open
+`unparsed` rows can therefore have a genuine enquiry evicted by that mail. The
+eviction is logged (a pruned unreviewed row always warns), so it is bounded and
+visible rather than silent, but separating the two would need bulk-mail headers
+this table does not keep.
 """
 import hashlib
 import logging

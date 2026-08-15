@@ -487,18 +487,54 @@ def test_a_retry_whose_store_fails_hands_the_row_back(client, monkeypatch):
         "source": "email", "raw": body, "traveler": "Emma", "property_name": "Boom",
     })
 
+    import pipeline as pipeline_mod
+
     def explode(*a, **kw):
         raise RuntimeError("database is locked")
 
+    # Both routes to the board are down. Patching `store` alone is not enough to
+    # prove this: recovery falls back to opening the deal directly, so the lead
+    # would reach the board and `recovered` would be the honest answer.
     monkeypatch.setattr(inbound, "store", explode)
+    monkeypatch.setattr(pipeline_mod, "ensure", explode)
 
     resp = client.post(f"/inbound/rejected/{rid}/retry")
     assert resp.status_code == 302
 
+    assert len(pipeline.all_deals(tid, SITE)) == 0, "precondition: nothing reached the board"
     row = inbound_rejects.get(tid, SITE, rid)
     assert row["status"] == "open", "a failed store must not leave the row marked recovered"
     assert row["resolved_item_id"] in (None, ""), "must not claim a deal that was never opened"
     assert inbound_rejects.count_open(tid, SITE) == 1, "the lead must stay visible"
+
+
+def test_a_store_failure_alone_still_gets_the_guest_onto_the_board(client, monkeypatch):
+    """`store` is a convenience, not the only way onto the board.
+
+    It does dedup and deal-opening together, so a failure in its first half used
+    to cost the lead entirely. Recovery opens the deal directly when it is
+    missing, so the guest still arrives — losing the dedup bookkeeping, which
+    `pipeline.ensure` is idempotent against, rather than losing the enquiry.
+    """
+    tid = _tenant_with_login(client)
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+        "kind": "lead", "id": "half-1", "title": "Half | Emma", "url": "u",
+        "source": "email", "raw": body, "traveler": "Emma", "property_name": "Half",
+    })
+    monkeypatch.setattr(inbound, "store", lambda *a, **kw: (_ for _ in ()).throw(
+        RuntimeError("database is locked")
+    ))
+
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    assert len(pipeline.all_deals(tid, SITE)) == 1, "the guest must still reach the board"
+    assert inbound_rejects.get(tid, SITE, rid)["status"] == "recovered"
+    assert inbound_rejects.count_open(tid, SITE) == 0
 
 
 def test_a_retry_whose_deal_never_opens_hands_the_row_back(client, monkeypatch):
@@ -533,6 +569,107 @@ def test_a_retry_whose_deal_never_opens_hands_the_row_back(client, monkeypatch):
     row = inbound_rejects.get(tid, SITE, rid)
     assert row["status"] == "open", "row marked recovered with nothing on the board"
     assert inbound_rejects.count_open(tid, SITE) == 1, "the lead must stay visible"
+
+
+def test_a_retry_after_a_failed_one_still_recovers_the_lead(client, monkeypatch):
+    """Handing the row back is only half a fix if the next retry can't work.
+
+    `inbound.store` commits its dedup row *before* opening the deal and swallows
+    the failure, so after one bad attempt the lead is marked seen with nothing on
+    the board. Every later retry then short-circuits at that dedup and never
+    reaches `pipeline.ensure` again: the row reopens forever and the guest can
+    never be recovered from this page at all — permanent loss of exactly the lead
+    this table promises to give back.
+    """
+    import pipeline as pipeline_mod
+
+    tid = _tenant_with_login(client)
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+        "kind": "lead", "id": "stuck-1", "title": "Stuck | Emma", "url": "u",
+        "source": "email", "raw": body, "traveler": "Emma", "property_name": "Stuck",
+    })
+
+    # An outage that spans the whole first retry — `worker.py` writes the same
+    # SQLite file, so a "database is locked" out of pipeline.ensure is the
+    # realistic version. It must outlast the request, or the retry self-heals
+    # and this never reaches the case being tested.
+    down = {"yes": True}
+    calls = {"n": 0}
+    real_ensure = pipeline_mod.ensure
+
+    def flaky(*a, **kw):
+        calls["n"] += 1
+        if down["yes"]:
+            raise RuntimeError("database is locked")
+        return real_ensure(*a, **kw)
+
+    monkeypatch.setattr(pipeline_mod, "ensure", flaky)
+
+    client.post(f"/inbound/rejected/{rid}/retry")
+    assert inbound_rejects.get(tid, SITE, rid)["status"] == "open", (
+        "precondition: the first attempt failed and handed the row back"
+    )
+
+    # The operator presses Try again. The outage is over.
+    down["yes"] = False
+    before = calls["n"]
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    assert calls["n"] > before, "the second retry never even attempted to open the deal"
+    assert len(pipeline.all_deals(tid, SITE)) == 1, "the guest must reach the board"
+    row = inbound_rejects.get(tid, SITE, rid)
+    assert row["status"] == "recovered", "a recovered lead must leave the list"
+    assert inbound_rejects.count_open(tid, SITE) == 0
+
+
+def test_a_lead_recovered_on_a_later_retry_is_still_drafted(client, monkeypatch):
+    """The draft gate must track the board, not `store`'s "was it new" answer.
+
+    That answer is False on any retry after a half-completed store, which would
+    leave a recovered guest sitting on the board with no reply written — a late
+    lead needs the draft more, not less.
+    """
+    import pipeline as pipeline_mod
+    import runner
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    tid = _tenant_with_login(client)
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+        "kind": "lead", "id": "draft-1", "title": "Draft | Emma", "url": "u",
+        "source": "email", "raw": body, "traveler": "Emma", "property_name": "Draft",
+    })
+
+    down = {"yes": True}
+    real_ensure = pipeline_mod.ensure
+
+    def flaky(*a, **kw):
+        if down["yes"]:
+            raise RuntimeError("database is locked")
+        return real_ensure(*a, **kw)
+
+    monkeypatch.setattr(pipeline_mod, "ensure", flaky)
+
+    drafted = []
+    monkeypatch.setattr(
+        runner, "draft_ingested", lambda t, s, it: drafted.append(it.get("id"))
+    )
+
+    client.post(f"/inbound/rejected/{rid}/retry")   # fails, row handed back
+    assert drafted == [], "precondition: nothing to draft while the deal never opened"
+    down["yes"] = False
+    client.post(f"/inbound/rejected/{rid}/retry")   # succeeds
+
+    assert drafted == ["draft-1"], "a lead recovered on a later retry was never drafted"
 
 
 def test_retrying_a_lead_already_on_the_board_does_not_duplicate_it(client, monkeypatch):

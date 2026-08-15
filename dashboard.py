@@ -447,17 +447,34 @@ def inbound_rejected_retry(rid):
         flash("That message was already handled.")
         return redirect(url_for("inbound_rejected"))
 
+    # Whether the guest is already on the board decides two things below, and it
+    # has to be read *before* storing to mean anything.
+    was_on_board = bool(pipeline.get(tenant_id, SITE, item.get("id", "")))
+
     try:
-        is_new = inbound.store(tenant_id, item, SITE)
+        inbound.store(tenant_id, item, SITE)
     except Exception:
         app.logger.exception("Could not store recovered inbound item")
-        is_new = False
 
-    # Confirm the deal exists rather than trusting the call returned. `store`
-    # logs and swallows a `pipeline.ensure` failure and still reports success,
-    # so "it didn't raise" is not evidence the guest reached the board. Hand the
-    # row back if they didn't — a message marked recovered with nothing to show
-    # for it is the silent loss this page exists to end.
+    # `store` is deliberately the scrape's own path, but it commits its dedup row
+    # before opening the deal and swallows a `pipeline.ensure` failure while
+    # still reporting success. That leaves the lead marked seen with nothing on
+    # the board, and every later retry then short-circuits at the dedup and never
+    # reaches `ensure` again — the row reopens forever and the guest can never be
+    # recovered from this page at all. So open the deal directly when it is
+    # missing, rather than trusting either the return value or the dedup.
+    if not pipeline.get(tenant_id, SITE, item.get("id", "")):
+        try:
+            pipeline.ensure(
+                tenant_id, SITE, item, None, units=config.get_units(tenant_id)
+            )
+        except Exception:
+            app.logger.exception("Could not open a deal for recovered inbound item")
+
+    # Confirm the guest really reached the board rather than trusting that any of
+    # the above returned. Hand the row back if they didn't — a message marked
+    # recovered with nothing to show for it is the silent loss this page exists
+    # to end.
     if not pipeline.get(tenant_id, SITE, item.get("id", "")):
         inbound_rejects.reopen(
             tenant_id, SITE, rid, "parsed, but the lead could not be opened"
@@ -468,7 +485,11 @@ def inbound_rejected_retry(rid):
     # Same follow-through the webhook gives a lead that parsed first time. A
     # recovered lead is a *late* lead, so it needs the draft more, not less —
     # and an email-only tenant has no scheduled pass that would pick it up.
-    if is_new and os.getenv("ANTHROPIC_API_KEY"):
+    # Gated on the deal being new to *the board*: `store`'s "was it new" answer
+    # is False on any retry after a half-completed store, which would leave a
+    # recovered guest sitting there undrafted. Note this is the full ingest
+    # follow-through, so with the scheduler on it can send, not just draft.
+    if not was_on_board and os.getenv("ANTHROPIC_API_KEY"):
         try:
             runner.draft_ingested(tenant_id, SITE, item)
         except Exception:
