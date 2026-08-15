@@ -60,9 +60,18 @@ APPROVABLE = (PENDING, FAILED)
 # success for a message the guest receives anyway. An operator cannot stop an
 # in-flight browser send; the honest answer is "too late". This strands
 # nothing: a row wedged by a crashed process is returned to `queued` (or failed
-# at the attempt cap) by `reclaim_stuck_sending`, which runs on both delivery
-# topologies — dashboard view in-process, and worker.py for the worker queue —
-# and both of those states are cancelable again.
+# at the attempt cap) by `reclaim_stuck_sending`, which every dashboard render
+# now calls unconditionally — it is pure DB work, and gating it on "can this
+# process drive a browser" left the worker-queue topology unable to recover the
+# rows its own ungated `start_drainer` had claimed. Both of those states are
+# cancelable again.
+#
+# Accepted cost: for the first `reclaim_stuck_sending` interval (900s from
+# `sending_at`) a crashed send is uncancelable, where before it was cancelable
+# immediately. That window is the price of not lying about delivery — inside it
+# we genuinely cannot tell a wedged send from a slow one, and the conservative
+# read is the one that does not tell the guest's message it was called off
+# while it is still going out.
 CANCELABLE = (PENDING, QUEUED, FAILED, CANCELED)
 
 # Human-readable status for the card line under a deal.

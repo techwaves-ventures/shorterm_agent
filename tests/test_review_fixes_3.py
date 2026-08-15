@@ -329,6 +329,40 @@ def test_a_wedged_send_is_still_recoverable_and_then_cancelable(tenant):
     assert outbox.get(msg["id"])["status"] == outbox.CANCELED
 
 
+def test_a_host_that_cannot_deliver_still_reclaims_its_own_stranded_sends(
+        tenant, monkeypatch):
+    """The test above proves the mechanism but calls `reclaim_stuck_sending`
+    directly with an age no production caller uses, so it passed even while the
+    real call site was unreachable. This one goes through `_board`.
+
+    `start_drainer` on the approve route is *not* gated on
+    `_can_deliver_in_process()`, so a worker-queue host claims rows into
+    `sending` regardless. Gating the reclaim on it meant that host never
+    recovered its own stranded rows, and with `sending` no longer cancelable
+    the operator had no route left at all: `has_open_step` counts the row as
+    open, so the agent never re-drafts that step for that guest either.
+    """
+    import dashboard
+
+    monkeypatch.setattr(dashboard, "_can_deliver_in_process", lambda: False)
+    msg = _queued(tenant)
+    outbox.set_status(msg["id"], outbox.SENDING)
+    # Stamp the claim old enough for the (unchanged, conservative) age gate.
+    with outbox._conn() as c:
+        c.execute("UPDATE outbox SET sending_at=? WHERE id=?",
+                  ("2020-01-01T00:00:00", msg["id"]))
+
+    with dashboard.app.test_request_context():
+        dashboard._board(tenant)
+
+    assert outbox.get(msg["id"])["status"] == outbox.QUEUED, (
+        "a host that cannot deliver must still reclaim what it stranded")
+    outbox.cancel(msg["id"])
+    assert outbox.get(msg["id"])["status"] == outbox.CANCELED
+    assert not outbox.has_open_step(tenant, SITE, "s1", "intro"), (
+        "and the step must be free for the agent to draft again")
+
+
 # --- send_reply: a collision must not be recorded as a delivery -------------
 
 def test_a_cancelled_message_is_not_resurrected_by_the_busy_release(tenant):
@@ -336,11 +370,14 @@ def test_a_cancelled_message_is_not_resurrected_by_the_busy_release(tenant):
     landed while a drainer held the claim was silently undone and the message
     the human called off went to the guest anyway.
 
-    Now that `sending` is not cancelable, the cancel can no longer land *during*
-    the claim — but the guard is still load-bearing on the sequence below, which
-    is reachable whenever a wedged row is reclaimed while its original drainer
-    is still alive: reclaim returns it to `queued`, the operator cancels it, and
-    the old drainer's busy path then releases a claim it no longer owns.
+    Now that `sending` is not cancelable, that original race is closed at the
+    source. The guard is kept as an invariant rather than a race fix: a claim
+    may only be handed back by the holder that still owns it. Measured, the
+    window it used to cover is ~6-10ms (`automation.py` between the claim and
+    the busy release) against a 900s reclaim gate, so no *timing* argument
+    keeps it — the reason to keep it is that `release_unattempted` writing to a
+    row in any other state is simply wrong, and it costs one SQL predicate.
+    The assertion below still discriminates: drop `AND status=?` and it fails.
     """
     msg = _queued(tenant)
     outbox.set_status(msg["id"], outbox.SENDING)

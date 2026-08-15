@@ -248,10 +248,19 @@ def _board(tenant_id: str) -> dict:
     send_states = outbox.latest_by_item(tenant_id, SITE)
     # Self-heal on view: requeue sends stranded by a crashed process, and make
     # sure something is draining if messages are waiting (e.g. after a restart).
-    if _can_deliver_in_process():
-        outbox.reclaim_stuck_sending()
-        if outbox.queued_tenants():
-            automation.start_drainer(SITE)
+    #
+    # The reclaim is deliberately *not* gated on `_can_deliver_in_process()`.
+    # It is pure DB work — it drives no browser — and the topology that cannot
+    # deliver in-process is exactly the one that most needs it: `start_drainer`
+    # on the approve route is ungated, so this process claims rows into
+    # `sending` whether or not it can finish them, and worker.py is then the
+    # only other reclaimer. With no worker running, gating this stranded the
+    # row forever: `sending` is not cancelable (see `outbox.CANCELABLE`), and
+    # `has_open_step` counts it as open, so the agent never re-drafts that step
+    # for that guest again.
+    outbox.reclaim_stuck_sending()
+    if _can_deliver_in_process() and outbox.queued_tenants():
+        automation.start_drainer(SITE)
 
     def card(deal: dict) -> dict:
         item = items.get(deal["item_id"], {})
