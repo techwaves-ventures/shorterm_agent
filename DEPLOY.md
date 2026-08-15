@@ -309,9 +309,18 @@ the stamp and read it. The hazard is specifically `worker.py` reading rows the
 web host wrote (or the reverse) while the two are on different code.
 
 ```bash
-# On a non-UTC fleet, in this order:
+# On a non-UTC fleet, in this order. Draining comes FIRST and stopping the
+# drainer SECOND: the off-host drainer is the thing that empties the queue, so
+# stopping it first leaves step 2 waiting on a queue that can no longer drain.
 
-# 1. Stop the off-host drainer so nothing reads new-frame rows with old code.
+# 1. Let the queue empty on the OLD code, with the drainer still running, then
+#    confirm it reached zero:
+#    (psql, or: sqlite3 "$SQLITE_PATH")
+#      SELECT count(*) FROM outbox WHERE status IN ('queued','sending');
+#    Anything still queued is a legacy-frame row — see the next section.
+
+# 2. Now stop the off-host drainer, so nothing reads new-frame rows with old
+#    code during the cutover.
 #    However you run it — a Procfile `worker` dyno, a Render/Fly worker, or a
 #    bare `python worker.py` on a VM. Note that NONE of the units in deploy/
 #    runs worker.py: that directory is the single-VM topology, which has no
@@ -319,15 +328,15 @@ web host wrote (or the reverse) while the two are on different code.
 #      Render/Heroku-style:  scale the `worker` process to 0
 #      VM:                   stop/kill the `python worker.py` process
 
-# 2. Let the queue empty on the OLD code before you cut over, then confirm:
-#    (psql, or: sqlite3 "$SQLITE_PATH")
-#      SELECT count(*) FROM outbox WHERE status IN ('queued','sending');
-#    Anything still queued is a legacy-frame row — see the next section.
-
 # 3. Deploy the new code to BOTH the web host and the worker host.
 
 # 4. Start the worker again (scale back to 1, or restart `python worker.py`).
 ```
+
+Between steps 1 and 3 the web host can still accept approvals, and those rows
+are written in whichever frame the web host is currently running. That window is
+the reason step 3 is a single cutover of both hosts rather than a rolling one —
+draining bounds the *backlog*, not the approvals that arrive while you deploy.
 
 ### Pre-existing rows are not rewritten (deliberate)
 
