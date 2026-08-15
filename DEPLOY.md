@@ -162,6 +162,18 @@ UI says so (jobs stay *queued*), so nothing looks connected that isn't.
 > stamped once at enqueue and never re-stamped, so jobs queued by an old web host
 > keep a naive `created_at` for their whole life.
 >
+> **Rolling back has the same hazard, in the same direction.** Once a new worker
+> has written an offset-aware `last_seen`, rolling the *web* host back to the
+> previous revision re-opens exactly the `TypeError` above — the row is already
+> aware and the old reader cannot subtract it. **Roll the worker back first, then
+> the web host** (the reverse of the deploy order). Rolling back only the worker
+> is always safe. This is the part reached for under pressure, so it is worth
+> knowing before the incident rather than during it.
+>
+> On the single-image topologies (`Dockerfile`, `docker-compose.yml`) the web and
+> worker roles turn over together, so there is no mixed window and no ordering to
+> enforce in either direction.
+>
 > There is no migration to run: both shapes are readable, and a legacy naive value
 > is read as local wall clock, which is what wrote it.
 
