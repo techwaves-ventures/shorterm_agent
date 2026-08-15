@@ -80,16 +80,14 @@
              parsed but couldn't reach the board, the code still says "unparsed"
              while the row's reason says what actually went wrong. Rendering the
              code told the operator we couldn't read an email we had just read
-             fine. Falls back for rows written before the reason was copy. #}
-          <div class="rej__reason">
-            {% if r.reason %}
-              {{ r.reason }}
-            {% elif r.reason_code == 'sender_not_allowed' %}
-              Sent from an address we don't recognise as FurnishedFinder.
-            {% else %}
-              Couldn't find a guest name and a property or date in this email.
-            {% endif %}
-          </div>
+             fine.
+
+             `reason` is always populated — `record` falls back to copy keyed on
+             the code — so there is no "no reason" branch to write. An earlier
+             revision had one keyed on `reason_code`; it was unreachable, and it
+             read as a safety net for rows written before the copy existed, which
+             it could not actually catch. #}
+          <div class="rej__reason">{{ r.reason }}</div>
           <pre class="rej__excerpt">{{ r.body or '(empty message)' }}</pre>
         </div>
         <div class="rej__actions">

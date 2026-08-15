@@ -158,6 +158,25 @@ def filter_new(tenant_id: str, site: str, kind: str, items: Iterable[dict]) -> l
     return new
 
 
+def already_seen(tenant_id: str, site: str, kind: str, item_id: str) -> bool:
+    """Whether this item has been ingested before — without recording it.
+
+    `filter_new` answers the same question but *records as it asks*, which makes
+    it useless to a caller that needs to know beforehand whether to act: asking
+    is indistinguishable from consuming. Recovery needs to tell "this message was
+    already applied" from "this message is new", and must not mark the second one
+    seen until the board write has actually happened.
+    """
+    if not item_id:
+        return False
+    with _conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM seen WHERE tenant_id=? AND site=? AND kind=? AND item_id=?",
+            (tenant_id, site, kind, str(item_id)),
+        ).fetchone()
+    return row is not None
+
+
 def get_recent(tenant_id: str, site: str, kind: str, limit: int = 20) -> list[dict]:
     """Return the most recently seen items of a kind, newest first.
 

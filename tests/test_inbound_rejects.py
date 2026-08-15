@@ -1037,3 +1037,104 @@ def test_two_sends_of_the_same_words_recover_onto_two_deals(client, monkeypatch)
     assert deals[0].get("last_guest_reply_at"), (
         "the re-send must be recorded on the thread, not absorbed by the first"
     )
+
+
+def test_retrying_an_already_ingested_reply_does_not_reply_to_the_guest_twice(client, monkeypatch):
+    """A stale row whose message the webhook already ingested must be a no-op.
+
+    Re-applying it is not harmless. `record_guest_reply` cancels the deal's
+    queued follow-up and the drafting path then runs again — so one click on a
+    row that is merely out of date cancels a scheduled nurture step and queues a
+    *second* reply to a guest who only ever wrote once.
+
+    Reachable without anything exotic: a `sender_not_allowed` row is captured,
+    the operator fixes the allowlist, the guest's message is re-forwarded and
+    ingested normally, and the original row is still sitting on the list.
+    """
+    tid = _tenant_with_login(client)
+    _post(client, tid, body=GOOD_LEAD, subject="New lead from Emma M.")
+    parent = pipeline.all_deals(tid, SITE)[0]
+
+    # The row the operator will click, captured while the parser still failed.
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    reply = {
+        "kind": "message", "id": "reply-already-in", "title": "Emma M.",
+        "traveler": "Emma M.",
+        "property_name": parent.get("property_name") or "Quiet Spacious Home in NW DC - Unit 1",
+        "url": "u", "source": "email", "raw": "Any update?",
+    }
+    monkeypatch.setattr(ff_email, "parse",
+                        lambda subject, body, received_at=None: dict(reply))
+
+    # The same message arrives properly and is ingested by the webhook.
+    _post(client, tid, body="a second forward that now parses")
+    assert not inbound.store(tid, dict(reply), SITE), (
+        "precondition: the webhook really did ingest this message already"
+    )
+
+    # A nurture step is queued on the conversation.
+    pipeline.update(tid, SITE, parent["item_id"],
+                    next_action_at="2026-09-01T09:00:00", next_action_step=2)
+    before = pipeline.get(tid, SITE, parent["item_id"])
+    assert before["next_action_at"], "precondition: a follow-up is queued"
+
+    import runner as runner_mod
+
+    drafted = []
+    monkeypatch.setattr(runner_mod, "draft_ingested",
+                        lambda t, s, it: drafted.append(it.get("id")))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    after = pipeline.get(tid, SITE, parent["item_id"])
+    assert after["next_action_at"] == before["next_action_at"], (
+        "retrying an already-ingested reply must not cancel the queued follow-up"
+    )
+    assert after["last_guest_reply_at"] == before["last_guest_reply_at"], (
+        "the guest did not write again, so nothing may re-stamp the thread"
+    )
+    assert drafted == [], "must not queue a second reply to a guest who wrote once"
+    assert inbound_rejects.get(tid, SITE, rid)["status"] == "recovered", (
+        "the message really is on the board, so the row is genuinely resolved"
+    )
+
+
+def test_replies_recovered_in_the_same_second_all_land(client, monkeypatch):
+    """Recovery must not depend on the wall clock ticking between two clicks.
+
+    `pipeline._now()` is second-resolution, so anything that decides "did this
+    land?" by comparing a stamp before and after the write reports failure for
+    every recovery that shares a second with the previous one — handing back a
+    row whose message reached the board perfectly well, and skipping its draft.
+    """
+    tid = _tenant_with_login(client)
+
+    from sites import ff_email
+
+    real_parse = ff_email.parse
+    subject = "New message from Emma Rodriguez"
+    words = ("Traveler: Emma Rodriguez\n"
+             "Property: Quiet Spacious Home in NW DC - Unit 1\n\n"
+             "Any update?\n")
+
+    monkeypatch.setattr(ff_email, "parse", lambda *a, **kw: None)
+    for n, day in enumerate(("3", "11", "19"), start=1):
+        _post(client, tid, subject=subject,
+              body=words + ("\n> quoted history %s\n" % ("x" * n)),
+              date=f"Mon, {day} Aug 2026 09:00:00 +0000")
+    rows = inbound_rejects.open_for_tenant(tid, SITE)
+    assert len(rows) == 3, "precondition: three distinct rows"
+
+    # Back to back, deliberately with no sleep — they share a wall-clock second.
+    monkeypatch.setattr(ff_email, "parse", real_parse)
+    for r in rows:
+        client.post(f"/inbound/rejected/{r['id']}/retry")
+
+    out = [inbound_rejects.get(tid, SITE, r["id"]) for r in rows]
+    stuck = [(o["id"], o["reason"]) for o in out if o["status"] != "recovered"]
+    assert not stuck, f"every message reached the board, so none may be handed back: {stuck}"

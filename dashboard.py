@@ -481,39 +481,27 @@ def inbound_rejected_retry(rid):
         flash("That message was already handled.")
         return redirect(url_for("inbound_rejected"))
 
-    # Read the board *before* storing. For a reply the conversation it answers is
-    # already there, so only a before/after comparison can tell "landed" apart
-    # from "did nothing at all" — see `inbound.board_mark`.
-    before = inbound.board_mark(tenant_id, item, SITE)
-
+    # `inbound.recover`, not `store`: it writes the board first and reports what
+    # it actually did, where `store` records its dedup row first and swallows a
+    # board failure while still returning success. Both of this path's earlier
+    # defects came out of that ordering — a failed recovery told the operator the
+    # lead was safe, and poisoned the dedup so no later retry could ever reach the
+    # board again.
+    #
+    # `already_had_it` matters as much as `on_board`. Re-applying a message that
+    # was ingested earlier is not a harmless no-op: it cancels the deal's queued
+    # follow-up and re-opens drafting, so a second click on a stale row would
+    # queue a second reply to a guest who only wrote once.
     try:
-        inbound.store(tenant_id, item, SITE)
+        already_had_it, on_board = inbound.recover(tenant_id, item, SITE)
     except Exception:
         app.logger.exception("Could not store recovered inbound item")
+        already_had_it, on_board = False, False
 
-    # `store` is deliberately the scrape's own path, but it commits its dedup row
-    # before opening the deal and swallows the failure while still reporting
-    # success. That leaves the lead marked seen with nothing on the board, and
-    # every later retry then short-circuits at the dedup and never tries to open
-    # the deal again — the row reopens forever and the guest can never be
-    # recovered from this page at all. So go to the board directly when they
-    # aren't there, rather than trusting the return value or the dedup.
-    #
-    # Via `inbound.open_deal`, not `pipeline.ensure`: half of what that does is
-    # threading a reply onto the conversation it answers, and reimplementing only
-    # the other half opened a second deal beside it.
-    if not inbound.landed(before, inbound.board_mark(tenant_id, item, SITE)):
-        try:
-            inbound.open_deal(tenant_id, item, SITE)
-        except Exception:
-            app.logger.exception("Could not open a deal for recovered inbound item")
-
-    # Confirm the guest really reached the board rather than trusting that any of
-    # the above returned. Hand the row back if they didn't — a message marked
+    # Hand the row back when the guest didn't reach the board — a message marked
     # recovered with nothing to show for it is the silent loss this page exists
     # to end.
-    after = inbound.board_mark(tenant_id, item, SITE)
-    if not inbound.landed(before, after):
+    if not on_board:
         inbound_rejects.reopen(
             tenant_id, SITE, rid,
             "Read this email, but couldn't open the lead — try again.",
@@ -525,15 +513,16 @@ def inbound_rejected_retry(rid):
     # recovered lead is a *late* lead, so it needs the draft more, not less —
     # and an email-only tenant has no scheduled pass that would pick it up.
     #
-    # Gated on this attempt having actually advanced the board, which is the
+    # Gated on this attempt having been the one that ingested it, which is the
     # recovery-path equivalent of the webhook's `is_new`: it drafts a threaded
     # reply (an existing conversation, so nothing "new" is on screen, but the
     # guest is waiting on an answer) and stays quiet when the retry found the
-    # item already fully ingested. A presence test got this backwards and left
-    # every recovered reply undrafted while the identical webhook reply was
-    # drafted. Note this is the full ingest follow-through, so with the
-    # scheduler on it can send, not just draft.
-    if inbound.advanced(before, after) and os.getenv("ANTHROPIC_API_KEY"):
+    # item already ingested. A presence test got this backwards and left every
+    # recovered reply undrafted while the identical webhook reply was drafted.
+    # Note this is the full ingest follow-through, so with the scheduler on it
+    # can send, not just draft — which is why the already-ingested case must not
+    # fall through to here.
+    if not already_had_it and os.getenv("ANTHROPIC_API_KEY"):
         try:
             runner.draft_ingested(tenant_id, SITE, item)
         except Exception:

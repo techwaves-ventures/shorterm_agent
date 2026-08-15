@@ -327,7 +327,7 @@ def _thread_parent(tenant_id: str, item: dict, site: str):
         exclude_item_id=item.get("id"))
 
 
-def open_deal(tenant_id: str, item: dict, site: str = "furnishedfinder") -> None:
+def open_deal(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
     """Put an already-deduped item on the board, threading a reply if it is one.
 
     Split out of `store` so recovery can reach the board without going through
@@ -335,16 +335,25 @@ def open_deal(tenant_id: str, item: dict, site: str = "furnishedfinder") -> None
     `pipeline.ensure`: half of what this does is the *threading*, and a reply
     that skips it opens a second deal beside the conversation it answers — the
     duplicate this branching exists to prevent.
+
+    Returns whether the board actually took the item. Reporting it is the point:
+    a threaded reply leaves no deal of its own, so a caller that tries to infer
+    this by looking at the board afterwards cannot tell a reply that landed from
+    one that never did, and telling the operator the wrong one of those is the
+    whole defect this path exists to avoid.
     """
     import config
     import pipeline
 
     parent = _thread_parent(tenant_id, item, site)
     if parent:
-        pipeline.record_guest_reply(tenant_id, site, parent["item_id"])
-    else:
-        pipeline.ensure(tenant_id, site, item, None,
-                        units=config.get_units(tenant_id))
+        return bool(pipeline.record_guest_reply(tenant_id, site, parent["item_id"]))
+    pipeline.ensure(tenant_id, site, item, None,
+                    units=config.get_units(tenant_id))
+    # Read it back rather than trusting that `ensure` returned: it is the one
+    # case where presence is proof, because a deal under this item's own id can
+    # only have been opened for this item.
+    return bool(pipeline.get(tenant_id, site, item.get("id", "")))
 
 
 def board_mark(tenant_id: str, item: dict, site: str = "furnishedfinder"):
@@ -372,22 +381,40 @@ def board_mark(tenant_id: str, item: dict, site: str = "furnishedfinder"):
     return None
 
 
-def advanced(before, after) -> bool:
-    """Whether this attempt put something new on the board.
+def recover(tenant_id: str, item: dict, site: str = "furnishedfinder") -> tuple[bool, bool]:
+    """Put a recovered item on the board. Returns `(already_had_it, on_board)`.
 
-    The webhook decides whether to draft on `store`'s "was it new" answer; this
-    is the recovery path's equivalent. It has to be a *change* rather than a
-    state: a reply threading onto an existing conversation adds no deal, so any
-    state-based reading of it cannot be told apart from having done nothing.
+    Deliberately not `store()`. That records the dedup row *before* the board
+    write and swallows the failure while still reporting success, which cost this
+    feature two separate defects: a failed recovery both told the operator the
+    lead was safe and poisoned every later retry, because the next attempt
+    short-circuited at the dedup and never reached the board again.
+
+    Here the order is inverted — the board write happens first and records itself,
+    and the item is marked seen only once it has actually landed. A failed attempt
+    therefore leaves nothing behind and can simply be retried.
+
+    `already_had_it` separates "this message was ingested earlier" from "this
+    attempt ingested it". Re-applying the first is not harmless: `record_guest_reply`
+    cancels the deal's queued follow-up and re-opens the drafting path, so a second
+    click would cancel a scheduled nurture step and queue a *second* reply to a
+    guest who only ever wrote once.
     """
-    return after is not None and after != before
+    import storage
 
+    kind = item.get("kind", "lead")
+    if storage.already_seen(tenant_id, site, kind, item.get("id", "")):
+        # Already ingested, so do not write again — only confirm it is really
+        # there. For a lead that is definitive; for a reply the best available
+        # answer is that the conversation it belongs to is on the board.
+        return (True, bool(board_mark(tenant_id, item, site)))
 
-def landed(before, after) -> bool:
-    """Whether the item is on the board *and* we can prove how it got there.
+    try:
+        on_board = open_deal(tenant_id, item, site)
+    except Exception:
+        log.exception("Could not open a deal for recovered item %s", item.get("id"))
+        return (False, False)
 
-    Either this attempt moved something (`advanced`), or a deal keyed on the
-    item's own id exists — the one case where bare presence is proof, because
-    that deal can only have been opened for this item.
-    """
-    return advanced(before, after) or bool(after and after[0] == "deal")
+    if on_board:
+        storage.filter_new(tenant_id, site, kind, [item])
+    return (False, on_board)
