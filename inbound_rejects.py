@@ -130,6 +130,9 @@ def record(tenant_id: str, site: str, reason_code: str, reason: str,
     """
     import inbound  # local: inbound imports nothing from here, keep it that way
 
+    # The column is TEXT and every reader scopes on it, so coerce once here
+    # rather than leave a tenant addressable as both 7 and "7".
+    tenant_id = str(tenant_id)
     subject = inbound.extract_subject(payload)[:_MAX_SUBJECT]
     sender = inbound.extract_sender(payload)[:_MAX_SENDER]
     body = inbound.extract_body(payload)[:MAX_STORED_BODY]
@@ -167,6 +170,7 @@ def record(tenant_id: str, site: str, reason_code: str, reason: str,
 
 def open_for_tenant(tenant_id: str, site: str) -> list[dict]:
     """Unresolved rejections, newest first — what the review page lists."""
+    tenant_id = str(tenant_id)
     with _conn() as c:
         rows = c.execute(
             f"{_SELECT} WHERE tenant_id=? AND site=? AND status=? ORDER BY id DESC",
@@ -177,6 +181,7 @@ def open_for_tenant(tenant_id: str, site: str) -> list[dict]:
 
 def count_open(tenant_id: str, site: str) -> int:
     """How many leads are currently sitting unread. Drives the dashboard banner."""
+    tenant_id = str(tenant_id)
     with _conn() as c:
         row = c.execute(
             "SELECT COUNT(*) FROM inbound_rejects WHERE tenant_id=? AND site=? AND status=?",
@@ -187,6 +192,7 @@ def count_open(tenant_id: str, site: str) -> int:
 
 def count_all(tenant_id: str, site: str) -> int:
     """Every retained row, resolved or not — the denominator on the settings line."""
+    tenant_id = str(tenant_id)
     with _conn() as c:
         row = c.execute(
             "SELECT COUNT(*) FROM inbound_rejects WHERE tenant_id=? AND site=?",
