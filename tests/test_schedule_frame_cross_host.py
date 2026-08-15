@@ -13,7 +13,9 @@ points, so the file runs unchanged on the pre-fix head — where it fails.
 import os
 import time as time_mod
 from contextlib import contextmanager
-from datetime import datetime, time as time_cls, timedelta
+from datetime import datetime, time as time_cls, timedelta, timezone as tz_utc_mod
+
+tz_utc = tz_utc_mod.utc
 
 import pytest
 
@@ -251,16 +253,28 @@ def test_sequence_step_schedule_agrees_across_reader_hosts(db_tenant, no_quiet_h
     deal actually takes after each contact.
     """
     pipeline.ensure(db_tenant, SITE, {"id": "L1", "title": "lead"}, {}, [])
-    # followup_1 fires 48h after last contact; put that 1h in the past.
-    anchor = datetime.now() - timedelta(hours=49)
-    pipeline.update(db_tenant, SITE, "L1", sequence="presale", step_index=1,
-                    last_contact_at=anchor.isoformat(timespec="seconds"))
 
     with host_tz(writer_tz) as offset:
         assert offset is not None
+        # The contact happened on this host, so its stamp is this host's wall
+        # clock — the coherent case, and the one production actually produces.
+        anchor = datetime.now().replace(microsecond=0) - timedelta(hours=49)
+        pipeline.update(db_tenant, SITE, "L1", sequence="presale", step_index=1,
+                        last_contact_at=anchor.isoformat(timespec="seconds"))
         automation.reschedule(db_tenant, SITE, "L1")
+        # Oracle built from stdlib alone, not from the module under test:
+        # followup_1 fires 48h after contact, and `astimezone()` resolves that
+        # wall clock against the writer's real zone.
+        expected = ((anchor + timedelta(hours=48))
+                    .astimezone(tz_utc).replace(tzinfo=None))
+
     scheduled = pipeline.get(db_tenant, SITE, "L1")["next_action_at"]
     assert scheduled, "reschedule must have produced a due time"
+    # Consistency alone is not enough here: once every reader shares one clock
+    # they agree happily on a wrong instant, so pin the instant itself.
+    assert datetime.fromisoformat(scheduled) == expected, (
+        f"writer={writer_tz} stored {scheduled} for a step due at {expected} "
+        f"absolute — the schedule was written in the wrong frame")
 
     verdicts = {}
     for reader_tz in ZONES:
