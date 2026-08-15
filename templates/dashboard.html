@@ -304,7 +304,10 @@
                 <textarea class="draft-text" id="ta-{{ c.id }}">{{ r.draft }}</textarea>
               </details>
               <div class="actions">
-                <button class="mini primary" id="send-{{ c.id }}" onclick="sendReply('{{ c.id }}')">Approve &amp; send</button>
+                {# Rendered disabled by the server, not by JS: the poll needs a
+                   round-trip, and until it lands the button is live over a send
+                   that is already going out. A failed fetch never lands. #}
+                <button class="mini primary" id="send-{{ c.id }}" onclick="sendReply('{{ c.id }}')"{% if c.send and c.send.in_flight %} disabled{% endif %}>{% if c.send and c.send.in_flight %}{{ c.send.label }}{% else %}Approve &amp; send{% endif %}</button>
                 <button class="mini" id="draft-{{ c.id }}" onclick="draftItem('{{ c.id }}')">Re-draft</button>
                 <button class="mini" onclick="markBooked('{{ c.id }}')">Mark booked</button>
                 <button class="mini danger" onclick="markLost('{{ c.id }}')">Lost</button>
@@ -317,7 +320,7 @@
                 <button class="mini danger" onclick="markLost('{{ c.id }}')">Lost</button>
               </div>
               {% endif %}
-              <div class="msg" id="msg-{{ c.id }}"></div>
+              <div class="msg" id="msg-{{ c.id }}">{% if c.send and c.send.in_flight %}{{ c.send.label }}{% endif %}</div>
             </div>
           </article>
         {% else %}
@@ -352,7 +355,11 @@
               </details>
               <div class="preview">{{ msg.body }}</div>
               <div class="actions">
-                <button class="mini primary" onclick="approveMsg({{ msg.id }})">Approve &amp; send</button>
+                {# This card's *own* row is awaiting approval, but a sibling row
+                   for the same guest can be in flight; approving then releases
+                   a second message mid-delivery. The id is what lets the poll
+                   reach this button at all — it had none. #}
+                <button class="mini primary" id="approve-ob-{{ msg.id }}" data-item="{{ c.id }}" onclick="approveMsg({{ msg.id }})"{% if c.send and c.send.in_flight %} disabled{% endif %}>{% if c.send and c.send.in_flight %}{{ c.send.label }}{% else %}Approve &amp; send{% endif %}</button>
                 <button class="mini danger" onclick="cancelMsg({{ msg.id }})">Don't send</button>
               </div>
               <div class="msg" id="msg-ob-{{ msg.id }}"></div>
@@ -517,6 +524,22 @@
 
       function renderSendState(id, s) {
         const btn = document.getElementById("send-" + id);
+        // Approve buttons for *other* rows of this same guest. They follow the
+        // in-flight flag only — whether they may be pressed once nothing is in
+        // flight depends on their own row, which `s` does not describe.
+        const siblings = Array.from(document.querySelectorAll('[data-item="' + CSS.escape(id) + '"]'));
+        // `in_flight` is tested before `status` on purpose. The effective status
+        // can be `failed` or `canceled` — a newer row — while an older row for
+        // this guest is still going out, and both of those branches re-enable
+        // the button, i.e. offer a second send over a live one.
+        if (s.in_flight) {
+          const label = s.status === "sending" ? "Sending…" : "Queued…";
+          setBusy(btn, true, label);
+          siblings.forEach(b => setBusy(b, true, label));
+          setMsg(id, s.label, "");
+          return;
+        }
+        siblings.forEach(b => setBusy(b, false));
         if (s.status === "sent") {
           setBusy(btn, false);
           if (btn) { btn.disabled = true; btn.textContent = "Sent ✓"; }
@@ -525,24 +548,38 @@
           setBusy(btn, false);
           if (btn) { btn.disabled = false; btn.textContent = "Retry send"; }
           setMsg(id, "Send failed: " + (s.error || "unknown error"), "err");
-        } else if (s.in_flight) {
-          setBusy(btn, true, s.status === "sending" ? "Sending…" : "Queued…");
+        } else if (s.status === "canceled" || s.status === "pending_approval") {
+          // Both are real latest-statuses that matched nothing here, leaving the
+          // button frozen in whatever the previous tick made of it.
+          setBusy(btn, false);
           setMsg(id, s.label, "");
         }
       }
 
+      // While something is in flight, watch closely; otherwise keep watching
+      // slowly rather than stopping. A send can begin with no click in this tab
+      // (autopilot queues one, or another tab approves), and the poll used to
+      // clear itself the first time nothing was in flight — after which the
+      // buttons in this tab stayed live over every later send for the life of
+      // the page.
+      const IDLE_SKIP = 4;   // → re-check every 5th tick, i.e. 15s, when idle
+      let idleTicks = 0;
+
       async function trackSends() {
         if (sendPoll) return;
         const tick = async () => {
+          if (idleTicks > 0) { idleTicks -= 1; return; }
+          let anyInFlight = false;
           try {
             const states = await (await fetch("/api/send-states")).json();
-            let anyInFlight = false;
             for (const [id, s] of Object.entries(states)) {
               renderSendState(id, s);
               if (s.in_flight) anyInFlight = true;
             }
-            if (!anyInFlight) { clearInterval(sendPoll); sendPoll = null; }
-          } catch (e) { /* transient */ }
+          } catch (e) {
+            anyInFlight = false;  // transient — back off, don't hammer
+          }
+          idleTicks = anyInFlight ? 0 : IDLE_SKIP;
         };
         sendPoll = setInterval(tick, 3000);
         tick();
@@ -651,18 +688,10 @@
 
       // Resume tracking on load so a send that's still in flight (or failed
       // while the page was closed) shows its state without any user action.
-      {% if board.all | selectattr('send') | selectattr('send.in_flight') | list %}
+      // Armed unconditionally: the old else-branch fetched once and started no
+      // interval, so a send beginning later in the session was never seen. The
+      // first tick always fetches, and the result picks the cadence from there.
       trackSends();
-      {% else %}
-      (async () => {
-        try {
-          const states = await (await fetch("/api/send-states")).json();
-          for (const [id, s] of Object.entries(states)) {
-            if (s.status === "failed" || s.status === "sent") renderSendState(id, s);
-          }
-        } catch (e) { /* transient */ }
-      })();
-      {% endif %}
     </script>
   {% endif %}
   </main>

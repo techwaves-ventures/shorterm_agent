@@ -480,3 +480,59 @@ def counts(tenant_id: str, site: str) -> dict:
         "sent": by_status.get(SENT, 0),
         "failed": by_status.get(FAILED, 0),
     }
+
+
+def rows_by_item(tenant_id: str, site: str) -> dict[str, list[dict]]:
+    """Every row per item, oldest first — the input `send_state` decides from.
+
+    `latest_by_item` collapses to the last write, which is the wrong question to
+    ask before offering a send button. One item routinely holds several rows —
+    `enqueue_autopilot_reply` has no per-item dedupe, so a scrape returning two
+    messages in a thread queues two — and the newest is not necessarily the one
+    that matters: an older row can still be `sending` while a newer one sits
+    `canceled`. Reading only the newest calls that item idle and puts a live
+    Approve & send over a message the browser is already delivering.
+
+    Same single query and same Python collapse as `latest_by_item`, so grouping
+    costs nothing extra; callers that need the newest row can take `[-1]`.
+    """
+    out: dict[str, list[dict]] = {}
+    with _conn() as c:
+        rows = c.execute(
+            f"{_SELECT} WHERE tenant_id=? AND site=? ORDER BY id ASC",
+            (str(tenant_id), site),
+        ).fetchall()
+    for r in rows:
+        msg = _row(r)
+        if msg:
+            out.setdefault(msg["item_id"], []).append(msg)
+    return out
+
+
+def send_state(rows: list[dict] | None) -> dict | None:
+    """What this item's delivery is doing — the one rule, for every surface.
+
+    Any in-flight row wins over a newer row in another state, because the
+    question every caller is really asking is "may I offer to send?", and the
+    honest answer while a drainer holds *any* row for this item is no. Falling
+    back to the newest row keeps single-row items — the common case — reading
+    exactly as `latest_by_item` made them read.
+
+    `status` is therefore the *effective* status, not necessarily the newest
+    one: callers branch on it to pick an affordance, so a caller that saw the
+    newest `failed` while an older row was `queued` would offer "Retry send"
+    over a live delivery. Returns None for an item with no rows at all.
+    """
+    rows = [m for m in (rows or []) if m]
+    if not rows:
+        return None
+    governing = next((m for m in rows if m["status"] in IN_FLIGHT), rows[-1])
+    status = governing["status"]
+    return {
+        "id": governing["id"],
+        "status": status,
+        "label": STATUS_LABELS.get(status, status),
+        "error": governing.get("error"),
+        "step": governing.get("step_label"),
+        "in_flight": status in IN_FLIGHT,
+    }
