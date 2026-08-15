@@ -53,6 +53,7 @@ import runner
 import scheduler
 import sequences
 import storage
+import timeframe
 import waitlist
 
 SITE = "furnishedfinder"
@@ -221,6 +222,24 @@ def _recent(tenant_id: str):
 def _item_by_id(tenant_id: str, item_id: str) -> dict | None:
     """Find a lead or message by id (within this tenant), tagging its kind."""
     return storage.get_item(tenant_id, SITE, item_id)
+
+
+@app.template_filter("sched_local")
+def _sched_local(value, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Render a schedule stamp in the operator's property timezone.
+
+    `scheduled_at`/`next_action_at` are stored absolute so that the host which
+    writes a schedule and the host which acts on it agree (see `timeframe`).
+    That frame is plumbing, and showing it to a host would be a regression in its
+    own right: this dashboard's whole premise is the property's local schedule,
+    so "due 15:00" has to mean 15:00 where the property is, not on a dyno.
+
+    Falls back to the server's zone when the tenant hasn't configured one, which
+    is what `scheduler.tz_for` already promises everywhere else.
+    """
+    tenant_id = getattr(current_user, "tenant_id", None)
+    local = timeframe.to_zone(value, scheduler.tz_for(tenant_id) if tenant_id else None)
+    return local.strftime(fmt) if local else "—"
 
 
 # ---------------------------------------------------------------------------

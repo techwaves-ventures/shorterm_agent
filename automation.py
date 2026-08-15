@@ -21,6 +21,7 @@ import time
 
 import config
 import outbox
+import timeframe
 import pipeline
 import responder
 import sequences
@@ -93,6 +94,9 @@ def start_prearrival(tenant_id: str, site: str, item_id: str,
 
 
 def _due(deal: dict, now_iso: str) -> bool:
+    """Has the deal's next step come due? Both sides must be in the schedule
+    frame (see `timeframe`) — this is a text compare, so a mismatched frame is
+    silently off by the offset rather than an error."""
     when = deal.get("next_action_at")
     return bool(when) and str(when) <= now_iso
 
@@ -104,9 +108,10 @@ def run_due(tenant_id: str, site: str, limit: int = 25) -> dict:
     message lands in the outbox as `queued` (auto-send armed and permitted) or
     `pending_approval` (everything else).
     """
-    from datetime import datetime
-
-    now_iso = datetime.now().isoformat(timespec="seconds")
+    # Absolute, not host-local: this gates `next_action_at` (written by whichever
+    # host last advanced the deal) and is also what the retry path writes back
+    # via `_plus_hour`, so a local reading would drift the schedule every pass.
+    now_iso = timeframe.now()
     auto = settings_for(tenant_id)
     units = config.get_units(tenant_id)
     summary = {"drafted": 0, "auto_queued": 0, "skipped": 0, "errors": 0}

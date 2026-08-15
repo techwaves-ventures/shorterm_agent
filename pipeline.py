@@ -24,6 +24,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 import db
+import timeframe
 
 log = logging.getLogger(__name__)
 
@@ -680,8 +681,14 @@ def get(tenant_id: str, site: str, item_id: str) -> dict | None:
 
 
 def tenants_with_due(now_iso: str | None = None) -> list[str]:
-    """Tenants that have at least one lifecycle step due — the worker's work list."""
-    now_iso = now_iso or _now()
+    """Tenants that have at least one lifecycle step due — the worker's work list.
+
+    `next_action_at` is written by whoever last advanced the deal and read here
+    by the worker, so both sides are absolute rather than host-local; otherwise a
+    westward worker never sees the deal at all and the step is never even
+    drafted. See `timeframe`.
+    """
+    now_iso = now_iso or timeframe.now()
     with _conn() as c:
         rows = c.execute(
             "SELECT DISTINCT tenant_id FROM deals "
