@@ -33,6 +33,7 @@ import logging
 import os
 import re
 from email.utils import parseaddr
+from html.parser import HTMLParser
 
 log = logging.getLogger(__name__)
 
@@ -186,6 +187,111 @@ def extract_sender(payload: dict) -> str:
     return ""
 
 
+# Tags whose *content* is markup rather than prose, and must not reach the body.
+_OPAQUE_ELEMENTS = frozenset({"script", "style"})
+# End tags that closed a block in the old regex, and so still become a newline.
+_BLOCK_END_TAGS = frozenset({"p", "div", "tr"})
+
+
+class _BodyExtractor(HTMLParser):
+    """Turn notification HTML into the plain text the parser downstream reads.
+
+    Replaces a `<[^>]+>` substitution that treated a bare `<` in guest prose as a
+    tag opener: "my budget is < $2400" swallowed everything up to the next `>`,
+    which is normally the rest of the message — the guest's ask and their reply
+    address — plus several real tags. A real parser knows a `<` that no tag name
+    follows is text, so it survives (VEN-152).
+
+    Written as a parser rather than a smarter regex because no single tag pattern
+    serves the four grammars an ESP actually emits — tags, `<!-- -->` comments,
+    `<? ?>` processing instructions and `<![CDATA[ ]]>`. Every regex tried either
+    kept eating prose or leaked a comment's innards into the guest-visible body,
+    and a leaked prefix is worse than the bug: it un-anchors the label matching in
+    `sites.ff_email`, `parse` returns None and the enquiry is dropped outright.
+
+    Entities are re-emitted verbatim rather than decoded, deliberately: the old
+    substitution never decoded them, and the money/email patterns downstream are
+    written against the un-decoded text. Decoding here would turn a guest's
+    literal `&lt;` into a `<` and quietly move every message's dedup id.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=False)
+        self._out: list[str] = []
+        self._opaque_depth = 0
+
+    # -- collection ---------------------------------------------------------
+    def _emit(self, text: str) -> None:
+        if not self._opaque_depth:
+            self._out.append(text)
+
+    def text(self) -> str:
+        return "".join(self._out)
+
+    # -- element boundaries -------------------------------------------------
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in _OPAQUE_ELEMENTS:
+            # Emit the separator before going quiet, so the surrounding words do
+            # not run together once the script's body is dropped.
+            self._emit(" ")
+            self._opaque_depth += 1
+            return
+        self._emit("\n" if tag == "br" else " ")
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        # `<br/>` is a start tag that never opens a region; a self-closing
+        # script/style likewise has no content to suppress.
+        self._emit("\n" if tag == "br" else " ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _OPAQUE_ELEMENTS:
+            self._opaque_depth = max(0, self._opaque_depth - 1)
+            self._emit(" ")
+            return
+        self._emit("\n" if tag in _BLOCK_END_TAGS else " ")
+
+    # -- prose --------------------------------------------------------------
+    def handle_data(self, data: str) -> None:
+        self._emit(data)
+
+    def handle_entityref(self, name: str) -> None:
+        self._emit(f"&{name};")
+
+    def handle_charref(self, name: str) -> None:
+        self._emit(f"&#{name};")
+
+    # -- markup that is never prose ----------------------------------------
+    # Each becomes a separator, never its contents. Outlook puts a conditional
+    # comment in nearly every HTML mail it sends, so leaking these is the common
+    # case, not an edge one.
+    def handle_comment(self, data: str) -> None:
+        self._emit(" ")
+
+    def handle_decl(self, decl: str) -> None:
+        self._emit(" ")
+
+    def handle_pi(self, data: str) -> None:
+        self._emit(" ")
+
+    def unknown_decl(self, data: str) -> None:
+        self._emit(" ")
+
+
+def strip_html(value: str) -> str:
+    """Extract readable text from an HTML mail part. Never raises."""
+    extractor = _BodyExtractor()
+    try:
+        extractor.feed(value)
+        extractor.close()
+    except Exception:  # pragma: no cover - html.parser is lenient by design
+        # Keep whatever was recovered before the failure. Returning nothing here
+        # would fail the enquiry closed: `accept` rejects an item that does not
+        # parse, and the webhook still answers 202, so the provider never
+        # retries and the lead is gone. Partial text still usually parses.
+        log.warning("inbound: HTML extraction failed, using partial text")
+    return re.sub(r"[ \t]+", " ", extractor.text())
+
+
 def extract_body(payload: dict) -> str:
     for key in ("text", "plain", "TextBody", "body-plain", "stripped-text", "body"):
         value = payload.get(key)
@@ -196,10 +302,7 @@ def extract_body(payload: dict) -> str:
     for key in ("html", "HtmlBody", "body-html"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
-            text = re.sub(r"(?is)<(script|style).*?</\1>", " ", value)
-            text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", text)
-            text = re.sub(r"<[^>]+>", " ", text)
-            return re.sub(r"[ \t]+", " ", text)
+            return strip_html(value)
     return ""
 
 
