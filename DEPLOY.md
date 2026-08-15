@@ -162,20 +162,40 @@ UI says so (jobs stay *queued*), so nothing looks connected that isn't.
 > stamped once at enqueue and never re-stamped, so jobs queued by an old web host
 > keep a naive `created_at` for their whole life.
 >
-> **Rolling back has the same hazard, in the same direction.** Once a new worker
-> has written an offset-aware `last_seen`, rolling the *web* host back to the
-> previous revision re-opens exactly the `TypeError` above — the row is already
-> aware and the old reader cannot subtract it. **Roll the worker back first, then
-> the web host** (the reverse of the deploy order). Rolling back only the worker
-> is always safe. This is the part reached for under pressure, so it is worth
-> knowing before the incident rather than during it.
+> **Rolling back has the same hazard, in the same direction, plus a quieter one.**
+> Once a new worker has written an offset-aware `last_seen`, rolling the *web*
+> host back to the previous revision re-opens exactly the `TypeError` above — the
+> row is already aware and the old reader cannot subtract it. **Roll the worker
+> back first, then the web host** (the reverse of the deploy order). This is the
+> part reached for under pressure, so it is worth knowing before the incident.
+>
+> Two caveats that decide whether that actually works:
+>
+> - **"Worker first" assumes the worker is still running.** A rolled-back worker
+>   only clears the aware `last_seen` by heartbeating a naive one over it. If the
+>   worker is stopped or crashed — often *why* you are rolling back — nothing
+>   re-stamps it, and the web rollback hits the `TypeError` anyway. In that case
+>   clear the beacon first (`DELETE FROM ff_worker WHERE id=1;`, or wait for one
+>   naive heartbeat); an empty table reads as "offline", which every revision
+>   handles.
+> - **The `ff_jobs` columns degrade silently rather than loudly.** The old
+>   `_age_seconds` catches `Exception` broadly, so an aware `created_at` /
+>   `updated_at` written by the new stack reads as `None` on the rolled-back web
+>   host — no traceback, no log line. `_cooldown_remaining` then returns 0 (the
+>   FurnishedFinder login-email burst guard is **off**) and the
+>   `MAX_ACTIVE_JOB_SECONDS` backstop in `reap_stale` is **skipped** (a wedged job
+>   is never reaped). Because `created_at` is stamped once at enqueue and never
+>   re-stamped, that lasts the whole life of every job the new stack queued. It
+>   clears as those jobs finish; a rollback expected to last should drain or
+>   delete them.
 >
 > On the single-image topologies (`Dockerfile`, `docker-compose.yml`) the web and
 > worker roles turn over together, so there is no mixed window and no ordering to
 > enforce in either direction.
 >
-> There is no migration to run: both shapes are readable, and a legacy naive value
-> is read as local wall clock, which is what wrote it.
+> There is no migration to run **going forward**: a new reader handles both
+> shapes, and a legacy naive value is read as local wall clock, which is what
+> wrote it. That symmetry does not hold backwards — see the two caveats above.
 
 **Connection honesty:** saving a FurnishedFinder email lands the account in
 `needs_verification` — it is **not** shown as connected. The first successful
