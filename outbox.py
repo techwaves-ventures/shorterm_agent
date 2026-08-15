@@ -355,13 +355,20 @@ def release_unattempted(msg_id: int) -> None:
     the message was then abandoned on its first genuine stall with an
     operator-facing error saying it "may already have reached the guest" — which
     was false; it had been sent zero times.
+
+    Only a row still in `SENDING` is released, because that is the claim being
+    given back. Without the status check this re-queued whatever the row had
+    since become — and an operator's cancel landing while the drainer held the
+    claim was silently undone, delivering a message a human had explicitly
+    called off. That race is reachable on every collision now that a same-tenant
+    one is busy too, and `_drain_loop` retries it every few seconds.
     """
     with _conn() as c:
         c.execute(
             "UPDATE outbox SET status=?, sending_at=NULL, "
             "attempts=CASE WHEN COALESCE(attempts,0)>0 THEN attempts-1 ELSE 0 END "
-            "WHERE id=?",
-            (QUEUED, msg_id),
+            "WHERE id=? AND status=?",
+            (QUEUED, msg_id, SENDING),
         )
 
 

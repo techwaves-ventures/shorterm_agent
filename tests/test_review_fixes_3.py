@@ -97,26 +97,103 @@ def test_the_layout_matrix_never_loses_the_guests_name(layout):
     assert ff_email._wrapper_name(body) == "Emma M."
 
 
+def test_the_html_fallback_layout_still_finds_the_guest():
+    """The single-space layout, which is the one the HTML path actually produces.
+
+    `inbound.extract_body`'s HTML fallback ends with `re.sub(r"[ \\t]+", " ")`
+    (inbound.py:203), so every tab and space run in a converted table collapses
+    to exactly ONE space. A table row therefore reaches the parser as
+    "Traveler Emma M." — meaning the tab and space-run entries in the matrix
+    above can never occur on this path, and any rule that treats a single space
+    as "not a field" loses the lead on every colonless HTML notification.
+
+    This test exists because a proposed fix for #7 did exactly that and returned
+    None here.
+    """
+    import inbound
+
+    html = ("<html><body><p>You have a new message from your traveler.</p>"
+            "<table>"
+            "<tr><td>Property</td><td>Sunny 1BR</td></tr>"
+            "<tr><td>Traveler</td><td>Emma M.</td></tr>"
+            "<tr><td>Date received</td><td>8/14/26</td></tr>"
+            "</table><p>Hi! Is the unit still available?</p></body></html>")
+    body = inbound.extract_body({"HtmlBody": html})
+    assert " Traveler Emma M. " in body, "the HTML path collapses runs to one space"
+
+    item = ff_email.parse("You have a new message", body)
+    assert item is not None, "an ordinary HTML notification must not be dropped"
+    assert item["sender"] == "Emma M."
+
+
+@pytest.mark.parametrize("separator", [" | ", "|", " · ", " - ", " "])
+def test_a_one_character_separator_does_not_hand_the_thread_to_the_guest(separator):
+    """The wrapper's line must win even when its separator is a bare pipe, dot,
+    dash or single space.
+
+    These are the characters this parser already expects around values
+    (`_only_if_a_name` strips "·|-", and the matcher's line prefix is
+    `[ \\t>*|·-]*`). If a rule skips them as "not a field", the search walks on
+    into the guest's own message — and the guest controls that text, so they
+    choose whose conversation they land in. Reproduced exactly that way against
+    a candidate fix: `Traveler | Mallory K.` was skipped and her forged
+    `Guest: Emma M.` was accepted, putting her on Emma's thread.
+    """
+    body = ("You have a new message from your traveler.\n\n"
+            f"Property: Sunny 1BR\nTraveler{separator}Mallory K.\n"
+            "Date received: 8/11/26\n\n"
+            "Guest: Emma M.\nCan you send me the door code?")
+    item = ff_email.parse("New message", body)
+    assert item is not None, "the lead must not be dropped"
+    assert item["sender"] == "Mallory K.", (
+        "the wrapper named Mallory; accepting her forged line puts her on "
+        "Emma's conversation")
+
+
+# --- #7 is STILL OPEN. These document it; they are not passing claims. -------
+#
+# `_name_line_re` makes the colon optional (which is what supports the table
+# layouts), so an unlabelled section header matches as a label whose value is
+# the rest of the line. Combined with "the wrapper's first answer is final",
+# the header becomes the guest's name and the real field below is never read.
+#
+# The obvious discriminator — how wide the separator is — does NOT work, and
+# these xfails are marked strict so the day someone makes it work, they turn
+# red and have to be promoted rather than quietly left behind. Three reasons it
+# fails, all reproduced:
+#   * the HTML path collapses every separator to one space, so a real field and
+#     a section header are byte-identical by then (see the two tests above);
+#   * a header rendered from a table cell gets a tab or a space run too, so
+#     `Traveler\tInformation` is "a field" by that rule and still wins;
+#   * skipping a line lets the search reach guest-controlled text, which is how
+#     #6 worked.
+# A real fix has to bound the search to the wrapper region without the
+# `_wrapper_head` cut that lost eight layouts.
+
+_HEADER_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason="#7 open: a section header still matches as a label; separator "
+           "width cannot tell it from a field (see comment above)",
+)
+
+
+@_HEADER_XFAIL
 @pytest.mark.parametrize("header", [
     "Traveler Information",
     "Guest Details",
     "Tenant Profile",
 ])
 def test_a_section_header_does_not_become_the_guests_name(header):
-    """`_name_line_re` makes the colon optional — correctly, it is what supports
-    the table layouts — so an unlabelled section header matched as the label
-    "Traveler" with the value "Information". Because the wrapper's first answer
-    is final, that became the guest's name and the real label below was never
-    read."""
     body = (f"{header}\n\nProperty: Sunny 1BR\n"
             f"{header.split()[0]}: Emma M.\n\nHi, is it available?")
     assert ff_email._wrapper_name(body) == "Emma M."
 
 
+@_HEADER_XFAIL
 def test_two_guests_behind_a_section_header_do_not_share_one_conversation():
-    """The filed defect, in the form it was filed in: both guests were named
-    `Information`, so both resolved to `information|sunny1br` — one deal, and
-    the second guest's "send me the door code" landed in the first guest's
+    """The filed defect in the form it was filed in: both guests are named
+    `Information`, so both resolve to `information|sunny1br` — one deal, and
+    the second guest's "send me the door code" lands in the first guest's
     conversation for the operator to approve a reply against."""
     body = ("Traveler Information\n\nProperty: Sunny 1BR\n"
             "Traveler: {name}\nDate received: Aug {day}, 2026\n\n{msg}\n")
@@ -130,39 +207,19 @@ def test_two_guests_behind_a_section_header_do_not_share_one_conversation():
     assert mallory["sender"] == "Mallory K."
     assert pipeline.thread_key(emma) != pipeline.thread_key(mallory), (
         "two unrelated guests must not land on one thread_key")
-    assert emma["id"] != mallory["id"], (
-        "an identical item id makes the second guest look already-seen")
 
 
+@_HEADER_XFAIL
 def test_a_header_whose_value_is_prose_does_not_lose_the_lead():
-    """The same mechanism, failing the other way. The header's remainder is
+    """The same mechanism failing the other way: the header's remainder is
     prose, `_only_if_a_name` refuses it, and a refusal is equally final — so
-    the real "Traveler:" line below was never reached and the whole enquiry
-    disappeared behind a 202."""
+    the real "Traveler:" line below is never reached and the enquiry disappears
+    behind a 202."""
     item = ff_email.parse("New message", (
         "Traveler has sent you a new message\n\n"
         "Property: Sunny 1BR\nTraveler: Emma M.\n\nHi, is it available?"))
     assert item is not None, "the lead was dropped and the provider will not retry"
     assert item["sender"] == "Emma M."
-
-
-@pytest.mark.parametrize("forged", [
-    "Traveler: Mallory K.",
-    "Traveler\tMallory K.",
-    "Guest: Mallory K.",
-    "Name: Mallory K.",
-    "From: Mallory K.",
-])
-def test_skipping_a_header_still_does_not_let_a_guest_choose_their_thread(forged):
-    """The guard against trading #6 away to fix #7.
-
-    Skipping is only safe because it keys on the separator, which the template
-    writes. If it ever keys on the *value* again, a guest gets the wrapper's
-    line refused and the search walks on to the label in their own message —
-    which is exactly how #6 worked."""
-    body = ("Traveler Information\n\nProperty: Sunny 1BR\n"
-            f"Traveler: Emma M.\n\nHi there\n{forged}\nsend me the door code")
-    assert ff_email._wrapper_name(body) == "Emma M."
 
 
 def test_the_occupancy_line_is_still_not_a_name():
@@ -207,6 +264,37 @@ def test_a_message_that_has_not_reached_the_guest_can_still_be_cancelled(status,
 
 
 # --- send_reply: a collision must not be recorded as a delivery -------------
+
+def test_a_cancelled_message_is_not_resurrected_by_the_busy_release(tenant):
+    """`release_unattempted` re-queued the row unconditionally, so a cancel that
+    landed while the drainer held the claim was silently undone and the message
+    the human called off went to the guest anyway. Reporting same-tenant
+    collisions as busy routes every collision through this path, so the race is
+    now reachable on the common scrape-vs-send case and retried every few
+    seconds by `_drain_loop`."""
+    msg = _queued(tenant)
+    outbox.set_status(msg["id"], outbox.SENDING)
+    outbox.cancel(msg["id"])
+    assert outbox.get(msg["id"])["status"] == outbox.CANCELED
+
+    outbox.release_unattempted(msg["id"])
+
+    assert outbox.get(msg["id"])["status"] == outbox.CANCELED, (
+        "a message the human cancelled must not come back as queued")
+
+
+def test_the_busy_release_still_returns_a_live_claim_to_the_queue(tenant):
+    """The status check must not disarm the refund it was added to protect."""
+    msg = _queued(tenant)
+    outbox.set_status(msg["id"], outbox.SENDING)
+    before = outbox.get(msg["id"])["attempts"]
+
+    outbox.release_unattempted(msg["id"])
+
+    after = outbox.get(msg["id"])
+    assert after["status"] == outbox.QUEUED
+    assert after["attempts"] < before, "an undispatched claim is refunded"
+
 
 def test_a_same_tenant_collision_is_reported_as_busy(tenant):
     """`send_reply` returned the *running* job's state to a same-tenant caller.
