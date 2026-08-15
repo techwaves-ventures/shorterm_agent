@@ -24,7 +24,9 @@ single-process test is structurally incapable of reaching it -- note that every
 cell on the writer==reader diagonal is correct even on unfixed code, which is
 why the rest of the suite never caught this.
 """
+import contextlib
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -38,7 +40,8 @@ import jobs  # noqa: E402
 
 # A west/east spread either side of UTC, plus a half-hour zone so the test does
 # not silently assume whole-hour offsets.
-ZONES = ["UTC", "America/Los_Angeles", "Asia/Tokyo", "Pacific/Auckland"]
+ZONES = ["UTC", "America/Los_Angeles", "Asia/Tokyo", "Pacific/Auckland",
+         "Asia/Kolkata"]
 
 _FAILURES = []
 
@@ -165,17 +168,31 @@ def _assert_real_zone(zone, actual):
             % (zone, actual, want))
 
 
+@contextlib.contextmanager
+def _scratch_db():
+    """A throwaway DB path, cleaned up afterwards.
+
+    Each cell needs a virgin database, and there are len(ZONES)**2 of them per
+    matrix -- left behind, they accumulate in $TMPDIR run after run.
+    """
+    d = tempfile.mkdtemp(prefix="ven137_")
+    try:
+        yield os.path.join(d, "t.db")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 def _matrix(age):
     """worker_online() for every (writer TZ, reader TZ) pair at a given age."""
     grid = {}
     for zw in ZONES:
         for zr in ZONES:
-            db = os.path.join(tempfile.mkdtemp(prefix="ven137_"), "t.db")
-            offw, _ = _run(_WRITER, zw, db, age)
-            _assert_real_zone(zw, offw)
-            offr, res = _run(_READER, zr, db, age)
-            _assert_real_zone(zr, offr)
-            grid[(zw, zr)] = res
+            with _scratch_db() as db:
+                offw, _ = _run(_WRITER, zw, db, age)
+                _assert_real_zone(zw, offw)
+                offr, res = _run(_READER, zr, db, age)
+                _assert_real_zone(zr, offr)
+                grid[(zw, zr)] = res
     return grid
 
 
@@ -207,11 +224,11 @@ def test_eastward_dead_worker_is_not_reported_online():
     forever. This is the dangerous half of the defect -- the operator is told
     automation is running when it is not, and stranded jobs are never reaped.
     """
-    db = os.path.join(tempfile.mkdtemp(prefix="ven137_"), "t.db")
-    offw, _ = _run(_WRITER, "Pacific/Auckland", db, age=10 * jobs.WORKER_TTL_SECONDS)
-    _assert_real_zone("Pacific/Auckland", offw)
-    offr, res = _run(_READER, "UTC", db)
-    _assert_real_zone("UTC", offr)
+    with _scratch_db() as db:
+        offw, _ = _run(_WRITER, "Pacific/Auckland", db, age=10 * jobs.WORKER_TTL_SECONDS)
+        _assert_real_zone("Pacific/Auckland", offw)
+        offr, res = _run(_READER, "UTC", db)
+        _assert_real_zone("UTC", offr)
     check(res == "False",
           "worker dead %ds in Pacific/Auckland reads OFFLINE to a UTC web host, "
           "not falsely ONLINE (got %s)" % (10 * jobs.WORKER_TTL_SECONDS, res))
@@ -226,9 +243,9 @@ def test_legacy_naive_row_does_not_crash_the_reader():
     branch this is an uncaught 500 for every user until the first new heartbeat.
     """
     for age, expected in ((0, "True"), (10 * jobs.WORKER_TTL_SECONDS, "False")):
-        db = os.path.join(tempfile.mkdtemp(prefix="ven137_"), "t.db")
-        _run(_LEGACY, "UTC", db, age)
-        _, res = _run(_READER, "UTC", db)
+        with _scratch_db() as db:
+            _run(_LEGACY, "UTC", db, age)
+            _, res = _run(_READER, "UTC", db)
         # Same-zone, so the pre-fix comparison the fallback reuses is correct
         # here -- this pins that the legacy branch still answers, and answers
         # exactly what unfixed code answered, rather than merely not raising.
@@ -242,20 +259,41 @@ def test_aware_expiry_path_is_exercised():
 
     The suite's `_expire_worker()` helper used to hand-write a naive stamp, so
     after this fix every reap/offline test would have gone down the legacy
-    fallback instead of the real path. That helper is now aware; this pins the
-    behaviour directly so it cannot regress unnoticed.
+    fallback instead of the real path.
+
+    This pins `heartbeat()`. `_expire_worker()` itself is pinned separately by
+    `test_expire_worker_helper_writes_an_aware_stamp` -- an earlier version of
+    this docstring claimed *this* test covered it, which was false: reverting
+    the helper to a naive stamp left the whole suite green.
     """
-    db = os.path.join(tempfile.mkdtemp(prefix="ven137_"), "t.db")
-    # A real heartbeat from a worker whose clock is TTL+60s back, so the stamp
-    # is exactly what a genuinely expired worker would have written.
-    _run(_WRITER, "UTC", db, age=jobs.WORKER_TTL_SECONDS + 60)
-    _, stored = _run(_READ_RAW, "UTC", db)
+    with _scratch_db() as db:
+        # A real heartbeat from a worker whose clock is TTL+60s back, so the
+        # stamp is exactly what a genuinely expired worker would have written.
+        _run(_WRITER, "UTC", db, age=jobs.WORKER_TTL_SECONDS + 60)
+        _, stored = _run(_READ_RAW, "UTC", db)
+        _, res = _run(_READER, "UTC", db)
     parsed = datetime.fromisoformat(stored)
     check(parsed.tzinfo is not None,
           "heartbeat() stores an offset-aware stamp, so the expiry path under "
           "test is the shipped one and not the legacy fallback (stored %r)" % stored)
-    _, res = _run(_READER, "UTC", db)
     check(res == "False", "an offset-aware stamp past the TTL reads OFFLINE (got %s)" % res)
+
+
+def test_expire_worker_helper_writes_an_aware_stamp():
+    """`test_ff_connect_flow._expire_worker()` must stamp aware, and this must fail if it stops.
+
+    That helper lives in a file whose own `check()` only appends to a list, so
+    under pytest its assertions cannot fail (see this module's `check`). The
+    helper could therefore silently revert to a naive stamp -- routing every
+    reap/offline test in that file down the legacy compatibility branch and
+    leaving the shipped aware path uncovered -- with the suite fully green.
+    Asserting it from here, where `check()` raises, is what makes it a real pin.
+    """
+    src = (Path(REPO) / "tests" / "test_ff_connect_flow.py").read_text()
+    body = src.split("def _expire_worker(")[1].split("\ndef ")[0]
+    check("timezone.utc" in body,
+          "_expire_worker() builds its stamp with timezone.utc, so the reap/offline "
+          "tests exercise the shipped aware path rather than the legacy fallback")
 
 
 def main():
@@ -263,9 +301,13 @@ def main():
                test_dead_worker_reads_offline_in_every_timezone_pair,
                test_eastward_dead_worker_is_not_reported_online,
                test_legacy_naive_row_does_not_crash_the_reader,
-               test_aware_expiry_path_is_exercised):
+               test_aware_expiry_path_is_exercised,
+               test_expire_worker_helper_writes_an_aware_stamp):
         print(fn.__name__)
-        fn()
+        try:
+            fn()
+        except AssertionError:
+            pass          # `check` already recorded and printed it
     if _FAILURES:
         print("\n%d FAILED" % len(_FAILURES))
         sys.exit(1)

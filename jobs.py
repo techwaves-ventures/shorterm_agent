@@ -80,8 +80,14 @@ def _now_utc() -> str:
     `reap_stale` then never frees its stranded jobs.
 
     So this column carries its offset. Deliberately narrow, mirroring
-    `outbox._now_utc`: `_now()` is shared with `created_at`/`updated_at`, whose
-    local semantics the UI projection and cooldown depend on.
+    `outbox._now_utc`: `_now()` is shared with `created_at`/`updated_at`, which
+    are left naive here only because they are outside this change's scope --
+    *not* because they were checked and cleared. Both in fact cross the same
+    host boundary and are wrong in the same way: `created_at` via `reap_stale`,
+    and `updated_at` via `_cooldown_remaining`, where a westward worker loses
+    the FurnishedFinder login-email cooldown entirely and an eastward one locks
+    the user out for hours. Tracked separately; do not read this helper's
+    narrowness as a judgement that those are safe.
     """
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
