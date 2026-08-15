@@ -212,6 +212,163 @@ def test_the_html_fallback_layout_still_finds_the_guest():
     assert " Traveler Emma M. " in body
 
 
+@pytest.mark.parametrize("label,markup", [
+    # Every one of these was a *regression introduced by the first version of
+    # this fix*: html.parser reports an unterminated construct by handing over
+    # the whole rest of the document, and dropping that blob (the obvious
+    # reading of "script bodies are not prose") destroyed the enquiry. An
+    # unclosed <style> in a template head is ordinary, not exotic.
+    ("unclosed <style> in head", "<style type=\"text/css\">.btn{color:#fff}"),
+    ("unclosed <script> in head", "<script>var t=1;"),
+    ("unterminated comment", "<!--x"),
+    ("unterminated CDATA", "<![CDATA[ x"),
+    ("MSO conditional missing its >", "<!--[if gte mso 9]><xml></xml><![endif]--"),
+])
+def test_an_unterminated_construct_never_swallows_the_document(label, markup):
+    html = ("<html><head>" + markup + "</head><body>" + TABLE +
+            "<p>Is the unit still available? Reach me at emma.r@gmail.com</p>"
+            "</body></html>")
+    item = ff_email.parse(MESSAGE_SUBJECT, inbound.extract_body({"HtmlBody": html}))
+
+    assert item is not None, f"{label}: the rest of the email was discarded"
+    assert item["sender"] == "Emma M."
+    assert item["email"] == "emma.r@gmail.com", f"{label}: the address was lost"
+    for token in ("<!", "<?", "CDATA[", "[if "):
+        assert token not in (item.get("body") or ""), f"{label}: {token!r} leaked"
+
+
+def test_an_unclosed_opaque_element_releases_its_content_at_eof():
+    """Asserted on the extractor directly, deliberately.
+
+    Mutation testing showed the end-to-end tests above cannot see this: break the
+    flush and `strip_html`'s empty-output fallback quietly rescues the result, so
+    every test stays green while the real mechanism is dead. Two layers of
+    defence means each one needs its own test.
+    """
+    extractor = inbound._BodyExtractor()
+    extractor.feed("<p>before</p><style>.a{color:red}")
+    text = extractor.finish()
+
+    assert "before" in text
+    assert ".a{color:red}" in text, "content after an unclosed <style> was dropped"
+
+
+def test_a_properly_closed_opaque_element_still_discards_its_content():
+    """The other half of the pair — the flush must not resurrect real script."""
+    extractor = inbound._BodyExtractor()
+    extractor.feed("<p>before</p><style>.a{color:red}</style><p>after</p>")
+    text = extractor.finish()
+
+    assert "before" in text and "after" in text
+    assert "color:red" not in text
+
+
+def test_an_unterminated_comment_releases_its_text_at_eof():
+    """Also asserted on the extractor directly, for the same masking reason."""
+    extractor = inbound._BodyExtractor()
+    extractor.feed("<p>before</p><!--x<p>AFTER</p>")
+    text = extractor.finish()
+
+    assert "AFTER" in text, "the rest of the document was swallowed by a comment"
+    assert "<!" not in text and "<p>" not in text, f"raw markup leaked: {text!r}"
+
+
+def test_a_terminated_comment_is_still_dropped_whole():
+    extractor = inbound._BodyExtractor()
+    extractor.feed("<p>before</p><!-- hidden --><p>after</p>")
+    text = extractor.finish()
+
+    assert "before" in text and "after" in text and "hidden" not in text
+
+
+def test_the_empty_output_fallback_fires_when_the_parser_yields_nothing(monkeypatch):
+    """The safety net itself, forced — otherwise nothing ever exercises it.
+
+    It is the last thing standing between a parser bug and a destroyed enquiry,
+    so "it never fires in practice" is not a reason to leave it unverified.
+    """
+    class Blank(inbound._BodyExtractor):
+        def finish(self):
+            return "   "
+
+    monkeypatch.setattr(inbound, "_BodyExtractor", Blank)
+    body = inbound.strip_html("<p>Traveler: Emma M.</p><p>Is it available?</p>")
+
+    assert "Emma M." in body and "Is it available?" in body
+
+
+def test_the_extractor_never_returns_a_blank_body_for_a_document_with_text():
+    """Last-resort net. `accept` rejects an unparseable item and the webhook still
+    answers 202, so "no text" is indistinguishable from "no enquiry"."""
+    for html in ("<style>x", "<!--", "<![CDATA[", "<script>", "<!--[if mso]>"):
+        html_with_text = html + "Emma wrote in about the unit"
+        assert inbound.extract_body({"HtmlBody": html_with_text}).strip(), html
+
+
+@pytest.mark.parametrize("text,shown", [
+    # Regression: entity refs were re-emitted as `&name;` from html.parser's
+    # `handle_entityref`, which matches `&name` with NO semicolon. That inserted
+    # a character the guest never typed, corrupting ordinary mail and moving the
+    # message id on rollout. None of these contain a bare `<`.
+    ("Is there a Q&A night?", "Q&A night?"),
+    ("Is it like a B&B?", "B&B?"),
+    ("I work for AT&T.", "AT&T."),
+    ("Johnson&Johnson relocation", "Johnson&Johnson relocation"),
+    ("See https://ff.com/x?a=1&b=2", "?a=1&b=2"),
+    ("Rent is&nbsp $2400", "is&nbsp $2400"),
+    # ...while real entities must still pass through undecoded.
+    ("Budget &lt; $2000 &amp; flexible", "&lt; $2000 &amp; flexible"),
+    ("it&#39;s available", "it&#39;s available"),
+])
+def test_an_ampersand_is_never_rewritten(text, shown):
+    body = inbound.extract_body({"HtmlBody": f"<p>{text}</p>"})
+    assert shown in body, f"expected {shown!r} in {body!r}"
+
+
+def test_an_incomplete_character_reference_does_not_dump_raw_markup():
+    """A `&#` in a guest's URL made html.parser abandon its scan and return every
+    remaining byte as text, so the whole notification landed in the body as
+    markup and `parse` found nothing."""
+    html = ("<html><body><p>I saw https://ff.com/l?id=9&#details</p>" + TABLE +
+            "<p>Available?</p></body></html>")
+    body = inbound.extract_body({"HtmlBody": html})
+    item = ff_email.parse(MESSAGE_SUBJECT, body)
+
+    assert "<td>" not in body and "<table>" not in body, f"raw markup leaked: {body!r}"
+    assert item is not None and item["sender"] == "Emma M."
+
+
+@pytest.mark.parametrize("cell,expected", [
+    ("Emma&Ryan", "Emma&Ryan"),
+    ("T&J M.", "T&J M."),
+    ("Emma &amp; Ryan", "Emma &amp; Ryan"),
+])
+def test_an_ampersand_in_the_guest_name_is_not_rewritten(cell, expected):
+    """Lead ids don't hash the body, but they do hash the name — and the name is
+    what the drafter addresses the guest by."""
+    html = ("<html><body><table>"
+            "<tr><td>Property</td><td>Sunny 1BR</td></tr>"
+            f"<tr><td>Traveler</td><td>{cell}</td></tr>"
+            "<tr><td>Date received</td><td>8/14/26</td></tr>"
+            "</table><p>Is it available?</p></body></html>")
+    item = ff_email.parse(MESSAGE_SUBJECT, inbound.extract_body({"HtmlBody": html}))
+    assert item is not None and item["sender"] == expected
+
+
+@pytest.mark.parametrize("html,expected", [
+    ("<div>line one<br>line two</div>", "line one\nline two"),
+    ("<div>line one<br/>line two</div>", "line one\nline two"),
+    ("<div>line one<br />line two</div>", "line one\nline two"),
+    # `</p>` closes with a newline and the next `<p>` opens with the separator
+    # space, exactly as the old substitution ordered them.
+    ("<p>para one</p><p>para two</p>", "para one\n para two"),
+])
+def test_block_boundaries_still_become_newlines(html, expected):
+    """Mutation testing found this contract had no coverage at all: breaking
+    `<br>` → newline left all 24 tests green."""
+    assert expected in inbound.extract_body({"HtmlBody": html})
+
+
 def _growth_ratio(make):
     """Median-of-3 wall time at n and 2n. Ratio ~2 is linear, ~4 is quadratic."""
     timings = {}
