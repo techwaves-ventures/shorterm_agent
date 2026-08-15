@@ -103,21 +103,52 @@ def _fingerprint(subject: str, sender: str, body: str) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+# Which rows survive the cap, best first. Ordering by usefulness rather than by
+# recency alone is load-bearing: a host who forwards *all* their mail instead of
+# filtering on furnishedfinder.com produces `sender_not_allowed` rows at
+# newsletter volume, and a plain newest-wins cap would let 200 of those silently
+# delete the one genuine unreadable enquiry — the exact loss this table exists to
+# prevent, reintroduced by its own bookkeeping. So: still-open before resolved,
+# a lead we failed to read before mail that was never ours, and only then recent.
+#
+# `received_at` leads the recency tiebreak because a duplicate forward bumps that
+# and not `id`; ordering by `id` alone would evict the freshest row first.
+_KEEP_IDS = """SELECT id FROM inbound_rejects
+                WHERE tenant_id=? AND site=?
+                ORDER BY CASE WHEN status=? THEN 0 ELSE 1 END,
+                         CASE WHEN reason_code=? THEN 0 ELSE 1 END,
+                         received_at DESC, id DESC
+                LIMIT ?"""
+
+_KEEP_PARAMS = ("unparsed",)  # the code that must outlive everything else
+
+
 def _prune(c: db.Conn, tenant_id: str, site: str) -> None:
-    """Keep only the newest `MAX_ROWS_PER_TENANT` rows for this tenant+site.
+    """Enforce the per-tenant row cap, keeping the most useful rows.
 
     Postgres has no `DELETE ... LIMIT`, so the bound goes in a subselect. This
     is the portable form; the SQLite-only shorthand passes tests locally and
     fails on the hosted database.
     """
+    keep = (tenant_id, site, OPEN) + _KEEP_PARAMS + (MAX_ROWS_PER_TENANT,)
+
+    # A cap that quietly discards evidence is indistinguishable from the bug.
+    doomed = c.execute(
+        f"SELECT COUNT(*) FROM inbound_rejects WHERE tenant_id=? AND site=? "
+        f"AND status=? AND id NOT IN ({_KEEP_IDS})",
+        (tenant_id, site, OPEN) + keep,
+    ).fetchone()
+    if doomed and doomed[0]:
+        log.warning(
+            "Pruning %s unreviewed rejected inbound row(s) for tenant %s at the "
+            "%s-row cap — raise the cap or review sooner",
+            doomed[0], tenant_id, MAX_ROWS_PER_TENANT,
+        )
+
     c.execute(
-        """DELETE FROM inbound_rejects
-           WHERE tenant_id=? AND site=? AND id NOT IN (
-               SELECT id FROM inbound_rejects
-               WHERE tenant_id=? AND site=?
-               ORDER BY id DESC LIMIT ?
-           )""",
-        (tenant_id, site, tenant_id, site, MAX_ROWS_PER_TENANT),
+        f"DELETE FROM inbound_rejects WHERE tenant_id=? AND site=? "
+        f"AND id NOT IN ({_KEEP_IDS})",
+        (tenant_id, site) + keep,
     )
 
 

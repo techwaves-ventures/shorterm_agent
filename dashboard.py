@@ -425,6 +425,10 @@ def inbound_rejected_retry(rid):
     """
     tenant_id = current_user.tenant_id
     row = _reject_or_404(tenant_id, rid)
+    if row["status"] != inbound_rejects.OPEN:
+        # A stale tab still shows rows that have since been handled elsewhere.
+        flash("That message was already handled.")
+        return redirect(url_for("inbound_rejected"))
 
     from sites import ff_email
 
@@ -444,7 +448,7 @@ def inbound_rejected_retry(rid):
         return redirect(url_for("inbound_rejected"))
 
     try:
-        inbound.store(tenant_id, item, SITE)
+        is_new = inbound.store(tenant_id, item, SITE)
     except Exception:
         # Hand the row back rather than leaving it marked recovered with nothing
         # on the board — that would be the silent loss this page exists to end.
@@ -454,6 +458,15 @@ def inbound_rejected_retry(rid):
         )
         flash("Read that email, but couldn't open the lead — it stays on this list.")
         return redirect(url_for("inbound_rejected"))
+
+    # Same follow-through the webhook gives a lead that parsed first time. A
+    # recovered lead is a *late* lead, so it needs the draft more, not less —
+    # and an email-only tenant has no scheduled pass that would pick it up.
+    if is_new and os.getenv("ANTHROPIC_API_KEY"):
+        try:
+            runner.draft_ingested(tenant_id, SITE, item)
+        except Exception:
+            app.logger.exception("Could not draft recovered inbound item")
 
     flash("Recovered — %s is on your board." % (item.get("title") or "the lead"))
     return redirect(url_for("index"))
@@ -465,8 +478,10 @@ def inbound_rejected_dismiss(rid):
     """Take a message off the list. The row is kept as a record, not deleted."""
     tenant_id = current_user.tenant_id
     _reject_or_404(tenant_id, rid)
-    inbound_rejects.dismiss(tenant_id, SITE, rid)
-    flash("Dismissed.")
+    if inbound_rejects.dismiss(tenant_id, SITE, rid):
+        flash("Dismissed.")
+    else:
+        flash("That message was already handled.")
     return redirect(url_for("inbound_rejected"))
 
 

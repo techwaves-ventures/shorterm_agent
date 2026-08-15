@@ -159,6 +159,34 @@ def test_unrecognised_recipient_stores_nothing(client):
     assert inbound_rejects.count_all(tid, SITE) == 0
 
 
+def test_the_allowlist_itself_gates_persistence_not_just_the_tenant_id(client, monkeypatch):
+    """Guard the actual security control, not a side effect of it.
+
+    The three cases above are also stopped by `Rejected.tenant_id` being unset,
+    so they would still pass if `RECORDABLE_CODES` were widened to include the
+    pre-auth codes. This drives a pre-auth rejection that *does* carry a tenant
+    id, which only the code allowlist can refuse.
+    """
+    tid = _tenant()
+
+    for code in ("bad_secret", "unknown_recipient", "too_large", "not_configured"):
+        def reject(*a, _code=code, **kw):
+            raise inbound.Rejected(f"simulated {_code}", code=_code, tenant_id=tid)
+
+        monkeypatch.setattr(inbound, "accept", reject)
+        resp = _post(client, tid)
+
+        assert resp.status_code == 202
+        assert inbound_rejects.count_all(tid, SITE) == 0, (
+            f"{code} was persisted; only {inbound.RECORDABLE_CODES} may be"
+        )
+
+
+def test_recordable_codes_are_only_the_post_authentication_ones():
+    """A code reaches this tuple only if the provider secret already verified."""
+    assert set(inbound.RECORDABLE_CODES) == {"unparsed", "sender_not_allowed"}
+
+
 def test_oversized_payload_stores_nothing(client):
     """Rejected on size before parsing, so it is never attributed or stored.
 
@@ -196,6 +224,69 @@ def test_row_count_is_capped_and_keeps_the_newest(client):
     subjects = {r["subject"] for r in rows}
     assert f"digest {total - 1}" in subjects, "newest must be kept"
     assert "digest 0" not in subjects, "oldest must be pruned"
+
+
+def test_junk_at_the_cap_cannot_evict_the_genuine_lost_lead(client):
+    """The cap must bound disk without discarding the evidence it exists to keep.
+
+    A host who forwards *all* their mail instead of filtering on
+    furnishedfinder.com generates `sender_not_allowed` rows at newsletter
+    volume. Under a plain newest-wins cap those silently delete the one real
+    unreadable enquiry — the loss this table exists to prevent, reintroduced by
+    its own bookkeeping.
+    """
+    tid = _tenant()
+    _post(client, tid, body="A guest wrote and we could not read it.",
+          subject="New enquiry from a real guest")
+    assert inbound_rejects.count_open(tid, SITE) == 1
+
+    for i in range(inbound_rejects.MAX_ROWS_PER_TENANT + 10):
+        _post(client, tid, body=f"Newsletter {i}", subject=f"Weekly roundup {i}",
+              sender=f"news{i}@some-newsletter.com")
+
+    rows = inbound_rejects.open_for_tenant(tid, SITE)
+    assert len(rows) <= inbound_rejects.MAX_ROWS_PER_TENANT
+    subjects = {r["subject"] for r in rows}
+    assert "New enquiry from a real guest" in subjects, (
+        "the real lost lead was evicted by junk — the cap defeated the feature"
+    )
+
+
+def test_a_deduped_row_is_kept_over_older_ones(client, monkeypatch):
+    """A replay bumps `received_at` but not `id`; the cap must respect that.
+
+    Ordering the survivors by id alone throws away the row being re-sent right
+    now — the one most likely to be a guest trying again. The clock is driven
+    explicitly because `received_at` has one-second resolution, and a test that
+    writes 200 rows inside one second would tie on every comparison and prove
+    nothing either way.
+    """
+    stamps = iter([f"2026-08-15T05:{m // 60:02d}:{m % 60:02d}+00:00" for m in range(1, 3000)])
+    clock = {"t": next(stamps)}
+    monkeypatch.setattr(inbound_rejects, "_now", lambda: clock["t"])
+
+    tid = _tenant()
+    _post(client, tid, body="Urgent, please read", subject="URGENT enquiry")
+
+    # Fill to just under the cap, so the replay lands before any pruning.
+    for i in range(inbound_rejects.MAX_ROWS_PER_TENANT - 2):
+        clock["t"] = next(stamps)
+        _post(client, tid, body=f"filler {i}", subject=f"filler {i}")
+
+    # The guest re-forwards the original: same fingerprint, newest arrival.
+    clock["t"] = "2026-08-15T09:00:00+00:00"
+    _post(client, tid, body="Urgent, please read", subject="URGENT enquiry")
+    assert inbound_rejects.get(tid, SITE,
+        [r for r in inbound_rejects.open_for_tenant(tid, SITE)
+         if r["subject"] == "URGENT enquiry"][0]["id"])["seen_count"] == 2
+
+    # Now push past the cap; the oldest rows must go, not the freshest.
+    for i in range(5):
+        clock["t"] = f"2026-08-15T09:0{i + 1}:00+00:00"
+        _post(client, tid, body=f"late {i}", subject=f"late {i}")
+
+    subjects = {r["subject"] for r in inbound_rejects.open_for_tenant(tid, SITE)}
+    assert "URGENT enquiry" in subjects, "the freshest row was evicted first"
 
 
 def test_stored_body_is_truncated(client):
@@ -294,8 +385,37 @@ def test_retry_recovers_the_lead_and_cannot_create_two_deals(client, monkeypatch
     assert inbound_rejects.count_open(tid, SITE) == 0
 
     # Second press (a stale tab, a double-submit) must not open a second deal.
+    # `storage.filter_new` would also swallow the duplicate, so that alone
+    # proves nothing about the guard — see the dedicated test below.
     client.post(f"/inbound/rejected/{rid}/retry")
     assert len(pipeline.all_deals(tid, SITE)) == 1
+
+
+def test_the_double_retry_guard_holds_without_help_from_storage_dedup(client, monkeypatch):
+    """Prove the status claim stops the second retry, not `filter_new`.
+
+    With dedup disabled, a missing claim shows up immediately as a second deal
+    for the same guest — which is what the operator would actually see.
+    """
+    import storage
+
+    tid = _tenant_with_login(client)
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+        "kind": "lead", "id": "dedup-off-1", "title": "Twice | Emma", "url": "u",
+        "source": "email", "raw": body, "traveler": "Emma", "property_name": "Twice",
+    })
+    # Every item looks brand new, so only the status claim can prevent a second deal.
+    monkeypatch.setattr(storage, "filter_new", lambda t, s, k, items: list(items))
+
+    client.post(f"/inbound/rejected/{rid}/retry")
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    assert len(pipeline.all_deals(tid, SITE)) == 1, "the second retry opened a duplicate deal"
 
 
 def test_a_retry_whose_store_fails_hands_the_row_back(client, monkeypatch):
@@ -417,16 +537,39 @@ def _executed_sql() -> list[str]:
     """
     import ast
 
+    def literal(node):
+        """The SQL text of a node, resolving f-strings built from module constants."""
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.JoinedStr):
+            parts = []
+            for piece in node.values:
+                if isinstance(piece, ast.Constant):
+                    parts.append(str(piece.value))
+                elif isinstance(piece, ast.FormattedValue) and isinstance(piece.value, ast.Name):
+                    # e.g. f"{_SELECT} WHERE ..." — resolve from the live module.
+                    parts.append(str(getattr(inbound_rejects, piece.value.id, "")))
+                else:
+                    return None  # unresolvable: caller must notice, not skip silently
+            return "".join(parts)
+        return None
+
     tree = ast.parse(Path(inbound_rejects.__file__).read_text())
-    out = []
+    calls, out = 0, []
     for node in ast.walk(tree):
         if (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
                 and node.func.attr == "execute"
-                and node.args
-                and isinstance(node.args[0], ast.Constant)
-                and isinstance(node.args[0].value, str)):
-            out.append(node.args[0].value)
+                and node.args):
+            calls += 1
+            sql = literal(node.args[0])
+            assert sql is not None, (
+                f"could not resolve the SQL at line {node.lineno} — this lint would "
+                f"skip it silently, which is how an unportable statement ships"
+            )
+            out.append(sql)
+    # Every execute() must have been read, or the lint is blind to the difference.
+    assert len(out) == calls, f"resolved {len(out)} of {calls} execute() call sites"
     return out
 
 
