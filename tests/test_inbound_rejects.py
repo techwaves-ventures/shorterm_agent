@@ -244,17 +244,162 @@ def test_identical_replays_collapse_onto_one_row(client):
     assert rows[0]["seen_count"] == 3
 
 
-def test_row_count_is_capped_and_keeps_the_newest(client):
+def test_noise_is_shed_at_the_cap_newest_first(client):
+    """The cap still bounds the rows it is allowed to delete.
+
+    This test used to flood with `unparsed` digests and assert "digest 0" was
+    pruned — it encoded the eviction of the oldest unreviewed row as *intended*
+    behaviour, which is exactly the defect (VEN-147). Newest-wins is still the
+    contract, but only over the class the cap may delete: mail that was never
+    ours. Evidence has its own tests below.
+    """
     tid = _tenant()
     total = inbound_rejects.MAX_ROWS_PER_TENANT + 5
     for i in range(total):
-        _post(client, tid, body=f"{DIGEST} ref {i}", subject=f"digest {i}")
+        _post(client, tid, body=f"Newsletter {i}", subject=f"roundup {i}",
+              sender=f"news{i}@some-newsletter.com")
 
     rows = inbound_rejects.open_for_tenant(tid, SITE)
     assert len(rows) == inbound_rejects.MAX_ROWS_PER_TENANT
     subjects = {r["subject"] for r in rows}
-    assert f"digest {total - 1}" in subjects, "newest must be kept"
-    assert "digest 0" not in subjects, "oldest must be pruned"
+    assert f"roundup {total - 1}" in subjects, "newest must be kept"
+    assert "roundup 0" not in subjects, "oldest noise must be pruned"
+
+
+def test_allowed_sender_volume_cannot_delete_the_genuine_lost_lead(client):
+    """VEN-147, the filed defect. Must fail on the pre-fix module.
+
+    FurnishedFinder's own digests arrive *from the allowed sender* and carry no
+    guest name, so they land in the same open `unparsed` bucket as a lead we
+    could not read. The existing junk-at-the-cap test floods from a *foreign*
+    sender, which produces `sender_not_allowed` rows — a different bucket, and
+    that is precisely what made it blind to this. No attacker is needed here,
+    only ordinary mail volume.
+    """
+    tid = _tenant()
+    _post(client, tid, body="A guest wrote and we could not read it.",
+          subject="New enquiry from a real guest")
+    assert inbound_rejects.count_open(tid, SITE) == 1, "precondition: the lead is stored"
+
+    for i in range(inbound_rejects.MAX_ROWS_PER_TENANT + 10):
+        _post(client, tid, body=f"{DIGEST} ref {i}", subject=f"digest {i}")
+
+    subjects = {r["subject"] for r in inbound_rejects.open_for_tenant(tid, SITE)}
+    assert "New enquiry from a real guest" in subjects, (
+        "the genuine lead was deleted by ordinary allowed-sender volume"
+    )
+
+
+def test_a_lead_arriving_into_an_already_full_table_survives(client):
+    """The steady state — the case that matters, and the one that kills ranking fixes.
+
+    The cap only bites when nobody is reviewing, and in that state the table is
+    *already* full of digests when the enquiry arrives. A "reserve slots for the
+    oldest rows" fix passes the ticket's own repro (lead into an empty table) and
+    regresses this one, because when the table is full the oldest rows are old
+    digests, not the lead. Without this test that design looks correct.
+    """
+    tid = _tenant()
+    for i in range(inbound_rejects.MAX_ROWS_PER_TENANT):
+        _post(client, tid, body=f"{DIGEST} early {i}", subject=f"early digest {i}")
+    assert inbound_rejects.count_open(tid, SITE) == inbound_rejects.MAX_ROWS_PER_TENANT
+
+    _post(client, tid, body="A guest wrote and we could not read it.",
+          subject="New enquiry from a real guest")
+
+    for i in range(inbound_rejects.MAX_ROWS_PER_TENANT + 10):
+        _post(client, tid, body=f"{DIGEST} late {i}", subject=f"late digest {i}")
+
+    subjects = {r["subject"] for r in inbound_rejects.open_for_tenant(tid, SITE)}
+    assert "New enquiry from a real guest" in subjects, (
+        "the lead was deleted by digests that arrived after it"
+    )
+
+
+def test_evidence_never_deleted_does_not_mean_storage_is_unbounded(client):
+    """The bound must still be *enforced*, not merely survivable.
+
+    `dashboard.py` swallows every exception from `record()`, so a `_prune` that
+    raises on each call deletes nothing and looks exactly like a working fix:
+    the lead survives. Asserting the lead survived is therefore not enough — a
+    crash passes it. This asserts the shedding mechanism actually ran.
+    """
+    tid = _tenant()
+    _post(client, tid, body="A guest wrote and we could not read it.",
+          subject="New enquiry from a real guest")
+
+    for i in range(300):
+        _post(client, tid, body=f"Newsletter {i}", subject=f"roundup {i}",
+              sender=f"news{i}@some-newsletter.com")
+
+    assert inbound_rejects.count_all(tid, SITE) <= inbound_rejects.MAX_ROWS_PER_TENANT, (
+        "non-evidence was not shed — the cap is not being enforced at all"
+    )
+    subjects = {r["subject"] for r in inbound_rejects.open_for_tenant(tid, SITE)}
+    assert "New enquiry from a real guest" in subjects
+
+
+def test_at_the_ceiling_a_new_row_is_refused_and_nothing_held_is_destroyed(client, monkeypatch):
+    """The chosen failure posture: refuse new, never destroy captured.
+
+    The ceiling is driven down rather than posting 1000 messages — the branch
+    under test is `>= MAX_UNREVIEWED`, the same code at any value.
+    `test_the_ceiling_must_leave_room_above_the_soft_cap` guards the real one.
+    """
+    monkeypatch.setattr(inbound_rejects, "MAX_UNREVIEWED", 5)
+    tid = _tenant()
+    _post(client, tid, body="A guest wrote and we could not read it.",
+          subject="New enquiry from a real guest")
+    for i in range(4):
+        _post(client, tid, body=f"{DIGEST} ref {i}", subject=f"digest {i}")
+    assert inbound_rejects.count_open(tid, SITE) == 5, "precondition: at the ceiling"
+
+    _post(client, tid, body=f"{DIGEST} over", subject="one too many")
+
+    subjects = {r["subject"] for r in inbound_rejects.open_for_tenant(tid, SITE)}
+    assert "one too many" not in subjects, "past the ceiling a new row must be refused"
+    assert "New enquiry from a real guest" in subjects, (
+        "the row already held was destroyed to make room — the VEN-147 defect"
+    )
+    assert inbound_rejects.count_all(tid, SITE) == 5, "the ceiling must bound storage"
+
+    # Self-healing: reviewing a row reclassifies it and frees a slot.
+    rid = [r for r in inbound_rejects.open_for_tenant(tid, SITE)
+           if r["subject"] == "digest 0"][0]["id"]
+    assert inbound_rejects.dismiss(tid, SITE, rid)
+    _post(client, tid, body=f"{DIGEST} after review", subject="admitted after review")
+    subjects = {r["subject"] for r in inbound_rejects.open_for_tenant(tid, SITE)}
+    assert "admitted after review" in subjects, "reviewing a row must free a slot"
+
+
+def test_a_guest_resending_is_never_turned_away_at_the_ceiling(client, monkeypatch):
+    """A replay is an UPDATE, not growth — and re-sending signals a real lead."""
+    monkeypatch.setattr(inbound_rejects, "MAX_UNREVIEWED", 3)
+    tid = _tenant()
+    _post(client, tid, body="A guest wrote and we could not read it.",
+          subject="New enquiry from a real guest")
+    for i in range(2):
+        _post(client, tid, body=f"{DIGEST} ref {i}", subject=f"digest {i}")
+    assert inbound_rejects.count_open(tid, SITE) == 3, "precondition: at the ceiling"
+
+    _post(client, tid, body="A guest wrote and we could not read it.",
+          subject="New enquiry from a real guest")
+
+    row = [r for r in inbound_rejects.open_for_tenant(tid, SITE)
+           if r["subject"] == "New enquiry from a real guest"][0]
+    assert row["seen_count"] == 2, "a re-forward at the ceiling was turned away"
+    assert inbound_rejects.count_all(tid, SITE) == 3
+
+
+def test_the_ceiling_must_leave_room_above_the_soft_cap():
+    """Setting the two equal silently re-creates the steady-state regression.
+
+    With `MAX_UNREVIEWED == MAX_ROWS_PER_TENANT`, a table already full of
+    unreviewed digests refuses the genuine lead *at the door* — worse than the
+    behaviour this fix replaced, which at least captured it. The headroom is the
+    whole reason refuse-new is an improvement rather than a relabelling.
+    """
+    assert inbound_rejects.MAX_UNREVIEWED > inbound_rejects.MAX_ROWS_PER_TENANT
 
 
 def test_junk_at_the_cap_cannot_evict_the_genuine_lost_lead(client):
@@ -374,6 +519,28 @@ def test_settings_states_what_happened_including_when_nothing_was_lost(client):
     # Must not claim everything was understood — one was dismissed unread.
     assert "every forwarded email so far has been understood" not in page
     assert "nothing unread right now" in page
+
+
+def test_settings_says_so_when_the_queue_is_full_and_stays_quiet_when_it_is_not(client, monkeypatch):
+    """A refusal the host cannot see is the same silent loss as a deletion.
+
+    Both states are asserted: a banner that renders unconditionally would pass a
+    one-sided check while telling every host their queue is full.
+    """
+    monkeypatch.setattr(inbound_rejects, "MAX_UNREVIEWED", 2)
+    tid = _tenant_with_login(client)
+    config.save_settings(tid, ingest_mode="email")
+
+    _post(client, tid, body="A guest wrote and we could not read it.",
+          subject="New enquiry from a real guest")
+    page = client.get("/settings").get_data(as_text=True)
+    assert "being turned away" not in page, "warned about a queue that is not full"
+
+    _post(client, tid, body=f"{DIGEST} ref 1", subject="digest 1")
+    assert inbound_rejects.count_unreviewed(tid, SITE) == 2, "precondition: at the ceiling"
+    page = client.get("/settings").get_data(as_text=True)
+    assert "being turned away" in page
+    assert "unread list is full (2" in page, "the ceiling must be the real one"
 
 
 def test_the_banner_reports_the_actual_count(client):
