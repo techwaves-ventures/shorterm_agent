@@ -169,9 +169,63 @@ def test_a_prose_fragment_is_rejected_where_a_name_was_expected(junk):
     "emma m.", "mary smith", "EMMA M.",
     "Emma M. (verified)", "Emma (Travel Nurse)", "Emma M. | RN",
     "Dana R. – Traveler", "Emma & John S.",
+    # These were rejected by the first version of this guard: its prose
+    # blocklist held "will", "an", "or", "new" and "sent", every one of which
+    # is also somebody's given name. Each collision silently cost a real lead.
+    "Will Smith", "An Nguyen", "Or Levi", "New Guest", "Sent Kumar",
+    "van der Berg", "O'Brien", "José Müller",
 ])
 def test_a_real_name_still_parses(real):
     assert ff_email._only_if_a_name(real) == real
+
+
+@pytest.mark.parametrize("name", ["Will Smith", "An Nguyen", "Or Levi"])
+def test_a_name_that_collides_with_a_function_word_is_not_dropped(name):
+    """The unit check above is not enough. Rejection only hurts because `parse`
+    then returns None and `inbound.accept` answers 202: the guest's enquiry is
+    gone and the provider never retries."""
+    item = ff_email.parse("New message", WRAPPER.format(
+        tenant=name, received="Aug 15, 2026", body="Is it still available?"))
+    assert item is not None, f"{name!r} was rejected and the lead was lost"
+    assert item["sender"] == name
+
+
+def test_an_occupancy_count_is_not_read_as_the_guests_name():
+    """`Travelers: 3` must not match the `traveler` label and yield "s: 3".
+
+    The label alternation was unbounded, so it matched the prefix of the longer
+    word. Two unrelated guests both came out named "s: 3" — one shared
+    thread_key *and* one shared item id, so the second was discarded as already
+    seen. That is the defect this guard exists to prevent, reintroduced by it.
+    """
+    nameless = ("You have a new message.\n\nProperty: Quiet Home\n"
+                "Travelers: 3\nDate received: 8/15/26\n\nIs it available?\n")
+    assert ff_email._wrapper_name(nameless) == ""
+
+    with_name = ("You have a new message.\n\nProperty: Quiet Home\n"
+                 "Traveler: Emma M.\nTravelers: 3\n"
+                 "Date received: 8/15/26\n\nIs it available?\n")
+    assert ff_email._wrapper_name(with_name) == "Emma M."
+
+
+@pytest.mark.parametrize("junk", ["s: 3", "3", "2", "Travelers: 3"])
+def test_a_field_fragment_is_never_accepted_as_a_name(junk):
+    assert ff_email._only_if_a_name(junk) == ""
+
+
+def test_two_guests_with_an_occupancy_line_do_not_share_a_thread():
+    """The end-to-end symptom: identical thread_key and identical item id."""
+    tmpl = ("You have a new message.\n\nProperty: Quiet Home\n"
+            "Traveler: {who}\nTravelers: 3\n"
+            "Date received: 8/15/26\n\nIs it available?\n")
+    # Both names have to be ones the guard rejected, or the collision doesn't
+    # happen: a name that parses cleanly never falls through to `Travelers`.
+    a = ff_email.parse("New message", tmpl.format(who="Will Smith"))
+    b = ff_email.parse("New message", tmpl.format(who="An Nguyen"))
+    assert a and b
+    assert a["sender"] != b["sender"]
+    assert a["id"] != b["id"], "the second guest was discarded as already seen"
+    assert pipeline.thread_key(a) != pipeline.thread_key(b)
 
 
 def test_a_real_name_survives_the_whole_parse(tenant):

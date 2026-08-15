@@ -328,7 +328,8 @@ def _name_line_re(labels: tuple) -> re.Pattern:
     the provider never retries.
     """
     return re.compile(
-        rf"^[ \t>*|·-]*(?:{'|'.join(labels)})[ \t]*:?[ \t]*(?:\r?\n[ \t]*){{0,2}}(.+)$",
+        rf"^[ \t>*|·-]*(?:{'|'.join(labels)})(?![^\W\d_])"
+        rf"[ \t]*:?[ \t]*(?:\r?\n[ \t]*){{0,2}}(.+)$",
         re.I | re.M,
     )
 
@@ -339,12 +340,19 @@ _SENDER_NAME_LINE = _name_line_re(_SENDER_LABELS)
 # Function words that open a sentence but never a name. Used only to spot a
 # labelled value that is really prose — deliberately a *small* list, because the
 # cost of a false positive here is a silently discarded lead.
+#
+# Every entry has to survive one question: is it also somebody's given name?
+# "Will", "An", "Or", "New" and "Sent" were all in this list and all rejected a
+# real guest ("Will Smith", "An Nguyen", "Or Levi"), so they are gone. That is
+# the whole reason this test is additionally gated on the word being lower-case
+# as written: a blocklist of English function words will always collide with
+# some name somewhere, and the collision must not be what decides.
 _PROSE_OPENERS = frozenset(
-    ("a", "an", "the", "this", "that", "these", "those", "your", "our", "my",
+    ("a", "the", "this", "that", "these", "those", "your", "our", "my",
      "his", "her", "their", "its", "about", "regarding", "from", "with", "for",
-     "and", "or", "but", "is", "are", "was", "were", "has", "have", "had",
-     "will", "would", "can", "could", "please", "you", "we", "they", "he",
-     "she", "it", "i", "there", "here", "new", "sent", "sends", "wants",
+     "and", "but", "is", "are", "was", "were", "has", "have", "had",
+     "would", "can", "could", "please", "you", "we", "they", "he",
+     "she", "it", "there", "here",
      "interested", "replied", "message", "messages"))
 
 
@@ -381,14 +389,24 @@ def _only_if_a_name(value: str) -> str:
     v = (value or "").split("\n")[0].strip().strip("·|-").strip()
     if not v or "@" in v or len(v) > 60:
         return ""
+    # A colon means the label pass ran into a *different* field, not a name —
+    # "Travelers: 3" yielding "s: 3" is how two guests last shared a thread.
+    if ":" in v:
+        return ""
     words = v.split()
     # A sentence, not a name. Six allows "Juan Carlos de la Cruz Rodriguez".
     if not 1 <= len(words) <= 6:
         return ""
-    # Bare punctuation — the tail of a sentence the label matched into.
-    if not re.search(r"\w", v, re.U):
+    # No letters at all — bare punctuation, or an occupancy count like "3".
+    # `\w` is not enough here: it accepts digits.
+    if not re.search(r"[^\W\d_]", v, re.U):
         return ""
-    if words[0].strip(".,;:!?").lower() in _PROSE_OPENERS:
+    first = words[0].strip(".,;:!?")
+    # Only prose if it *reads* as prose. A capitalised first word is taken as a
+    # name even when it collides with a function word, because dropping "Will
+    # Smith" loses his enquiry silently and forever, while accepting a stray
+    # capitalised word costs one odd-looking thread_key.
+    if first.lower() in _PROSE_OPENERS and first[:1] == first[:1].lower():
         return ""
     return v
 
