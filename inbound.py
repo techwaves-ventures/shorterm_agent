@@ -208,56 +208,75 @@ def extract_body(payload: dict) -> str:
 # would leak that content into the stored body.
 _SCRIPT_OPEN_RE = re.compile(r"(?i)<(script|style)")
 
-# Closers, matched case-insensitively by the regex engine rather than by
-# lowercasing the input. `str.lower()` is not length-preserving — U+0130
-# (`İ`, Turkish dotted capital I) lowercases to two characters, and it is the
-# only codepoint in Unicode that does. Searching a lowercased copy and then
-# using the hit as an index into the *original* therefore drifts one character
-# per `İ` seen, which silently ate real text, moved `_body_fingerprint`, and
-# could overshoot a whole element so the next `<script>` was never stripped.
-_SCRIPT_CLOSE_RE = {
-    "script": re.compile(r"(?i)</script>"),
-    "style": re.compile(r"(?i)</style>"),
-}
+# The whole element, byte-for-byte the pattern this file used before the
+# linearity work, and the *only* thing that decides where an element ends.
+#
+# It is kept as a backreference on purpose. `re` compares a backreference under
+# IGNORECASE with **simple** (1:1) case mapping but compares a **literal** with
+# **extended** folding, and the two disagree:
+#
+#     re.search(r"(?i)(s)\1", "sſ")  -> None   (backreference: ſ is not s)
+#     re.search(r"(?i)s",     "ſ")   -> match  (literal:       ſ is s)
+#
+# So `</script>` as a literal, or `group(1).lower()` as a dict key, both admit
+# openers and closers this file historically did not — `<ſcript>`, `<scrİpt>`,
+# `<ſtyle>`. Earlier attempts here re-derived the fold by hand (first a
+# lowercased copy indexed back into the original, then a case-insensitive
+# literal) and each was wrong in a new way. Letting the engine do the
+# comparison is what makes equivalence structural instead of argued.
+_SCRIPT_ELEMENT_RE = re.compile(r"(?is)<(script|style).*?</\1>")
 
 
 def _script_spans(value: str) -> list[tuple[int, int]]:
     """Extent of each <script>/<style> element that is actually closed.
 
-    An unclosed one yields nothing, which is what the previous
-    `<(script|style).*?</\\1>` did too: it also required the closing tag before
-    it would strip anything.
+    An unclosed one yields nothing, which is what a bare
+    `re.sub(<(script|style).*?</\\1>)` did too: it also required the closing tag
+    before it would strip anything.
 
-    Matches that pattern span for span. The lazy `.*?` stopped at the *nearest*
-    following `</script>`, which is what `find` returns, and after a match the
-    engine resumed at the match end rather than rescanning it.
+    Matches that sub() span for span, because it runs the very same pattern —
+    the only difference is *where* it is allowed to start. `sub()` re-tries the
+    pattern at every offset, which is what made `"<script" * n` quadratic; here
+    the openers are located first and the pattern is anchored at each one, with
+    a failed match remembered so it is not retried for the same spelling.
     """
     spans: list[tuple[int, int]] = []
-    # A kind whose closer has already been searched for and not found. The
-    # search only ever runs at non-decreasing offsets, so once `</script>` is
-    # absent from the rest of the input it is absent for every later opener.
-    # Without this, `"<script" * n` searched to end-of-input from each of the
-    # n openers and stayed O(n^2) — the very shape being fixed.
+    # Opener spellings already searched for and found to have no closer in the
+    # rest of the input. Matching only ever runs at non-decreasing offsets, so
+    # once an element with this opener fails to close it fails for every later
+    # opener spelled the same way. Without this, `"<script" * n` re-scanned to
+    # end-of-input from each of the n openers and stayed O(n^2) — the shape
+    # being fixed.
+    #
+    # Keyed by `str.lower()`, which is safe *as a cache key* even though it is
+    # not the engine's fold: two spellings can only share a key if they lower
+    # to the same string, and equal `lower()` implies equal simple-fold, so a
+    # key never merges two genuinely different closer requirements. It can
+    # split one (`İ` lowers to two chars), which only costs an extra search.
+    # The opener alternation admits a fixed, finite set of spellings, so the
+    # number of distinct keys is bounded by a constant and this stays linear.
     exhausted: set[str] = set()
     pos = 0
     while True:
         m = _SCRIPT_OPEN_RE.search(value, pos)
         if not m:
             return spans
-        kind = m.group(1).lower()
-        if kind in exhausted:
+        if m.group(1).lower() in exhausted:
             pos = m.end()
             continue
-        close = _SCRIPT_CLOSE_RE[kind].search(value, m.end())
-        if close is None:
+        # Anchored at the opener, so the engine tries this one position and
+        # lazily expands to the nearest closer *it* considers a backreference
+        # match. Same pattern, same starting offset, same result as the sub().
+        element = _SCRIPT_ELEMENT_RE.match(value, m.start())
+        if element is None:
             # No closer for this opener, so the old regex reported no match
             # here either. Resume past it: an opener cannot begin inside
             # another opener, so nothing is skipped by not backing up.
-            exhausted.add(kind)
+            exhausted.add(m.group(1).lower())
             pos = m.end()
             continue
-        spans.append((m.start(), close.end()))
-        pos = close.end()
+        spans.append((element.start(), element.end()))
+        pos = element.end()
 
 
 def _strip_tags(text: str) -> str:

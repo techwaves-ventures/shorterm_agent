@@ -35,6 +35,7 @@ Verified against `6f62a57`: every cost test below fails there (ratios ~4x), and
 every equality test passes there — the equality tests are pinning behaviour the
 fix must preserve, not behaviour it introduces.
 """
+import itertools
 import json
 import os
 import tempfile
@@ -298,6 +299,74 @@ def test_message_item_id_is_unchanged_by_a_dotted_capital_i():
     assert "p>Message" not in body
     item = ff_email.parse("New message from İlker", body)
     assert item["id"] == "533bfdca296f208a"
+
+
+# `re` compares a backreference under IGNORECASE with *simple* (1:1) case
+# mapping, but compares a *literal* with *extended* folding:
+#
+#     re.search(r"(?i)(s)\1", "sſ")  -> None    (backreference)
+#     re.search(r"(?i)s",     "ſ")   -> match   (literal)
+#
+# `_SCRIPT_OPEN_RE` is a literal, so it matches `<ſcript`, `<scrİpt`, `<scrıpt`
+# and `<ſtyle`. A fix that located the closer with a literal `(?i)</script>`,
+# or that keyed a dict on `group(1).lower()`, therefore disagreed with the
+# `</\1>` this file shipped with — it raised KeyError on the lookup (and
+# `dashboard.py` turns that into a logged 202, losing the mail), and it ended
+# spans early at a closer base did not accept, leaking element content into the
+# stored body. Expected values below are what 6f62a57 produces.
+
+@pytest.mark.parametrize("html,expected", [
+    # KeyError shapes: the opener matches but `group(1).lower()` is no key.
+    ("<p>hi</p><ſcript>SECRET=1</ſcript>", " hi\n "),
+    ("<p>hi</p><scrİpt>SECRET=2</script>", " hi\n "),
+    # Base does *not* accept `</script>` as the closer for `<scrıpt>` (U+0131
+    # has no simple uppercase to `I`), so this content survives on base too.
+    # Pinned as-is: the point is equivalence, not improvement.
+    ("<p>hi</p><scrıpt>SECRET=3</script>", " hi\n SECRET=3 "),
+    ("<p>hi</p><ſtyle>SECRET=4</style>", " hi\n SECRET=4 "),
+    # An unclosed exotic opener needs no closer at all to reach the lookup.
+    ("<p>hi</p><scrİpt SECRET=5", " hi\n<scrİpt SECRET=5"),
+    # Span-end shapes: `(?i)</script>` matches `</ſcript>`, `</\1>` does not,
+    # so an early stop leaks the rest of the element.
+    ("<script>var s=1</ſcript>SECRET_TOKEN=9</script><p>hi</p>", " hi\n"),
+    ("<style>a{}</ſtyle>SECRET_CSS</style><p>hi</p>", " hi\n"),
+])
+def test_exotic_case_folds_in_a_tag_name_match_base(html, expected):
+    assert inbound.extract_body({"html": html}) == expected
+
+
+def test_an_exotic_opener_does_not_raise_through_the_route(monkeypatch):
+    """The KeyError was invisible: `dashboard.py` catches bare `Exception`,
+    logs, and still answers 202, so the mail is accepted-and-lost with no
+    user-visible signal. Assert the parse itself does not raise.
+    """
+    for name in ("ſcript", "scrİpt", "scrıpt", "ſtyle"):
+        html = "<p>Message: hi</p><%s>x" % name
+        inbound.extract_body({"html": html})  # must not raise
+
+
+def test_many_distinct_opener_spellings_stay_linear():
+    """The closer cache is keyed by `str.lower()`, which is not the engine's
+    fold, so this pins the reason that is still safe: the opener alternation
+    admits a fixed, finite set of spellings (64 for `script`), so the number of
+    distinct keys is bounded by a constant and the scan stays linear. Base is
+    quadratic on this shape (~4x per doubling, 2.5 s at n=8000).
+    """
+    variants = ["<" + "".join(c)
+                for c in itertools.product(*[(ch.lower(), ch.upper())
+                                             for ch in "script"])]
+    assert len(variants) == 64
+
+    def build(n):
+        return "".join(variants[i % len(variants)] for i in range(n // 7))
+
+    small = _best(inbound._strip_html, build(16_000))
+    large = _best(inbound._strip_html, build(64_000))
+    ratio = large / small if small else 0
+    assert ratio < 8.0, (
+        f"64 distinct opener spellings: 4x the input cost {ratio:.1f}x the "
+        f"time — still superlinear ({small * 1000:.1f}ms -> "
+        f"{large * 1000:.1f}ms)")
 
 
 # --- the size cap ---------------------------------------------------------
