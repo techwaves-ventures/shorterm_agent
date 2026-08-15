@@ -382,7 +382,7 @@ offset out for the rest of their (short) life:
   extra hop after the upgrade.
 
 This is bounded and self-healing — every row is rewritten in the new frame the
-next time it is scheduled — and step 2 above (drain the queue before cutting
+next time it is scheduled — and step 1 above (drain the queue before cutting
 over) avoids it entirely. **On a UTC fleet none of it applies:** the old local
 frame and the new UTC frame are the same values.
 
