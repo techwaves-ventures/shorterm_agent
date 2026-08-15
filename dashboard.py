@@ -356,6 +356,23 @@ def inbound_email():
     mail providers retry on non-2xx, which would replay a message we already
     deliberately rejected.
     """
+    # Measured first, before anything reads `request.form` or `get_json`.
+    #
+    # `content_length` is None when the provider streams the body with chunked
+    # transfer-encoding, and `or 0` collapsed "unknown" into "empty" — so the
+    # size check in `accept` skipped itself and a 1.9 MB body sent chunked
+    # reached the parser while the identical body sent with the header was
+    # rejected. Falling back to the bytes actually read closes that.
+    #
+    # The ordering is the whole trick: form and multipart parsing drains the
+    # stream, after which `get_data` returns empty and the fallback silently
+    # yields 0 again — which is what the mail providers we target actually
+    # POST. Reading (and caching) the body up front leaves form parsing below
+    # working off the cache, so every content type gets a real measurement.
+    raw_size = request.content_length
+    if raw_size is None:
+        raw_size = len(request.get_data(cache=True))
+
     supplied = (
         request.headers.get("X-Inbound-Secret")
         or request.args.get("secret")
@@ -364,9 +381,7 @@ def inbound_email():
     )
     payload = request.get_json(silent=True) or request.form.to_dict() or {}
     try:
-        tenant_id, item = inbound.accept(
-            payload, supplied, raw_size=request.content_length or 0
-        )
+        tenant_id, item = inbound.accept(payload, supplied, raw_size=raw_size)
     except inbound.Rejected as e:
         app.logger.warning("Inbound email rejected: %s", e)
         return ("", 202)
