@@ -234,6 +234,26 @@ def test_dashboard_banner_appears_only_when_something_was_lost(client):
     assert "/inbound/rejected" in page
 
 
+def test_settings_states_what_happened_including_when_nothing_was_lost(client):
+    """A host can only trust "nothing was lost" if it is stated, not implied by silence."""
+    tid = _tenant_with_login(client)
+    config.save_settings(tid, ingest_mode="email")
+
+    page = client.get("/settings").get_data(as_text=True)
+    assert "every forwarded email so far has been understood" in page
+
+    _post(client, tid)
+    page = client.get("/settings").get_data(as_text=True)
+    assert "1 forwarded email" in page and "couldn't be read" in page
+
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+    client.post(f"/inbound/rejected/{rid}/dismiss")
+    page = client.get("/settings").get_data(as_text=True)
+    # Must not claim everything was understood — one was dismissed unread.
+    assert "every forwarded email so far has been understood" not in page
+    assert "nothing unread right now" in page
+
+
 def test_stored_content_is_escaped_not_executed(client):
     """The body is attacker-influenced and rendered into the operator's browser."""
     tid = _tenant_with_login(client)
