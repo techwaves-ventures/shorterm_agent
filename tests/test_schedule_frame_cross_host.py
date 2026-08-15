@@ -25,6 +25,7 @@ import config
 import outbox
 import pipeline
 import responder
+import scheduler
 import sequences
 import storage
 
@@ -338,13 +339,18 @@ def test_run_due_drafts_on_every_reader_host(db_tenant, no_quiet_hours, writer_t
 # --- the zone the clamp computes in (VEN-141, pinned here so it cannot drift) --
 
 
+PROPERTY_ZONE = "America/Los_Angeles"
+
+
 @pytest.mark.xfail(
     strict=True,
-    reason="VEN-141: _clamp_quiet_hours computes in the server's zone, not the "
-           "property's, so a send clamped to 08:00 on the dyno lands at 01:00 "
-           "where the guest is. Strict: this must go red the day VEN-141 lands.",
+    reason="VEN-141: _clamp_quiet_hours computes in the host's zone, not the "
+           "property's, so a send that looks like daytime on the dyno lands at "
+           "03:00 where the guest is. Strict, and driven through "
+           "automation.reschedule on a tenant whose property zone IS configured, "
+           "so any fix that threads that zone into the clamp makes this XPASS.",
 )
-def test_quiet_hours_clamp_uses_the_property_zone():
+def test_quiet_hours_clamp_uses_the_property_zone(db_tenant):
     """Quiet hours are a claim about the wall clock the *guest* reads.
 
     Every other test in this file takes the clamp out of the picture with
@@ -356,9 +362,20 @@ def test_quiet_hours_clamp_uses_the_property_zone():
     VEN-134 moved *storage* to one absolute frame and deliberately left the clamp
     a local computation; deciding which local zone that is belongs to VEN-141.
     The consequence is visible in the dashboard today: `sched_local` renders in
-    the property zone, so a send the clamp believes is safely at 08:00 displays
-    as 01:00 — the product contradicting its own "an automated 3am message reads
-    as a bot" promise (`sequences.py`).
+    the property zone, so a send the clamp believes is safely daytime displays as
+    03:00 — the product contradicting its own "an automated 3am message reads as
+    a bot" promise (`sequences.py`).
+
+    **Why this drives `automation.reschedule` rather than calling
+    `sequences.next_send_time` directly.** An xfail is only a tripwire if it
+    exercises the path the future fix will alter. `next_send_time(dt)` takes a
+    bare datetime and knows no tenant, so a VEN-141 fix that threads the
+    property zone through cannot reach it: the test would keep xfailing after
+    the defect was gone, and even a required-argument signature change is
+    swallowed by the xfail as just another way to fail. `reschedule` is the real
+    entry point, it carries `tenant_id`, and `scheduler.tz_for` — the accessor
+    the dashboard already renders through (`dashboard.py`) — resolves that
+    tenant's zone. Configuring the zone here is what makes the fix observable.
 
     The host zone is pinned rather than inherited: on a host that happens to run
     in the property's own zone the clamp is accidentally right, this would XPASS,
@@ -367,22 +384,42 @@ def test_quiet_hours_clamp_uses_the_property_zone():
     """
     import timeframe
 
-    prop = ZoneInfo("America/Los_Angeles")
+    prop = ZoneInfo(PROPERTY_ZONE)
+    config.save_settings(db_tenant, timezone=PROPERTY_ZONE)
+    # If this regresses the test still xfails, but for the wrong reason — the
+    # fix would have nowhere to read the zone from. Assert the precondition.
+    assert scheduler.tz_for(db_tenant) == prop, \
+        "the property zone must actually be configured for this to test anything"
+
+    pipeline.ensure(db_tenant, SITE, {"id": "L1", "title": "lead"}, {}, [])
+
     with host_tz("UTC") as offset:
         assert offset == timedelta(0), "host zone must be pinned for this to mean anything"
-        # 03:00 where the property is, expressed as the host wall clock that
-        # `next_send_time` actually takes. On 2026-09-01 LA is PDT (UTC-7), so
-        # this is 10:00 on the dyno — already "daytime" to a server-zone clamp,
-        # which is exactly why it sails through unclamped.
-        three_am_at_the_property = datetime(2026, 9, 1, 3, 0, tzinfo=prop)
-        as_the_host_reads_it = three_am_at_the_property.astimezone().replace(tzinfo=None)
-        scheduled = sequences.next_send_time(as_the_host_reads_it)
+        # followup_1 fires 48h after last_contact_at, so the send lands at
+        # 2026-09-01 10:00 on the dyno. On that date LA is PDT (UTC-7), making
+        # it 03:00 where the guest is: already "daytime" to a host-zone clamp,
+        # which is exactly why it sails through unclamped today.
+        #
+        # The anchor is `last_contact_at` rather than the intro step's
+        # `inquiry_at` because `pipeline.update` silently drops any field
+        # outside its allow-list, and `inquiry_at` is not on it. Writing it
+        # would be a no-op, `_anchor_dt` would fall back to *now*, and the test
+        # would then quietly XPASS whenever the suite happened to run between
+        # 15:00 and 20:00 UTC — a strict xfail turning red on the clock rather
+        # than on the defect.
+        pipeline.update(db_tenant, SITE, "L1", sequence="presale", step_index=1,
+                        last_contact_at="2026-08-30T10:00:00")
+        assert pipeline.get(db_tenant, SITE, "L1")["last_contact_at"].startswith(
+            "2026-08-30T10:00"), "the anchor write was dropped; see the note above"
+        automation.reschedule(db_tenant, SITE, "L1")
 
+    scheduled = pipeline.get(db_tenant, SITE, "L1")["next_action_at"]
+    assert scheduled, "reschedule must have produced a due time"
     at_the_property = timeframe.to_zone(scheduled, prop)
     assert sequences.QUIET_START.hour <= at_the_property.hour <= sequences.QUIET_END.hour, (
-        f"a send at 03:00 property-local was stored as {scheduled}Z, which is "
-        f"{at_the_property:%H:%M} where the guest is — the clamp ran in the "
-        f"server's zone")
+        f"a send anchored at 03:00 property-local was stored as {scheduled}Z, "
+        f"which is {at_the_property:%H:%M} where the guest is — the clamp ran in "
+        f"the host's zone")
 
 
 def test_norm_ts_leaves_schedule_frame_stamps_alone():
