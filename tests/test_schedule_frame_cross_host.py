@@ -191,6 +191,88 @@ def test_worker_work_list_agrees_across_reader_hosts(db_tenant, no_quiet_hours, 
 
 
 @pytest.mark.parametrize("writer_tz", ZONES)
+def test_approve_and_send_releases_on_every_reader_host(db_tenant, no_quiet_hours,
+                                                        writer_tz):
+    """The ticket's headline flow: a host clicks Approve & send on the dashboard
+    and a worker elsewhere is supposed to deliver it.
+
+    Approving pulls a future `scheduled_at` forward to "now" — every route into
+    QUEUED is an explicit go-now. If that release stamp is the approving host's
+    wall clock, a westward drainer still reads it as future and the operator
+    watches a message they were told was sent go nowhere for hours.
+    """
+    msg = _queue(db_tenant, "held", "2099-01-01T09:00:00")
+    with host_tz(writer_tz) as offset:
+        assert offset is not None
+        outbox.set_status(msg["id"], outbox.QUEUED)
+
+    released = {}
+    for reader_tz in ZONES:
+        with host_tz(reader_tz) as offset:
+            assert offset is not None
+            picked = outbox.next_queued(db_tenant)
+            released[reader_tz] = bool(picked and picked["id"] == msg["id"])
+    assert all(released.values()), (
+        f"approved on {writer_tz} (release stamp "
+        f"{outbox.get(msg['id'])['scheduled_at']}); still withheld by "
+        f"{[z for z, ok in released.items() if not ok]}")
+
+
+@pytest.mark.parametrize("writer_tz", ZONES)
+def test_send_now_with_no_explicit_schedule_agrees_across_hosts(db_tenant, writer_tz):
+    """`automation.enqueue_send` (the dashboard's own Send button) queues without
+    naming a time, so `outbox.add` supplies one. That default is a write like any
+    other and has to be in the same frame as the gate that reads it."""
+    with host_tz(writer_tz) as offset:
+        assert offset is not None
+        msg = outbox.add(db_tenant, SITE, "adhoc", sequence="presale",
+                         step_id="intro", step_label="First reply", body="hi",
+                         auto=True, reason="test")  # no scheduled_at
+
+    released = {}
+    for reader_tz in ZONES:
+        with host_tz(reader_tz) as offset:
+            assert offset is not None
+            picked = outbox.next_queued(db_tenant)
+            released[reader_tz] = bool(picked and picked["id"] == msg["id"])
+    assert all(released.values()), (
+        f"queued on {writer_tz} with no explicit time "
+        f"({outbox.get(msg['id'])['scheduled_at']}); withheld by "
+        f"{[z for z, ok in released.items() if not ok]}")
+
+
+@pytest.mark.parametrize("writer_tz", ZONES)
+def test_sequence_step_schedule_agrees_across_reader_hosts(db_tenant, no_quiet_hours,
+                                                           writer_tz):
+    """The follow-up cadence goes through `sequences.due_at`, not
+    `next_send_time` — a different writer, the same frame requirement.
+
+    `automation.reschedule` is the real entry point, so this covers the path a
+    deal actually takes after each contact.
+    """
+    pipeline.ensure(db_tenant, SITE, {"id": "L1", "title": "lead"}, {}, [])
+    # followup_1 fires 48h after last contact; put that 1h in the past.
+    anchor = datetime.now() - timedelta(hours=49)
+    pipeline.update(db_tenant, SITE, "L1", sequence="presale", step_index=1,
+                    last_contact_at=anchor.isoformat(timespec="seconds"))
+
+    with host_tz(writer_tz) as offset:
+        assert offset is not None
+        automation.reschedule(db_tenant, SITE, "L1")
+    scheduled = pipeline.get(db_tenant, SITE, "L1")["next_action_at"]
+    assert scheduled, "reschedule must have produced a due time"
+
+    verdicts = {}
+    for reader_tz in ZONES:
+        with host_tz(reader_tz) as offset:
+            assert offset is not None
+            verdicts[reader_tz] = db_tenant in pipeline.tenants_with_due()
+    assert len(set(verdicts.values())) == 1, (
+        f"writer={writer_tz} scheduled followup_1 at {scheduled}; workers "
+        f"disagree on whether it is due: {verdicts}")
+
+
+@pytest.mark.parametrize("writer_tz", ZONES)
 def test_run_due_drafts_on_every_reader_host(db_tenant, no_quiet_hours, writer_tz, monkeypatch):
     """The second gate: `tenants_with_due` picks the tenant, `automation._due`
     then re-checks each deal. Leaving that one in host-local frame makes the
