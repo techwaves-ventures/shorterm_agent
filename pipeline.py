@@ -78,8 +78,7 @@ _ADDED_COLS = (
 )
 
 
-def _conn() -> db.Conn:
-    c = db.connect()
+def _ddl(c) -> None:
     c.execute(
         """CREATE TABLE IF NOT EXISTS deals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,6 +127,16 @@ def _conn() -> db.Conn:
         "CREATE INDEX IF NOT EXISTS deals_tenant_stage "
         "ON deals (tenant_id, site, stage, inquiry_at)"
     )
+
+
+def _conn() -> db.Conn:
+    c = db.open_with_schema("pipeline", _ddl)
+    # Deliberately NOT inside _ddl: this opens a second connection of its own.
+    # Nested under an uncommitted ALTER on Postgres it waits for a lock held by
+    # a transaction that is itself idle waiting on its client — no cycle, so the
+    # deadlock detector never fires and the process hangs at boot forever. By
+    # here the schema is committed and `c` has issued no statement, so it holds
+    # no locks for the nested connection to block on.
     _normalize_legacy_timestamps()
     return c
 

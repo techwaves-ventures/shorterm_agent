@@ -16,10 +16,17 @@ Why this shape: the existing modules (storage/models/config/billing/ff_account/
 waitlist) each open their own connection and CREATE TABLE IF NOT EXISTS lazily.
 Keeping that pattern — but pointing it at db.connect() — means the Postgres path
 is a small, centralized surface rather than a rewrite of every query.
+
+Schema creation goes through open_with_schema() rather than running the DDL on
+the caller's own connection. On SQLite the lazy-every-time behavior is kept
+exactly; on Postgres running DDL inside the caller's transaction deadlocks two
+concurrent writers. See open_with_schema for the full reasoning.
 """
 import os
 import re
 import sqlite3
+import threading
+import zlib
 from pathlib import Path
 
 # Default local file. On a read-only serverless FS this path is never opened as
@@ -119,6 +126,104 @@ def connect() -> Conn:
         return Conn(raw, pg=True)
     raw = sqlite3.connect(DB_PATH)
     return Conn(raw, pg=False)
+
+
+# --- Schema creation -------------------------------------------------------
+# Which (dsn, key) schemas this *process* has already created on Postgres.
+# Keyed by DSN too, so repointing DATABASE_URL mid-process re-runs the DDL.
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_DONE: set[tuple[str, str]] = set()
+
+
+def _reset_schema_state() -> None:
+    """Forget the per-process schema latch — for use in a forked child.
+
+    The latch is a claim about *this* process ("I already ran the DDL on this
+    connection's database"). fork() copies it into a child that has run nothing,
+    so without this a forked worker skips a pending ADD COLUMN migration and
+    then fails on the missing column. The lock is rebuilt rather than reused
+    because a lock held by another thread at fork time stays locked forever in
+    the child.
+    """
+    global _SCHEMA_LOCK, _SCHEMA_DONE
+    _SCHEMA_LOCK = threading.Lock()
+    _SCHEMA_DONE = set()
+
+
+if hasattr(os, "register_at_fork"):  # not available on Windows
+    os.register_at_fork(after_in_child=_reset_schema_state)
+
+
+def _advisory_key(key: str) -> int:
+    """Stable 63-bit advisory-lock id for a schema key.
+
+    crc32 rather than hash(): hash() is salted per process, so two processes
+    would take *different* locks and not serialise against each other at all.
+    """
+    return (0x5645_4E31 << 32) | zlib.crc32(key.encode())
+
+
+def _ensure_pg_schema(key: str, ddl) -> None:
+    """Run `ddl` once per process, in its own committed transaction."""
+    dsn = database_url()
+    with _SCHEMA_LOCK:
+        if (dsn, key) in _SCHEMA_DONE:
+            return
+        lock_id = _advisory_key(key)
+        with connect() as c:
+            # Session-level, NOT pg_advisory_xact_lock: an xact lock is a silent
+            # no-op under autocommit, and this connection may become an
+            # autocommit/pooled one. Serialises first creation across processes,
+            # which is what stops concurrent CREATE TABLE IF NOT EXISTS from
+            # racing into Postgres' own catalog (duplicate pg_type/pg_class).
+            c.execute("SELECT pg_advisory_lock(?)", (lock_id,))
+            try:
+                ddl(c)
+            finally:
+                # Must be explicit. A session lock outlives the transaction, so
+                # if this connection is ever pool-backed rather than closed, a
+                # missed unlock would block first-creation for every other
+                # process for the life of that session.
+                c.execute("SELECT pg_advisory_unlock(?)", (lock_id,))
+        _SCHEMA_DONE.add((dsn, key))
+
+
+def open_with_schema(key: str, ddl, session=None) -> Conn:
+    """Open a connection whose tables are guaranteed to exist.
+
+    `ddl(conn)` creates/migrates this module's tables; `key` names them for the
+    once-per-process latch. `session(conn)` applies per-connection session state
+    (e.g. PRAGMA foreign_keys) and therefore runs on the returned connection
+    every time, on both backends.
+
+    Postgres: the DDL runs once per process on a *separate*, committed
+    connection, and the caller gets a clean one. It must not ride in the
+    caller's transaction — CREATE INDEX IF NOT EXISTS takes a ShareLock on the
+    table even when the index already exists, and holds it to commit. Two
+    writers both take that self-compatible lock, then each blocks upgrading to
+    the RowExclusiveLock its INSERT needs: a lock-upgrade deadlock that kills a
+    drainer mid-pass. A pending ALTER is worse than a deadlock — a nested
+    connection opened underneath it waits on AccessExclusiveLock behind a
+    transaction that is idle waiting on its own client, so there is no cycle for
+    Postgres to detect and the process hangs at boot forever.
+
+    SQLite: `ddl` runs on the returned connection every time, exactly as before.
+    This is deliberate and load-bearing, not an oversight — the test fixtures
+    repoint DB_PATH per test and rely on the schema being created lazily on
+    first use, so a once-per-process latch here hands a later test an empty
+    database.
+    """
+    if not is_postgres():
+        c = connect()
+        if session is not None:
+            session(c)
+        ddl(c)
+        return c
+    _ensure_pg_schema(key, ddl)
+    c = connect()
+    if session is not None:
+        session(c)
+    return c
 
 
 # --- Cross-dialect helpers -------------------------------------------------

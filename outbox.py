@@ -99,8 +99,12 @@ MAX_SEND_ATTEMPTS = 3
 _SELECT = f"SELECT {', '.join(_COLS)} FROM outbox"
 
 
-def _conn() -> db.Conn:
-    c = db.connect()
+def _ddl(c) -> None:
+    # NOTE (VEN-146/VEN-145): this block moved out of _conn(). VEN-145 adds a
+    # `claim_token` column to BOTH the CREATE TABLE and the migration loop
+    # below. Merging the two branches can resolve cleanly while dropping it, and
+    # the send-ownership guard then fails *open* with a green suite. Whoever
+    # merges must assert "claim_token" in db.table_columns(c, "outbox").
     c.execute(
         """CREATE TABLE IF NOT EXISTS outbox (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,7 +131,10 @@ def _conn() -> db.Conn:
                       ("attempts", "INTEGER NOT NULL DEFAULT 0")):
         if col not in have:
             c.execute(f"ALTER TABLE outbox ADD COLUMN {col} {decl}")
-    return c
+
+
+def _conn() -> db.Conn:
+    return db.open_with_schema("outbox", _ddl)
 
 
 def _now() -> str:

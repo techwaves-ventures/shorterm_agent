@@ -14,8 +14,7 @@ import db
 from db import DB_PATH  # re-exported for backward-compatible imports
 
 
-def _conn():
-    c = db.connect()
+def _ddl(c) -> None:
     # Schemas below are the CURRENT (multi-tenant) shape — tenant_id is part of
     # the primary key. Fresh databases get this directly; pre-existing
     # single-user databases are migrated by _migrate_tenant_id() below.
@@ -56,8 +55,14 @@ def _conn():
     for col, decl in (("tenant_email", "TEXT"), ("emailed_at", "TIMESTAMP")):
         if col not in have:
             c.execute(f"ALTER TABLE responses ADD COLUMN {col} {decl}")
+    # A destructive rebuild (CREATE/INSERT SELECT/DROP/RENAME), not idempotent
+    # DDL. It stays inside the schema step so it runs under the advisory lock
+    # and commits before any caller statement — never concurrently with one.
     _migrate_tenant_id(c)
-    return c
+
+
+def _conn():
+    return db.open_with_schema("storage", _ddl)
 
 
 def _migrate_tenant_id(c) -> None:
