@@ -348,7 +348,8 @@ PROPERTY_ZONE = "America/Los_Angeles"
            "property's, so a send that looks like daytime on the dyno lands at "
            "03:00 where the guest is. Strict, and driven through "
            "automation.reschedule on a tenant whose property zone IS configured, "
-           "so any fix that threads that zone into the clamp makes this XPASS.",
+           "so a fix reaching the due_at/reschedule writer makes this XPASS. "
+           "The immediate-send writer is covered by the companion test below.",
 )
 def test_quiet_hours_clamp_uses_the_property_zone(db_tenant):
     """Quiet hours are a claim about the wall clock the *guest* reads.
@@ -381,6 +382,12 @@ def test_quiet_hours_clamp_uses_the_property_zone(db_tenant):
     in the property's own zone the clamp is accidentally right, this would XPASS,
     and a strict xfail would then report a green suite as a failure for a reason
     that has nothing to do with the defect.
+
+    One caveat on what an XPASS here proves. This asserts the *outcome* — the
+    stored instant — not the mechanism, so it also goes red if the anchor frame
+    changes rather than the clamp zone (`timeframe` names anchor-frame closure
+    as remaining VEN-134 work). If this fires while VEN-141 is untouched, look
+    there before assuming the clamp moved.
     """
     import timeframe
 
@@ -403,10 +410,11 @@ def test_quiet_hours_clamp_uses_the_property_zone(db_tenant):
         # The anchor is `last_contact_at` rather than the intro step's
         # `inquiry_at` because `pipeline.update` silently drops any field
         # outside its allow-list, and `inquiry_at` is not on it. Writing it
-        # would be a no-op, `_anchor_dt` would fall back to *now*, and the test
-        # would then quietly XPASS whenever the suite happened to run between
-        # 15:00 and 20:00 UTC — a strict xfail turning red on the clock rather
-        # than on the defect.
+        # would be a no-op; the deal would keep the `inquiry_at` that
+        # `pipeline.derive` defaults to *now*, `_anchor_dt` would resolve that
+        # instead, and the test would then quietly XPASS whenever the suite
+        # happened to run at UTC hours 15 through 20 (i.e. 15:00-20:59) — a
+        # strict xfail turning red on the clock rather than on the defect.
         pipeline.update(db_tenant, SITE, "L1", sequence="presale", step_index=1,
                         last_contact_at="2026-08-30T10:00:00")
         assert pipeline.get(db_tenant, SITE, "L1")["last_contact_at"].startswith(
@@ -416,10 +424,77 @@ def test_quiet_hours_clamp_uses_the_property_zone(db_tenant):
     scheduled = pipeline.get(db_tenant, SITE, "L1")["next_action_at"]
     assert scheduled, "reschedule must have produced a due time"
     at_the_property = timeframe.to_zone(scheduled, prop)
-    assert sequences.QUIET_START.hour <= at_the_property.hour <= sequences.QUIET_END.hour, (
+    # Pin the instant, not just the hour band. `QUIET_START <= hour <= QUIET_END`
+    # would accept 20:00-20:59, which is *outside* QUIET_END, and would accept a
+    # clamp performed in any zone within a few hours of the property's. The
+    # sibling test above pins its instant against a stdlib oracle for the same
+    # reason; 08:00 PDT is 15:00Z.
+    assert scheduled == "2026-09-01T15:00:00", (
         f"a send anchored at 03:00 property-local was stored as {scheduled}Z, "
-        f"which is {at_the_property:%H:%M} where the guest is — the clamp ran in "
-        f"the host's zone")
+        f"which is {at_the_property:%H:%M} where the guest is — expected the "
+        f"clamp to push it to 08:00 property-local (15:00Z), so it ran in the "
+        f"host's zone")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="VEN-141 on the OTHER writer: automation.enqueue_autopilot_reply "
+           "stamps scheduled_at from sequences.next_send_time(), which clamps "
+           "in the host's zone. Strict. Companion to the test above — that one "
+           "covers the due_at/reschedule writer, this one the immediate-send "
+           "writer, and a fix to either alone leaves the other xfailing.",
+)
+def test_quiet_hours_clamp_uses_the_property_zone_on_the_immediate_send_path(
+        db_tenant, monkeypatch):
+    """The same defect on the second of the two schedule writers.
+
+    `next_send_time` is the writer the sibling test cannot reach. It takes no
+    tenant and reads the clock itself, so a VEN-141 fix confined to it — a
+    plausible first slice, since its own docstring is where the "reads as a bot"
+    argument lives — would leave the sibling xfailing and the suite green. Its
+    real production call site is `automation.enqueue_autopilot_reply`, which
+    *does* have `tenant_id` in scope, so that is what this drives.
+
+    The clock is frozen because that call site passes no `now`. The freeze is a
+    fixed **instant**, not a fixed wall-clock reading, so `datetime.now(tz)`
+    returns that instant correctly converted rather than the same digits
+    relabelled — otherwise a fix that clamps in the property zone would see
+    10:00 there instead of 03:00 and the test would assert nothing.
+    """
+    import timeframe
+
+    prop = ZoneInfo(PROPERTY_ZONE)
+    config.save_settings(db_tenant, timezone=PROPERTY_ZONE, automation_enabled="0")
+    assert scheduler.tz_for(db_tenant) == prop, \
+        "the property zone must actually be configured for this to test anything"
+
+    instant = datetime(2026, 9, 1, 10, 0, 0, tzinfo=tz_utc)
+
+    class _FrozenClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz is not None \
+                else instant.astimezone().replace(tzinfo=None)
+
+    monkeypatch.setattr(sequences, "datetime", _FrozenClock)
+
+    with host_tz("UTC") as offset:
+        assert offset == timedelta(0), "host zone must be pinned for this to mean anything"
+        # Positive control for the freeze: without this, a monkeypatch that
+        # stopped taking would leave the test reading the real clock and
+        # flipping with the time of day.
+        assert sequences.next_send_time().startswith("2026-09-01T10:00"), \
+            "the frozen clock is not reaching next_send_time"
+        msg = automation.enqueue_autopilot_reply(db_tenant, SITE, "L9", "hello")
+
+    assert msg, "enqueue_autopilot_reply must have produced a message"
+    scheduled = msg["scheduled_at"]
+    at_the_property = timeframe.to_zone(scheduled, prop)
+    assert scheduled == "2026-09-01T15:00:00", (
+        f"an immediate send at 03:00 property-local was stored as {scheduled}Z, "
+        f"which is {at_the_property:%H:%M} where the guest is — expected the "
+        f"clamp to push it to 08:00 property-local (15:00Z), so it ran in the "
+        f"host's zone")
 
 
 def test_norm_ts_leaves_schedule_frame_stamps_alone():
