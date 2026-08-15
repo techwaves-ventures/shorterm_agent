@@ -14,6 +14,7 @@ import os
 import time as time_mod
 from contextlib import contextmanager
 from datetime import datetime, time as time_cls, timedelta, timezone as tz_utc_mod
+from zoneinfo import ZoneInfo
 
 tz_utc = tz_utc_mod.utc
 
@@ -26,6 +27,7 @@ import pipeline
 import responder
 import sequences
 import storage
+import timeframe
 
 SITE = "furnishedfinder"
 
@@ -321,3 +323,76 @@ def test_run_due_drafts_on_every_reader_host(db_tenant, no_quiet_hours, writer_t
     assert len(set(drafted.values())) == 1, (
         f"writer={writer_tz} scheduled {due_now}; run_due drafts on some hosts "
         f"and not others: {drafted}")
+
+
+# --- the zone the clamp computes in (VEN-141, pinned here so it cannot drift) --
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="VEN-141: _clamp_quiet_hours computes in the server's zone, not the "
+           "property's, so a send clamped to 08:00 on the dyno lands at 01:00 "
+           "where the guest is. Strict: this must go red the day VEN-141 lands.",
+)
+def test_quiet_hours_clamp_uses_the_property_zone():
+    """Quiet hours are a claim about the wall clock the *guest* reads.
+
+    Every other test in this file takes the clamp out of the picture with
+    `no_quiet_hours` so that what is under test is the frame, which leaves the
+    file structurally unable to ask this question — and the host-zone assertion
+    in `test_agent_lifecycle.py` round-trips by construction, so it cannot ask it
+    either. Without this test the property-zone gap is asserted nowhere.
+
+    VEN-134 moved *storage* to one absolute frame and deliberately left the clamp
+    a local computation; deciding which local zone that is belongs to VEN-141.
+    The consequence is visible in the dashboard today: `sched_local` renders in
+    the property zone, so a send the clamp believes is safely at 08:00 displays
+    as 01:00 — the product contradicting its own "an automated 3am message reads
+    as a bot" promise (`sequences.py`).
+
+    The host zone is pinned rather than inherited: on a host that happens to run
+    in the property's own zone the clamp is accidentally right, this would XPASS,
+    and a strict xfail would then report a green suite as a failure for a reason
+    that has nothing to do with the defect.
+    """
+    prop = ZoneInfo("America/Los_Angeles")
+    with host_tz("UTC") as offset:
+        assert offset == timedelta(0), "host zone must be pinned for this to mean anything"
+        # 03:00 where the property is, expressed as the host wall clock that
+        # `next_send_time` actually takes. On 2026-09-01 LA is PDT (UTC-7), so
+        # this is 10:00 on the dyno — already "daytime" to a server-zone clamp,
+        # which is exactly why it sails through unclamped.
+        three_am_at_the_property = datetime(2026, 9, 1, 3, 0, tzinfo=prop)
+        as_the_host_reads_it = three_am_at_the_property.astimezone().replace(tzinfo=None)
+        scheduled = sequences.next_send_time(as_the_host_reads_it)
+
+    at_the_property = timeframe.to_zone(scheduled, prop)
+    assert sequences.QUIET_START.hour <= at_the_property.hour <= sequences.QUIET_END.hour, (
+        f"a send at 03:00 property-local was stored as {scheduled}Z, which is "
+        f"{at_the_property:%H:%M} where the guest is — the clamp ran in the "
+        f"server's zone")
+
+
+def test_norm_ts_leaves_schedule_frame_stamps_alone():
+    """`pipeline.norm_ts` must not rewrite a schedule-frame stamp to local time.
+
+    `norm_ts` decides whether a value needs a UTC->local conversion from its
+    *shape* — a space separator and no "T" means "database default, in UTC".
+    `timeframe.now()` emits `isoformat()`, which uses "T", so today the heuristic
+    correctly leaves it alone. Nothing states that as a requirement, though: it
+    holds by coincidence of formatting, and `norm_ts` runs over `next_action_at`,
+    the very column this ticket moved into the schedule frame.
+
+    Switch `timeframe` to a space separator — a cosmetic-looking change — and
+    every schedule stamp silently gets shifted by the reader's offset on the way
+    out, which is precisely the bug VEN-134 removed. Pin it on both sides of UTC
+    so the assertion cannot pass by the offset happening to be zero.
+    """
+    for zone in ZONES:
+        with host_tz(zone) as offset:
+            assert offset is not None
+            stamped = timeframe.now()
+            assert pipeline.norm_ts(stamped) == stamped, (
+                f"norm_ts rewrote a schedule-frame stamp on a host in {zone}: "
+                f"{stamped} -> {pipeline.norm_ts(stamped)}. The frame is UTC by "
+                f"declaration, not by string shape.")

@@ -193,10 +193,19 @@ def test_prearrival_scheduling_is_anchored_to_check_in():
 def test_quiet_hours_push_sends_out_of_the_night():
     deal = {"check_in": "2026-09-01", "inquiry_at": "2026-07-01T09:00:00"}
     welcome = sequences.find_step(sequences.PREARRIVAL, "welcome")
-    # Quiet hours are a claim about the wall clock the guest reads, and the
-    # stored stamp is absolute, so convert before asserting. Reading `when[11:13]`
-    # only tested the clamp on hosts whose offset happened to keep the digits in
-    # range — it passed on UTC and Los Angeles while failing on Auckland.
+    # The stored stamp is absolute, so convert before asserting: reading
+    # `when[11:13]` only tested the clamp on hosts whose offset happened to keep
+    # the digits in range — it passed on UTC and Los Angeles while failing on
+    # Auckland.
+    #
+    # Be precise about what this proves. `to_zone(..., tz=None)` renders in the
+    # *host* zone, which is the same zone `_clamp_quiet_hours` computed in, so
+    # this round-trips by construction and passes in every timezone. It pins the
+    # clamp's existence — delete `_clamp_quiet_hours` and the 3am case below
+    # fails — but it is blind to the clamp running in the *wrong* zone, which is
+    # the question the guest's wall clock actually asks. That one is VEN-141's,
+    # and is pinned as a strict xfail in
+    # `test_schedule_frame_cross_host.py::test_quiet_hours_clamp_uses_the_property_zone`.
     local = timeframe.to_zone(sequences.due_at(deal, welcome))
     assert sequences.QUIET_START.hour <= local.hour <= sequences.QUIET_END.hour
 
