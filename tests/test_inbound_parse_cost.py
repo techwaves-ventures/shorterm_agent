@@ -239,6 +239,67 @@ def test_item_id_is_unchanged_by_the_rewrite():
     assert item["id"] == "97af61eecfd80071"
 
 
+# --- non-ASCII: the case-folding trap -------------------------------------
+#
+# Every other equality test in this file is ASCII, and that is exactly why the
+# first version of `_script_spans` shipped green while corrupting real mail.
+# It lowercased the input and then indexed the *original* with the result.
+# `str.lower()` is not length-preserving: U+0130 (`İ`, Turkish dotted capital
+# I) folds to two characters, and it is the only codepoint in Unicode that
+# does. Each one before a closing tag dragged the computed span one character
+# too far. Expected values below were produced by the old pipeline on 6f62a57.
+
+@pytest.mark.parametrize("html,expected", [
+    # Overshoot eats text that follows the element.
+    ("<script>İİİ</script>TAIL", " TAIL"),
+    # The `İ` need not be inside the element — anything before the closer
+    # shifts it, so ordinary Turkish prose plus any <style> block triggers it.
+    ("<p>Hi İlker from İstanbul</p><style>p{color:red}</style>"
+     "<p>Budget is $2000</p>",
+     " Hi İlker from İstanbul\n Budget is $2000\n"),
+    # Enough drift skips the next element's opener entirely, which leaks the
+    # script content `_SCRIPT_OPEN_RE`'s comment exists to keep out.
+    ("<script>" + "İ" * 12 + "</script><script>SECRET_TOKEN=1</script>"
+     "<p>hi</p>", " hi\n"),
+    # Other non-ASCII must be untouched; only U+0130 changes length.
+    ("<p>Größe: 30m²</p><style>x</style><p>ok</p>", " Größe: 30m²\n ok\n"),
+    ("<p>Приве́т</p><script>var s=1;</script><p>ok</p>", " Приве́т\n ok\n"),
+])
+def test_case_folding_does_not_shift_element_spans(html, expected):
+    assert inbound.extract_body({"html": html}) == expected
+
+
+def test_script_content_is_not_leaked_past_a_dotted_capital_i():
+    """Exactly 12 `İ` is the discriminating count, and that is the point.
+
+    The drift is one character per `İ`, so *more* of them overshoot the whole
+    following element and delete the secret along with it — which reads as a
+    pass. 12 lands the span end inside `SECRET_TOKEN=1`, so the tail leaks.
+    """
+    body = inbound.extract_body(
+        {"html": "<script>" + "İ" * 12 + "</script>"
+                 "<script>SECRET_TOKEN=1</script><p>hi</p>"})
+    assert "TOKEN=1" not in body
+    assert body == " hi\n"
+
+
+def test_message_item_id_is_unchanged_by_a_dotted_capital_i():
+    """Must be a *message*, not a lead: only `kind == "message"` mixes
+    `_body_fingerprint(body)` into the id (`ff_email.py:667-670`), so the same
+    assertion on a lead passes even with the span drift present and proves
+    nothing. Id pinned from `6f62a57`; the pre-fix branch gave 4dea5190239c885a.
+    """
+    html = ("<p>You have a new message on FurnishedFinder.</p>"
+            "<p>Traveler: İlker Yılmaz</p>"
+            "<p>Property: 123 Maple St Unit B</p>"
+            "<style>p{color:red}</style>"
+            "<p>Message: Is the unit still available in March?</p>")
+    body = inbound.extract_body({"html": html})
+    assert "p>Message" not in body
+    item = ff_email.parse("New message from İlker", body)
+    assert item["id"] == "533bfdca296f208a"
+
+
 # --- the size cap ---------------------------------------------------------
 
 def _post_chunked(app, raw, headers):

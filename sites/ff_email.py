@@ -45,10 +45,19 @@ _LEAD_HINTS = ("lead", "inquiry", "enquiry", "interested", "booking request")
 # Requiring the local part to start at a token boundary leaves one viable
 # starting offset per run instead of one per character.
 #
-# It cannot change what is found. `search` returns the leftmost match, and a
-# match beginning mid-token implies a match beginning at that token's start —
-# the greedy `[\w.+-]+` simply absorbs the extra prefix — so every offset this
-# prunes was one that could never have produced the leftmost match. Bounding
+# It cannot change what `search` finds — which is all this pattern is used for,
+# here and in `responder.py`. `search` returns the leftmost match, and a match
+# beginning mid-token implies a match beginning at that token's start — the
+# greedy `[\w.+-]+` simply absorbs the extra prefix — so every offset this
+# prunes was one that could never have produced the leftmost match.
+#
+# That argument is specific to `search`. It does *not* extend to `findall` or
+# `finditer`, which resume scanning at the end of the previous match: a second
+# match starting immediately after the first is preceded by a class character
+# and so is now suppressed. `'a@b.c+d@e.f'` is the shape. If you ever want all
+# matches out of this pattern, re-derive the equivalence before trusting it.
+#
+# Bounding
 # the quantifiers instead (`{1,64}`) was tried and is *not* equivalent: it
 # matched a truncated tail of an over-long local part, which would store the
 # wrong address on the lead, and dropped addresses whose domain label ran past

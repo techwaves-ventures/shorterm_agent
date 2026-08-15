@@ -208,6 +208,18 @@ def extract_body(payload: dict) -> str:
 # would leak that content into the stored body.
 _SCRIPT_OPEN_RE = re.compile(r"(?i)<(script|style)")
 
+# Closers, matched case-insensitively by the regex engine rather than by
+# lowercasing the input. `str.lower()` is not length-preserving — U+0130
+# (`İ`, Turkish dotted capital I) lowercases to two characters, and it is the
+# only codepoint in Unicode that does. Searching a lowercased copy and then
+# using the hit as an index into the *original* therefore drifts one character
+# per `İ` seen, which silently ate real text, moved `_body_fingerprint`, and
+# could overshoot a whole element so the next `<script>` was never stripped.
+_SCRIPT_CLOSE_RE = {
+    "script": re.compile(r"(?i)</script>"),
+    "style": re.compile(r"(?i)</style>"),
+}
+
 
 def _script_spans(value: str) -> list[tuple[int, int]]:
     """Extent of each <script>/<style> element that is actually closed.
@@ -221,10 +233,9 @@ def _script_spans(value: str) -> list[tuple[int, int]]:
     engine resumed at the match end rather than rescanning it.
     """
     spans: list[tuple[int, int]] = []
-    lowered = value.lower()
-    # A kind whose closer has already been searched for and not found. `find`
-    # only ever runs at non-decreasing offsets, so once `</script>` is absent
-    # from the rest of the input it is absent for every later opener too.
+    # A kind whose closer has already been searched for and not found. The
+    # search only ever runs at non-decreasing offsets, so once `</script>` is
+    # absent from the rest of the input it is absent for every later opener.
     # Without this, `"<script" * n` searched to end-of-input from each of the
     # n openers and stayed O(n^2) — the very shape being fixed.
     exhausted: set[str] = set()
@@ -237,17 +248,16 @@ def _script_spans(value: str) -> list[tuple[int, int]]:
         if kind in exhausted:
             pos = m.end()
             continue
-        closer = "</%s>" % kind
-        end = lowered.find(closer, m.end())
-        if end < 0:
+        close = _SCRIPT_CLOSE_RE[kind].search(value, m.end())
+        if close is None:
             # No closer for this opener, so the old regex reported no match
             # here either. Resume past it: an opener cannot begin inside
             # another opener, so nothing is skipped by not backing up.
             exhausted.add(kind)
             pos = m.end()
             continue
-        spans.append((m.start(), end + len(closer)))
-        pos = end + len(closer)
+        spans.append((m.start(), close.end()))
+        pos = close.end()
 
 
 def _strip_tags(text: str) -> str:
