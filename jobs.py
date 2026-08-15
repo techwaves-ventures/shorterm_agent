@@ -420,6 +420,13 @@ def worker_online() -> bool:
 # Job status -> the dashboard's status vocabulary (idle | launching | checking |
 # waiting_for_otp | done | error), matching the in-process runner state shape so
 # the dashboard JS is identical on both the serverless and worker-host paths.
+#
+# One field is NOT identical between the two paths: `updated_at` is absolute here
+# (see `_now_utc`) and still naive local in `runner._state`. The dashboard reads
+# only `status` and `message` from this dict, so nothing consumes the difference
+# today — but the two paths are mutually exclusive per process, so a future reader
+# would see one shape or the other depending on the host it landed on. Parse it
+# with `_age_seconds`, which accepts both, rather than assuming either.
 def public_state(tenant_id: str) -> dict:
     """A runner-compatible state snapshot derived from the tenant's latest job.
 
