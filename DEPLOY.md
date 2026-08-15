@@ -231,6 +231,139 @@ on both engines — no separate migration files to run; `CREATE TABLE IF NOT
 EXISTS` bootstraps a fresh Postgres database on first connect. Point a worker and
 the web app at the **same** `DATABASE_URL` to share data.
 
+> **There is still no migration to run, but one release is not schema-neutral.**
+> The release that introduces `timeframe.py` changes the *frame* the schedule
+> columns are written in, without changing their type or shape. On a UTC fleet
+> that is a no-op. On a fleet in any other zone, read
+> [Upgrading across the schedule-frame change](#upgrading-across-the-schedule-frame-change)
+> **before** you deploy.
+
+---
+
+## Upgrading across the schedule-frame change
+
+**Applies to:** the release that adds `timeframe.py` (VEN-134).
+**If every host in your fleet runs UTC — the hosted Vercel/Render setup above —
+this section is a no-op. Deploy normally.** It matters only when your web host
+or worker runs in a non-UTC zone.
+
+### What changed
+
+`outbox.scheduled_at` and `deals.next_action_at` decide *when* an approved
+message may go out. They are written by whichever process drafts or approves the
+message and read by whichever process drains the queue — on the worker-queue
+topology those are different hosts sharing one `DATABASE_URL`. They used to be
+stored as the **writing host's local wall clock**, so a drainer in a different
+zone compared them against its own clock and was wrong by the offset. They are
+now stored as **naive UTC** so that every host agrees.
+
+Both are still plain `YYYY-MM-DDTHH:MM:SS` text with no offset suffix, because
+they are compared with SQL `<=` and sorted with `ORDER BY` — a lexicographic
+comparison that an offset suffix would break. The column type does not change,
+so there is nothing to `ALTER`.
+
+### No deploy order is safe on a non-UTC fleet
+
+The usual "deploy the web app first, then the worker" rule does **not** rescue
+this one. Which order is harmful flips with the *sign* of your fleet's offset —
+verified end-to-end, approving on one head and draining on the other against a
+shared database:
+
+| fleet zone | web=new / worker=old | web=old / worker=new |
+|---|---|---|
+| `America/Los_Angeles` (−7) | **approved sends stall** | sends |
+| `UTC` | sends | sends |
+| `Europe/Berlin` (+2) | sends | **approved sends stall** |
+
+A stalled send is silent: the operator clicks **Approve & send**, gets a success
+UI, and the message sits `queued` for up to the full offset. `reclaim_stuck_sending`
+does not rescue it — that reaper only looks at rows in `sending`, and these are
+`queued`. In the mirror direction a send deliberately deferred to a civilised
+hour is released *early*, which is the quiet-hours clamp being defeated rather
+than a message being late.
+
+### What to actually do
+
+**Cut both hosts over together, and let nothing drain on the old code while the
+new code is writing.** Draining the queue first is *not* sufficient on its own —
+a message approved during the mixed-code window stalls even when the queue was
+completely empty when the deploy started (verified). Emptying the queue is about
+the *existing* backlog; the atomic cutover is about new approvals.
+
+Two processes drain the outbox, and only one of them is the "worker":
+
+- **`worker.py`** — the off-host drainer (`run_agent_pass` → `automation.send_next`).
+  This is the one that can be in a different zone from the web host.
+- **the dashboard itself** — `automation.start_drainer` runs an in-process
+  drainer thread right after an approve, so the web host delivers its own
+  messages without help.
+
+That second one is why a web-only deploy is self-consistent: the same host wrote
+the stamp and read it. The hazard is specifically `worker.py` reading rows the
+web host wrote (or the reverse) while the two are on different code.
+
+```bash
+# On a non-UTC fleet, in this order:
+
+# 1. Stop the off-host drainer so nothing reads new-frame rows with old code.
+#    However you run it — a Procfile `worker` dyno, a Render/Fly worker, or a
+#    bare `python worker.py` on a VM. There is no systemd unit for it in
+#    deploy/; the units there (str-leads-dashboard, str-leads-check) are the
+#    single-VM topology, which has no separate worker host and is unaffected.
+#      Render/Heroku-style:  scale the `worker` process to 0
+#      VM:                   stop/kill the `python worker.py` process
+
+# 2. Let the queue empty on the OLD code before you cut over, then confirm:
+#    (psql, or: sqlite3 "$SQLITE_PATH")
+#      SELECT count(*) FROM outbox WHERE status IN ('queued','sending');
+#    Anything still queued is a legacy-frame row — see the next section.
+
+# 3. Deploy the new code to BOTH the web host and the worker host.
+
+# 4. Start the worker again (scale back to 1, or restart `python worker.py`).
+```
+
+### Pre-existing rows are not rewritten (deliberate)
+
+**There is no backfill, and that is a decision, not an oversight.** A row written
+before this release holds the *writing host's* local time, and the database does
+not record which host wrote it or what zone that host was in. Any backfill would
+have to guess an offset and apply it to every row; guessing wrong silently moves
+real customer sends, which is worse than the bounded problem it would fix.
+
+So on a **non-UTC** fleet, rows already in the queue at deploy time are read one
+offset out for the rest of their (short) life:
+
+- **West of UTC** every legacy schedule up to `|offset|` hours in the future
+  becomes due immediately and fires early.
+- **East of UTC** a legacy row that is genuinely due is withheld for `|offset|`
+  hours.
+- Mixed frames also mis-sort `ORDER BY scheduled_at`, so the drainer can pick a
+  legacy row ahead of a correctly-framed one.
+- `automation.reschedule` copies an existing `next_action_at` into a new outbox
+  row, so a legacy stamp can survive one extra hop after the upgrade.
+
+This is bounded and self-healing — every row is rewritten in the new frame the
+next time it is scheduled — and step 2 above (drain the queue before cutting
+over) avoids it entirely. **On a UTC fleet none of it applies:** the old local
+frame and the new UTC frame are the same values.
+
+### One display change ships with this
+
+The dashboard now renders schedule times in the **property's** timezone
+(`Settings → timezone`) rather than the server's. Existing deals will show a
+different clock time after this deploy **with no change to the underlying data** —
+the new number is the correct property-local time, and the old one was the
+server's. If the tenant has no timezone configured, nothing changes.
+
+One consequence is visible and worth expecting: because the quiet-hours clamp
+still computes in the *server's* zone, a send the system clamped to 08:00 can
+display as e.g. `01:00` in the property's zone. That display is telling the
+truth — the send really is scheduled for 01:00 where the guest is. Moving the
+clamp itself into the property zone is tracked separately (**VEN-141**); until
+that lands, treat an out-of-hours time on the dashboard as a real finding rather
+than a rendering bug.
+
 ---
 
 # Deploying on an Ubuntu VM (self-hosted, single-tenant)
