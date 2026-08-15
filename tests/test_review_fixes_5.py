@@ -153,9 +153,9 @@ def test_a_genuinely_stranded_send_still_recovers_on_the_next_pass(
         tenant, monkeypatch):
     """The cost of declining to judge a naive stamp, pinned so it stays bounded.
 
-    A pre-upgrade wedged row now needs *two* passes instead of one: the first
-    restamps it absolute, the second measures a real age against it. That is the
-    deliberate trade — a stranded row recovers one cycle later, where the
+    A pre-upgrade wedged row needs two passes: the first restamps it absolute,
+    the second measures a real age against it. That is the deliberate trade —
+    a stranded row recovers up to max_age_seconds (900 s) later, where the
     alternative was delivering a live message twice. This test exists so the
     second pass cannot quietly stop working.
     """
@@ -166,9 +166,15 @@ def test_a_genuinely_stranded_send_still_recovers_on_the_next_pass(
     outbox.set_status(msg["id"], outbox.SENDING)
     _claim_naive_at(msg["id"], 0)
 
+    before = datetime.now(timezone.utc).replace(microsecond=0)
     with dashboard.app.test_request_context():
         dashboard._board(tenant)
     assert outbox.get(msg["id"])["status"] == outbox.SENDING
+    written = datetime.fromisoformat(outbox.get(msg["id"])["sending_at"])
+    assert written >= before, (
+        "pass 1 must restamp absolute and current, not in the past — "
+        "a past stamp reintroduces the double-delivery defect"
+    )
 
     # Second pass, with the (now absolute) stamp aged past the reclaim window.
     old = (datetime.now(timezone.utc) - timedelta(seconds=3600))

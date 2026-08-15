@@ -316,8 +316,9 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
                 # So decline to judge it at all: treat it exactly like an
                 # unparseable stamp above. Restamp absolute and let the next
                 # pass measure a real age. The cost is that a row already
-                # wedged at deploy time takes two passes to recover instead of
-                # one; the alternative is sending a live message twice.
+                # wedged at deploy time takes two passes — after the restamp, the
+                # row must age out again (up to max_age_seconds); the alternative
+                # is sending a live message twice.
                 c.execute("UPDATE outbox SET sending_at=? WHERE id=? AND status=?",
                           (_now_utc(), msg["id"], SENDING))
                 continue
