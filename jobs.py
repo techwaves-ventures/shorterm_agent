@@ -111,19 +111,39 @@ def _age_seconds(value: str | None) -> float | None:
         age IS the last line of defence: None skips the wedged-job backstop and
         strands the tenant on "Checking…" forever, which is worse than base.
 
-    Legacy rows therefore behave precisely as they did on the previous release,
-    and converge on their own — the worker re-stamps `last_seen` within seconds,
-    and job rows are short-lived.
+    The naive branch subtracts wall clock from wall clock, which is bit-for-bit
+    what the previous release computed. It deliberately does NOT convert the naive
+    stamp with `astimezone()` first: that resolves the offset as of the *stamp's*
+    wall clock (with `fold=0`), while the reader's "now" carries the offset in
+    force *now*, so the two disagree by the DST delta whenever a transition falls
+    between them. Inside the autumn fall-back hour that reads a 60-second-old
+    heartbeat as 3660 seconds old — which fails a live worker as offline, reaps
+    the `running` job it is driving, and zeroes the cooldown, i.e. it re-creates
+    all three harms this change exists to remove, on a single-host deploy the
+    previous release got right.
+
+    Legacy rows therefore behave exactly as they did before, DST included. They
+    also converge, though not uniformly: the worker re-stamps `last_seen` every
+    15s, while `created_at` is written once at `enqueue` and never re-stamped, so
+    a job queued by a not-yet-upgraded web host keeps a naive `created_at` for its
+    whole life. For that column the cross-host defect persists until the *writer*
+    is upgraded; this reader change alone does not cure it.
     """
     if not value:
         return None
     try:
         stamp = datetime.fromisoformat(str(value))
-    except (TypeError, ValueError):
+        now = datetime.now(timezone.utc)
+        if stamp.tzinfo is None:
+            # Wall clock minus wall clock, exactly as the previous release did.
+            return (now.astimezone().replace(tzinfo=None) - stamp).total_seconds()
+        return (now - stamp).total_seconds()
+    except Exception:  # noqa: BLE001 - an unreadable stamp must not 500 a page
+        # Kept as broad as the previous release's: this feeds `worker_online` ->
+        # `reap_stale` -> `public_state`/`enqueue`, none of which is wrapped, so a
+        # raise here surfaces as a 500 on the dashboard rather than a bad age.
+        # `datetime.min`/`max`-adjacent values overflow on conversion.
         return None
-    if stamp.tzinfo is None:
-        stamp = stamp.astimezone()  # naive == this host's wall clock (pre-VEN-142)
-    return (datetime.now(timezone.utc) - stamp).total_seconds()
 
 
 def _conn() -> db.Conn:

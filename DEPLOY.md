@@ -141,6 +141,30 @@ The `Procfile` declares this as the `worker:` process; a Render/Fly worker
 service or a systemd unit can run the same command. Until a worker is online the
 UI says so (jobs stay *queued*), so nothing looks connected that isn't.
 
+> #### ⚠️ Deploy the web app BEFORE the worker
+>
+> The web host and the worker are deployed separately, so they can run different
+> revisions for a while. **Upgrade the web app first, or both together — never the
+> worker first.**
+>
+> `ff_worker.last_seen`, `ff_jobs.created_at` and `ff_jobs.updated_at` are written
+> on one host and read on the other, so they carry a UTC offset (`jobs._now_utc`,
+> VEN-142). A **new worker writing to an old web app** is the bad order: the old
+> reader does `datetime.now() - stamp` and raises `TypeError: can't subtract
+> offset-naive and offset-aware datetimes`. That is not a degraded number, it is an
+> uncaught exception on the dashboard page itself, `/api/status`, `POST /refresh`
+> and `/otp` — every tenant, every page, starting within ~15s of the worker
+> restarting (its heartbeat interval) and lasting until the web deploy lands.
+>
+> The other order is safe: a new web app reads an old worker's naive stamps exactly
+> as the previous release did. The cross-host fix simply does not take effect for a
+> given column until that column's writer is upgraded — and note `created_at` is
+> stamped once at enqueue and never re-stamped, so jobs queued by an old web host
+> keep a naive `created_at` for their whole life.
+>
+> There is no migration to run: both shapes are readable, and a legacy naive value
+> is read as local wall clock, which is what wrote it.
+
 **Connection honesty:** saving a FurnishedFinder email lands the account in
 `needs_verification` — it is **not** shown as connected. The first successful
 worker scrape (a real OTP login) is what flips it to `connected`. See
