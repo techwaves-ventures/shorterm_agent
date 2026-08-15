@@ -91,7 +91,11 @@
       <div class="empty">No message text was captured for this conversation yet.</div>
     {% endif %}
 
-    {% if response and response.draft %}
+    {# A sent reply keeps its text in `response.draft` (the sender writes the
+       delivered body back over it), so "has a draft" cannot mean "unsent". Once
+       it has gone — or while a send is in flight — the approve control has to
+       disappear, or the operator re-sends the same message to the guest. #}
+    {% if response and response.draft and not sent_state %}
       <section class="panel">
         <h2>Suggested reply</h2>
         <p class="hint">
@@ -109,6 +113,11 @@
             </span>
           {% endif %}
         </div>
+      </section>
+    {% elif sent_state %}
+      <section class="panel">
+        <h2>Your reply</h2>
+        <p class="hint">{{ sent_state }}</p>
       </section>
     {% elif response and response.reason %}
       <section class="panel">

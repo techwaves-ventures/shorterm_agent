@@ -45,8 +45,14 @@ STATUS_LABELS = {
 _COLS = (
     "id", "tenant_id", "site", "item_id", "sequence", "step_id", "step_label",
     "body", "status", "auto", "reason", "scheduled_at", "created_at",
-    "approved_at", "sent_at", "error",
+    "approved_at", "sent_at", "error", "sending_at", "attempts",
 )
+
+# How many times a send may be reclaimed before we stop retrying it. Each
+# reclaim is a message we cannot prove *didn't* reach the guest, so the cap is
+# the difference between "recover from a crashed worker" and "message the guest
+# forever". Failing loudly at the cap puts it in front of a human instead.
+MAX_SEND_ATTEMPTS = 3
 
 _SELECT = f"SELECT {', '.join(_COLS)} FROM outbox"
 
@@ -73,6 +79,12 @@ def _conn() -> db.Conn:
             error TEXT
         )"""
     )
+    # Idempotent migration for databases created before send-attempt tracking.
+    have = db.table_columns(c, "outbox")
+    for col, decl in (("sending_at", "TEXT"),
+                      ("attempts", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in have:
+            c.execute(f"ALTER TABLE outbox ADD COLUMN {col} {decl}")
     return c
 
 
@@ -192,6 +204,17 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
 
     Without this a process that dies mid-send strands the message forever: it is
     no longer `queued` so no drainer picks it up, but it never reached the guest.
+
+    The danger is the mirror image — requeueing a send that is merely *slow*
+    delivers the message twice — so this is deliberately conservative on both
+    counts. Age is measured from `sending_at` (when a drainer actually picked
+    the message up), never from `approved_at`: approval can precede the send by
+    hours whenever the quiet-hours clamp defers delivery, which made every such
+    message eligible for reclaim the moment it went in flight, on every
+    dashboard load, forever. A row with no `sending_at` is treated as *just
+    started* rather than infinitely old, so an unreadable stamp cannot trigger a
+    duplicate. And `MAX_SEND_ATTEMPTS` bounds the loop: past the cap the message
+    fails visibly instead of being re-sent without limit.
     """
     cutoff = datetime.now().timestamp() - max_age_seconds
     requeued = 0
@@ -204,12 +227,26 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
             if not msg:
                 continue
             try:
-                started = datetime.fromisoformat(str(msg.get("approved_at") or "")).timestamp()
+                started = datetime.fromisoformat(
+                    str(msg.get("sending_at") or "")).timestamp()
             except ValueError:
-                started = 0
-            if started < cutoff:
-                c.execute("UPDATE outbox SET status=? WHERE id=?", (QUEUED, msg["id"]))
-                requeued += 1
+                # Unknown start time: assume it began now and revisit next pass.
+                c.execute("UPDATE outbox SET sending_at=? WHERE id=?",
+                          (_now(), msg["id"]))
+                continue
+            if started >= cutoff:
+                continue
+            if int(msg.get("attempts") or 0) >= MAX_SEND_ATTEMPTS:
+                c.execute(
+                    "UPDATE outbox SET status=?, error=? WHERE id=?",
+                    (FAILED,
+                     f"Abandoned after {MAX_SEND_ATTEMPTS} send attempts — "
+                     "may already have reached the guest; check before retrying.",
+                     msg["id"]),
+                )
+                continue
+            c.execute("UPDATE outbox SET status=? WHERE id=?", (QUEUED, msg["id"]))
+            requeued += 1
     return requeued
 
 
@@ -249,6 +286,13 @@ def set_status(msg_id: int, status: str, *, error: str | None = None,
         # already due keeps its position and can't jump the queue.
         sets.append("scheduled_at=CASE WHEN scheduled_at>? THEN ? ELSE scheduled_at END")
         vals += [_now(), _now()]
+    if status == SENDING:
+        # When the send actually started — which is what "stuck" is measured
+        # against. `approved_at` cannot answer that: a message approved into
+        # quiet hours sits queued for hours before anyone picks it up.
+        sets.append("sending_at=?")
+        vals.append(_now())
+        sets.append("attempts=COALESCE(attempts,0)+1")
     if status == SENT:
         sets.append("sent_at=?")
         vals.append(_now())

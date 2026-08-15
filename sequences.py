@@ -186,6 +186,26 @@ SEQUENCES: dict[str, dict] = {
 }
 
 
+# Answering a guest who has just written to us. Deliberately *not* a rung on the
+# nurture ladder: every step in `SEQUENCES` is a scheduled push into silence,
+# indexed by `step_index`, whereas this one is a reaction that can happen at any
+# point in a conversation and must not move the deal's position in its sequence.
+# It is still a real step so that a mid-conversation auto-reply passes the same
+# `can_auto_send` governance as everything else — off by default, armable by the
+# tenant, rather than bypassing the rails because no step described it.
+GUEST_REPLY = {
+    "id": "guest_reply",
+    "label": "Reply to guest",
+    "auto_send_default": False,
+    "guidance": (
+        "The guest has just written to you — answer THEM. Respond directly to "
+        "what they actually asked, using concrete catalog facts. Do not "
+        "introduce the place as though this were first contact, and do not "
+        "repeat anything already said earlier in the thread."
+    ),
+}
+
+
 def get(sequence_id: str | None) -> dict | None:
     return SEQUENCES.get(sequence_id or "")
 
@@ -217,7 +237,7 @@ def can_auto_send(step: dict, enabled_steps: set[str]) -> bool:
     """
     if step.get("never_auto"):
         return False
-    return step["id"] in enabled_steps
+    return bool(step.get("id")) and step["id"] in enabled_steps
 
 
 def default_enabled_steps() -> set[str]:

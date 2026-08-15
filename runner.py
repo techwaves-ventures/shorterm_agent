@@ -140,10 +140,27 @@ def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]
                 tenant_id, site, kind, it["id"], status="skipped",
                 reason=f"draft error: {e}",
             )
-        # Open the deal regardless of whether drafting succeeded — the lifecycle
-        # (and the owner's queue) shouldn't depend on the model being reachable.
+        # A message that continues a conversation we already have joins it
+        # instead of opening a second deal — the same rule `inbound.store` and
+        # `pipeline.backfill` apply. This path was missing it, so every scraped
+        # guest reply created a duplicate deal at step 0 carrying the same
+        # thread_key, which then shadowed the real one in `find_thread`
+        # (newest-id-first) and left the original's follow-up clock running at a
+        # guest who had just written back.
+        target_id, parent = it["id"], None
         try:
-            pipeline.ensure(tenant_id, site, it, decision, units=units)
+            if it.get("kind") == "message":
+                parent = pipeline.find_thread(
+                    tenant_id, site, pipeline.thread_key(it),
+                    exclude_item_id=it["id"])
+            if parent:
+                pipeline.record_guest_reply(tenant_id, site, parent["item_id"])
+                target_id = parent["item_id"]
+            else:
+                # Open the deal regardless of whether drafting succeeded — the
+                # lifecycle (and the owner's queue) shouldn't depend on the model
+                # being reachable.
+                pipeline.ensure(tenant_id, site, it, decision, units=units)
         except Exception:
             log.exception("Could not open deal for %s", it.get("id"))
 
@@ -162,13 +179,20 @@ def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]
             try:
                 import automation
                 import scheduler
+                import sequences
 
                 if scheduler.is_on(tenant_id):
+                    # Queue against the deal the conversation actually lives on,
+                    # and say which step this is: a reply to a guest who wrote
+                    # back is not the intro. Using the parent's id also restores
+                    # the `has_open_step` dedupe, which a per-message id defeated.
                     msg = automation.enqueue_autopilot_reply(
-                        tenant_id, site, it["id"], decision["draft"],
+                        tenant_id, site, target_id, decision["draft"],
+                        step=sequences.GUEST_REPLY if parent else None,
                     )
-                    log.info("Autopilot drafted first reply for %s (status=%s)",
-                             it.get("id"), (msg or {}).get("status"))
+                    log.info("Autopilot drafted %s for %s (status=%s)",
+                             "guest reply" if parent else "first reply",
+                             target_id, (msg or {}).get("status"))
             except Exception:
                 log.exception("Autopilot auto-reply failed for %s", it.get("id"))
 

@@ -663,6 +663,23 @@ def _entry_text(item: dict) -> str:
     return ""
 
 
+def _sent_state(tenant_id: str, item_id: str, response: dict | None) -> str:
+    """Why the approve-and-send control must not be offered, or "" if it may be.
+
+    Two distinct "already handled" cases, both of which previously still showed
+    an enabled Approve & send button over the text that had just gone out:
+    a reply that has been delivered, and one that is queued or mid-flight.
+    """
+    msgs = [m for m in outbox.for_tenant(tenant_id, SITE, outbox.IN_FLIGHT)
+            if m["item_id"] == item_id]
+    if msgs:
+        return outbox.STATUS_LABELS.get(msgs[0]["status"], "Sending…")
+    if (response or {}).get("status") == "sent":
+        at = (response or {}).get("sent_at") or ""
+        return f"Sent{' ' + str(at) if at else ''}."
+    return ""
+
+
 @app.route("/thread/<item_id>")
 @login_required
 def thread(item_id):
@@ -703,6 +720,7 @@ def thread(item_id):
         deal, response, has_failed_send=item_id in _failed_item_ids(tenant_id))
     return render_template(
         "thread.html",
+        sent_state=_sent_state(tenant_id, item_id, response),
         nav_active="inbox",
         account=current_user.email,
         deal=deal,
@@ -982,6 +1000,13 @@ def responder_send():
         return jsonify({"ok": False, "error": "item not found"}), 404
     if not (text or "").strip():
         return jsonify({"ok": False, "error": "empty reply"}), 400
+    # Hiding the button is not a guard: a double-click, a stale tab or a
+    # back-button replay all re-POST this, and every one of them used to put a
+    # second copy of the same message in front of the guest.
+    blocked = _sent_state(tenant_id, item_id,
+                          storage.get_responses(tenant_id, SITE).get(item_id))
+    if blocked:
+        return jsonify({"ok": False, "already": True, "error": blocked}), 409
     msg = automation.enqueue_send(tenant_id, SITE, item_id, text.strip())
     return jsonify({
         "ok": True,

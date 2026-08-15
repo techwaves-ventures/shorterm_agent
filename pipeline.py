@@ -20,7 +20,7 @@ Times are stored as ISO strings we control, so scheduling math happens in
 Python and stays portable across SQLite and Postgres (same rationale as jobs.py).
 """
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import db
 
@@ -128,8 +128,64 @@ def _conn() -> db.Conn:
     return c
 
 
+# --- One timestamp format, or the comparisons lie -------------------------—
+# Deal timestamps get compared against each other as *strings* — "did the guest
+# write after we did" is `last_guest_reply_at > last_contact_at`, in Python and
+# in SQL. That only works if every value in those columns has the same shape and
+# the same clock, and two writers disagreed about both:
+#
+#   * `_now()` wrote local time with a "T" separator.
+#   * SQLite's CURRENT_TIMESTAMP (storage.seen.first_seen, responses.sent_at)
+#     writes UTC with a *space* separator, and those values are copied straight
+#     into `last_guest_reply_at` / `last_contact_at`.
+#
+# Space (0x20) sorts below every digit and below "T", so on any shared date a
+# space-separated guest reply always compared as *older* than a T-separated send
+# — "Guest replied" could not fire same-day, which is precisely the day it
+# matters.
+#
+# The separator is also, usefully, a reliable provenance marker. Every in-app
+# writer stamps via `datetime.isoformat()`, which always emits "T" and always
+# server-local; the only producer of a space is the database's CURRENT_TIMESTAMP,
+# which is always UTC. So a space-separated value is, by construction, a UTC
+# database default and needs converting to the local clock the rest of the app
+# runs on — the same clock `scheduler.py` deliberately reads for quiet hours.
+# Canonical shape is therefore local time, "T"-separated, seconds precision, and
+# every write into a deal timestamp column goes through `norm_ts` on the way in.
+_TS_COLS = ("inquiry_at", "first_reply_at", "last_contact_at",
+            "last_guest_reply_at", "next_action_at", "created_at", "updated_at")
+
+_UTC_OFFSET = datetime.now() - datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def norm_ts(value) -> str | None:
+    """Coerce a timestamp into the one shape deal columns are compared in.
+
+    Handles what the two writers actually produce: "YYYY-MM-DD HH:MM:SS" (a UTC
+    database default, converted to local) and "YYYY-MM-DDTHH:MM:SS[.ffffff]"
+    (already local, left alone). Anything unparseable is passed through
+    untouched — a value we cannot read is still better than None, and it sorts
+    where its text puts it.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    was_utc = " " in s and "T" not in s
+    try:
+        dt = datetime.fromisoformat(s.replace(" ", "T", 1))
+    except ValueError:
+        return s
+    if dt.tzinfo is not None:
+        dt = dt.astimezone().replace(tzinfo=None)
+    elif was_utc:
+        dt += _UTC_OFFSET
+    return dt.isoformat(timespec="seconds")
 
 
 def _row(row) -> dict | None:
@@ -425,9 +481,12 @@ def ensure(tenant_id: str, site: str, item: dict, response: dict | None = None,
         # Repair a clock set from a bad `received` value. Two cases heal here:
         # an impossible future date (the old row-based parse), and a stored date
         # superseded by a trustworthy `received_at` from the lead detail page.
-        inquiry = existing.get("inquiry_at")
-        if inquiry_date(item) or (inquiry and str(inquiry) > now):
-            inquiry = fields["inquiry_at"]
+        # `ensure` writes raw SQL rather than going through `update()`, so it
+        # normalizes here — including the stored value, which may predate the
+        # canonical format and would otherwise fail the future-date test below.
+        inquiry = norm_ts(existing.get("inquiry_at"))
+        if inquiry_date(item) or (inquiry and inquiry > now):
+            inquiry = norm_ts(fields["inquiry_at"])
         # An existing deal keeps the thread it was filed under unless it never
         # had one (a row created before thread_key existed) — re-keying a live
         # conversation would strand the messages already attached to it.
@@ -452,7 +511,8 @@ def ensure(tenant_id: str, site: str, item: dict, response: dict | None = None,
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (tenant_id, site, item_id, fields["kind"], NEW, fields["guest_name"],
              fields["unit_id"], fields["check_in"], fields["check_out"],
-             fields["nights"], fields["monthly_value"], fields["inquiry_at"],
+             fields["nights"], fields["monthly_value"],
+             norm_ts(fields["inquiry_at"]),
              "presale", 0, fields["thread_key"], now, now),
         )
     return get(tenant_id, site, item_id)
@@ -579,6 +639,11 @@ def update(tenant_id: str, site: str, item_id: str, **fields) -> None:
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:
         return
+    # The single chokepoint every deal write passes through, so it is the one
+    # place that can guarantee the timestamp columns stay mutually comparable.
+    for col in _TS_COLS:
+        if col in sets:
+            sets[col] = norm_ts(sets[col])
     assignments = ", ".join(f"{k}=?" for k in sets)
     vals = list(sets.values()) + [_now(), str(tenant_id), site, str(item_id)]
     with _conn() as c:
@@ -699,10 +764,10 @@ def _is_abandoned(deal: dict, stale_before: str) -> bool:
         return False
     if _guest_is_waiting(deal):
         return False
-    last = max(str(deal.get("last_guest_reply_at") or ""),
-               str(deal.get("last_contact_at") or ""),
-               str(deal.get("inquiry_at") or ""))
-    return bool(last) and last < stale_before
+    last = max(norm_ts(deal.get("last_guest_reply_at")) or "",
+               norm_ts(deal.get("last_contact_at")) or "",
+               norm_ts(deal.get("inquiry_at")) or "")
+    return bool(last) and last < (norm_ts(stale_before) or stale_before)
 
 
 # --- The one state the operator actually thinks in --------------------------
@@ -760,10 +825,10 @@ def lead_state(deal: dict, response: dict | None = None,
 
 def _guest_is_waiting(deal: dict) -> bool:
     """True when the guest's last message came after our last one."""
-    replied = str(deal.get("last_guest_reply_at") or "")
+    replied = norm_ts(deal.get("last_guest_reply_at")) or ""
     if not replied:
         return False
-    return replied > str(deal.get("last_contact_at") or "")
+    return replied > (norm_ts(deal.get("last_contact_at")) or "")
 
 
 def state_counts(rows: list[dict]) -> dict[str, int]:
@@ -796,8 +861,11 @@ def _state_sql(failed_count: int) -> str:
         WHEN d.stage IN ('{BOOKED}','{PRE_ARRIVAL}','{STAYING}','{COMPLETED}','{LOST}')
             THEN '{CLOSED}'
         WHEN r.status = 'dismissed' THEN '{CLOSED}'
+        -- REPLACE mirrors `norm_ts`'s separator handling for rows written
+        -- before it existed; every new write is already canonical.
         WHEN d.last_guest_reply_at IS NOT NULL
-             AND d.last_guest_reply_at > COALESCE(d.last_contact_at, '')
+             AND REPLACE(d.last_guest_reply_at, ' ', 'T')
+                 > REPLACE(COALESCE(d.last_contact_at, ''), ' ', 'T')
             THEN '{GUEST_REPLIED}'
         WHEN {failed} THEN '{NEEDS_YOU}'
         WHEN r.status = 'skipped'
@@ -840,8 +908,18 @@ def inbox_page(tenant_id: str, site: str, *, state: str | None = None,
     # The CASE sits in the SELECT list, so its parameters bind before the WHERE
     # clause's — order here is load-bearing.
     args: list = list(failed) + [tenant_id, site]
-    if kind in ("lead", "message"):
+    if kind == "lead":
         where.append("d.kind=?")
+        args.append(kind)
+    elif kind == "message":
+        # "Messages" cannot be `d.kind='message'`. A guest reply that threads
+        # onto an existing conversation deliberately gets no deal row of its own
+        # (that is what stops every reply opening a duplicate deal), so filtering
+        # the deal's *origin* kind showed only the messages that failed to
+        # thread — the exact opposite of "show me all the messages". A
+        # conversation belongs in this tab when the guest has written in it,
+        # whether it began as a direct message or as a lead they replied to.
+        where.append("(d.kind=? OR d.last_guest_reply_at IS NOT NULL)")
         args.append(kind)
     if unit:
         where.append("d.unit_id=?")

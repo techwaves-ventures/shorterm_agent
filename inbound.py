@@ -32,6 +32,7 @@ import hmac
 import logging
 import os
 import re
+from email.utils import parseaddr
 
 log = logging.getLogger(__name__)
 
@@ -105,12 +106,27 @@ def verify_webhook(supplied_secret: str) -> bool:
 
 
 def sender_allowed(sender: str) -> bool:
-    """Whether the original sender is a FurnishedFinder address."""
-    addr = (sender or "").strip().lower()
-    m = re.search(r"[\w.+-]+@([\w.-]+)", addr)
-    if not m:
+    """Whether the original sender is a FurnishedFinder address.
+
+    Parsed with `parseaddr` rather than searched with a regex. A regex takes the
+    first address-shaped run of characters *anywhere* in the header, and the
+    display name comes first — so
+
+        "no-reply@furnishedfinder.com" <attacker@evil.com>
+
+    matched on the quoted display name and was accepted, while the mail actually
+    came from the attacker. The address that matters is the one in the angle
+    brackets, which is the one `parseaddr` returns.
+    """
+    _, addr = parseaddr((sender or "").strip())
+    addr = addr.strip().lower()
+    # parseaddr yields '' for junk, and a bare 'a@b@c' must not be split into a
+    # trusted tail — so require exactly one '@' and a non-empty local part.
+    if addr.count("@") != 1:
         return False
-    domain = m.group(1)
+    local, _, domain = addr.partition("@")
+    if not local or not domain:
+        return False
     return any(domain == d or domain.endswith("." + d) for d in ALLOWED_SENDER_DOMAINS)
 
 
@@ -138,7 +154,21 @@ def extract_recipient(payload: dict) -> str:
 
 
 def extract_sender(payload: dict) -> str:
-    for key in ("from", "sender", "From", "envelope_from", "reply_to"):
+    """Who sent this, for the allowlist check in `sender_allowed`.
+
+    Ordered by how hard the field is to forge: the provider's envelope sender
+    first (it comes from the SMTP transaction, not the message body), then the
+    `From` header.
+
+    `Reply-To` and `X-Forwarded-For` are deliberately *not* consulted. Reply-To
+    says where a reply should go, not where the mail came from, and an attacker
+    sending from anywhere can set it to a FurnishedFinder address to clear the
+    allowlist; X-Forwarded-For is an HTTP proxy header that has no business
+    authorizing mail at all. Both were treated as sender evidence, which meant
+    the allowlist could be satisfied by a field the sender fully controls
+    without ever touching the envelope.
+    """
+    for key in ("envelope_from", "sender", "from", "From"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value
@@ -146,8 +176,11 @@ def extract_sender(payload: dict) -> str:
             return value.get("email") or value.get("address") or ""
     headers = payload.get("headers")
     if isinstance(headers, dict):
-        # A forward wraps the original; these headers preserve who really sent it.
-        for key in ("X-Forwarded-For", "X-Original-From", "Reply-To", "From"):
+        # A forward wraps the original; X-Original-From is set by the forwarder
+        # to preserve who really sent it, so a host relaying their FF mail into
+        # us still passes. It is only as trustworthy as the forwarding mailbox,
+        # which is why it ranks below the envelope.
+        for key in ("X-Original-From", "From"):
             if headers.get(key):
                 return str(headers[key])
     return ""

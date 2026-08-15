@@ -424,7 +424,8 @@ def enqueue_send(tenant_id: str, site: str, item_id: str, body: str,
 
 
 def enqueue_autopilot_reply(tenant_id: str, site: str, item_id: str, body: str,
-                            reason: str = "") -> dict | None:
+                            reason: str = "",
+                            step: dict | None = None) -> dict | None:
     """Queue autopilot's unattended first reply — through the same rails as the
     scheduled steps, and honestly labelled.
 
@@ -439,9 +440,14 @@ def enqueue_autopilot_reply(tenant_id: str, site: str, item_id: str, body: str,
     Now: the intro step must be auto-send-eligible under this tenant's settings
     (it is not, by default) or the message waits for approval like every other
     draft, and delivery is clamped out of the middle of the night.
+
+    `step` names which step this is. It defaults to the intro because the common
+    case is a brand-new lead, but a reply to a guest who wrote back must pass
+    `sequences.GUEST_REPLY` — labelling that "First reply" told the operator the
+    conversation was starting when it was already underway.
     """
     auto = settings_for(tenant_id)
-    step = sequences.find_step(sequences.PRESALE, "intro") or {}
+    step = step or sequences.find_step(sequences.PRESALE, "intro") or {}
     may_auto = auto["enabled"] and sequences.can_auto_send(step, auto["steps"])
     deal = pipeline.get(tenant_id, site, item_id)
     msg = outbox.add(

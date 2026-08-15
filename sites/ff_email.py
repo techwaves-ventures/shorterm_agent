@@ -121,6 +121,68 @@ _BOILERPLATE = re.compile(
     re.I,
 )
 
+# Where the guest's own message stops and the history they replied on top of
+# begins. Everything from the first of these to the end of the body is the
+# previous conversation (or a mail-client signature), not this message.
+#
+# Every marker here has to be unambiguous, because cutting at the wrong line
+# silently deletes what the guest said. A run of dashes is specifically NOT a
+# marker: FurnishedFinder uses those as layout dividers inside its own wrapper,
+# above the guest's text, so cutting there would drop the entire message. Only
+# the exact RFC 3676 signature delimiter ("--" alone on its line) qualifies.
+_QUOTE_START = re.compile(
+    r"^\s*(>|--\s*$|"
+    r"on\s.{0,120}\swrote\s*:\s*$|"
+    r"-+\s*original message\s*-+|"
+    r"from\s*:\s.+\bsent\s*:|"
+    r"begin forwarded message)",
+    re.I,
+)
+
+
+def _strip_quoted(body: str) -> str:
+    """Drop the quoted history and signature a reply is stacked on top of.
+
+    A guest replying from their mail client sends their sentence followed by the
+    entire prior thread — including our own last message. Storing all of it made
+    the thread view show us our own words back, attributed to the guest, and
+    grew without bound as the conversation went on.
+    """
+    lines = (body or "").split("\n")
+    for i, line in enumerate(lines):
+        if _QUOTE_START.match(line):
+            return "\n".join(lines[:i]).rstrip()
+    return body or ""
+
+
+def _is_wrapper_value(value: str) -> bool:
+    """Whether `Label: <value>` is a template field rather than the guest talking.
+
+    The label filter used to drop any line whose first word matched a template
+    field, wherever it appeared. Guests answer in exactly those words, so
+    "Budget: I can do $2000." and "Pets: yes, one cat" were deleted from the
+    message before it was ever shown — the operator saw a reply with the single
+    most important sentence missing.
+
+    A wrapper value is short and declarative: "$2,400/month", "Yes", "8/16/26".
+    Once it runs to a sentence, it is prose, and prose belongs to the guest.
+    """
+    v = (value or "").strip()
+    if not v:
+        return True
+    if len(v) > 60:
+        return False
+    # A sentence's worth of words, or sentence punctuation, means they wrote it.
+    if re.search(r"[.!?]\s|[.!?]$", v) and len(v.split()) > 2:
+        return False
+    # A comma that separates words is someone elaborating ("yes, one cat")
+    # rather than a form field. Commas that precede a number are punctuation
+    # inside a value — "$2,400/month", "July 19, 2026" — and stay wrapper.
+    if re.search(r",(?!\s*\d)", v) and len(v.split()) > 2:
+        return False
+    return not re.search(r"\b(i|i'm|im|we|we're|my|our|can|could|would|please)\b",
+                         v, re.I)
+
 
 def _guest_text(body: str) -> str:
     """Just what the guest actually wrote, without the notification wrapper.
@@ -136,7 +198,7 @@ def _guest_text(body: str) -> str:
     survives, the caller still has the untrimmed text.
     """
     kept = []
-    for line in (body or "").split("\n"):
+    for line in _strip_quoted(body).split("\n"):
         stripped = line.strip().strip("·|").strip()
         if not stripped:
             kept.append("")
@@ -145,6 +207,8 @@ def _guest_text(body: str) -> str:
             continue
         label = stripped.split(":", 1)[0].strip().lower() if ":" in stripped else ""
         if label and label in _TEMPLATE_LABELS:
+            if not _is_wrapper_value(stripped.split(":", 1)[1]):
+                kept.append(stripped)
             continue
         if stripped.lower() in _TEMPLATE_LABELS:
             continue

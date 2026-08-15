@@ -149,7 +149,14 @@ def test_sql_and_python_agree_with_every_filter_combined(tenant):
                 has_failed_send=deal["item_id"] in failed)
             # Every filter must actually hold on every returned row.
             assert not state or row["state"] == state
-            assert not kind or deal["kind"] == kind
+            # "Messages" is every conversation the guest has written in, not
+            # just the deals whose *origin* was a direct message — a reply that
+            # threads onto a lead never gets a deal row of its own.
+            if kind == "message":
+                assert (deal["kind"] == "message"
+                        or deal["last_guest_reply_at"]), deal
+            elif kind:
+                assert deal["kind"] == kind
             assert not unit or deal["unit_id"] == unit
     assert checked > 500, "the sweep has to actually return rows to prove anything"
 
