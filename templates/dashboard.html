@@ -157,6 +157,20 @@
       {% for f in flashes %}<div class="flash">{{ f }}</div>{% endfor %}
     {% endwith %}
 
+    {# Messages are waiting and no process in this deployment can send them.
+       This host cannot drive a browser and no worker has heartbeated, so the
+       cards below would otherwise sit on "Queued to send…" indefinitely with
+       nothing to explain it. Only shown when all three are true, so a healthy
+       worker-queue deployment never sees it. #}
+    {% if board.no_capable_sender %}
+    <div class="banner error show" role="alert">
+      <span><b>Nothing is available to send your replies.</b>
+        {{ board.outbox_counts.queued }} approved message{{ '' if board.outbox_counts.queued == 1 else 's' }}
+        {{ 'is' if board.outbox_counts.queued == 1 else 'are' }} queued. This host can’t send them
+        itself and the worker service isn’t running — they’ll go out as soon as it’s back.</span>
+    </div>
+    {% endif %}
+
   {% if not can_scrape %}
     <div class="connect-card">
       <h2>Connect your FurnishedFinder account</h2>
