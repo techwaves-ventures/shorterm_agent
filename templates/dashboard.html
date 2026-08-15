@@ -307,7 +307,12 @@
                 {# Rendered disabled by the server, not by JS: the poll needs a
                    round-trip, and until it lands the button is live over a send
                    that is already going out. A failed fetch never lands. #}
-                <button class="mini primary" id="send-{{ c.id }}" onclick="sendReply('{{ c.id }}')"{% if c.send and c.send.in_flight %} disabled{% endif %}>{% if c.send and c.send.in_flight %}{{ c.send.label }}{% else %}Approve &amp; send{% endif %}</button>
+                {# `data-label` carries the resting caption because `setBusy`
+                   caches `innerHTML` the first time it makes a button busy, and
+                   that innerHTML is now the server-rendered "Sending…". Without
+                   it, a completed send hands the button back live and still
+                   captioned "Sending…". #}
+                <button class="mini primary" id="send-{{ c.id }}" data-label="Approve &amp; send" onclick="sendReply('{{ c.id }}')"{% if c.send and c.send.in_flight %} disabled{% endif %}>{% if c.send and c.send.in_flight %}{{ c.send.label }}{% else %}Approve &amp; send{% endif %}</button>
                 <button class="mini" id="draft-{{ c.id }}" onclick="draftItem('{{ c.id }}')">Re-draft</button>
                 <button class="mini" onclick="markBooked('{{ c.id }}')">Mark booked</button>
                 <button class="mini danger" onclick="markLost('{{ c.id }}')">Lost</button>
@@ -359,7 +364,7 @@
                    for the same guest can be in flight; approving then releases
                    a second message mid-delivery. The id is what lets the poll
                    reach this button at all — it had none. #}
-                <button class="mini primary" id="approve-ob-{{ msg.id }}" data-item="{{ c.id }}" onclick="approveMsg({{ msg.id }})"{% if c.send and c.send.in_flight %} disabled{% endif %}>{% if c.send and c.send.in_flight %}{{ c.send.label }}{% else %}Approve &amp; send{% endif %}</button>
+                <button class="mini primary" id="approve-ob-{{ msg.id }}" data-item="{{ c.id }}" data-label="Approve &amp; send" onclick="approveMsg({{ msg.id }})"{% if c.send and c.send.in_flight %} disabled{% endif %}>{% if c.send and c.send.in_flight %}{{ c.send.label }}{% else %}Approve &amp; send{% endif %}</button>
                 <button class="mini danger" onclick="cancelMsg({{ msg.id }})">Don't send</button>
               </div>
               <div class="msg" id="msg-ob-{{ msg.id }}"></div>

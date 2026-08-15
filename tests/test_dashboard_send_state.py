@@ -216,6 +216,27 @@ def test_the_poll_is_armed_on_load_with_no_user_action(client, tenant):
         not in scripts, "the one-shot fallback still short-circuits the poll"
 
 
+@pytest.mark.parametrize("status", [outbox.SENDING, outbox.QUEUED])
+def test_an_in_flight_button_carries_its_resting_caption(client, tenant, status):
+    """Found in the browser, not by the suite.
+
+    `setBusy` caches `innerHTML` the first time it makes a button busy and
+    restores it on the way out. Server-rendering the caption as "Sending…"
+    poisoned that cache: when the send settled, `setBusy(btn, false)` handed the
+    button back **enabled and still captioned "Sending…"** — a live control
+    claiming to be mid-send, which is the ticket's own complaint inverted.
+    """
+    _deal(tenant, "s1")
+    _row(tenant, "s1", status)
+
+    html = _server_html(_dashboard_html(client))
+    btn = _button(html, "send-s1")
+    assert 'data-label="Approve &amp; send"' in btn, (
+        "no resting caption, so setBusy will restore this button to whatever "
+        "the server rendered while it was in flight"
+    )
+
+
 def test_the_client_tests_in_flight_before_status(client, tenant):
     """The shared helper does not close the defect on its own.
 
