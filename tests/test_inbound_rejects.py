@@ -1002,12 +1002,23 @@ def test_two_sends_of_the_same_words_recover_onto_two_deals(client, monkeypatch)
              "Any update?\n")
     resend = words + "\n> On Aug 3 you wrote:\n> Thanks for reaching out, I will check.\n"
 
+    # Pin our own capture clock so the two rows share a `received_at`. Without
+    # this the test passes for the wrong reason: two captures a second apart get
+    # different write times, and the fallback separates them even when the mail
+    # date is never stored at all — so the assertion below would guard the
+    # fallback rather than the `mail_date` column it is here to guard.
+    monkeypatch.setattr(inbound_rejects, "_now",
+                        lambda: "2026-08-15T09:00:00+00:00")
+
     # Before the parser fix: neither can be read, so both land on the review list.
     monkeypatch.setattr(ff_email, "parse", lambda *a, **kw: None)
     _post(client, tid, subject=subject, body=words,
           date="Mon, 3 Aug 2026 09:00:00 +0000")
     _post(client, tid, subject=subject, body=resend,
           date="Tue, 11 Aug 2026 09:00:00 +0000")
+    assert len({r["received_at"] for r in inbound_rejects.open_for_tenant(tid, SITE)}) == 1, (
+        "control: the write times are identical, so only mail_date can separate these"
+    )
 
     rows = inbound_rejects.open_for_tenant(tid, SITE)
     assert len(rows) == 2, "precondition: two distinct rows, not one deduped row"
