@@ -35,6 +35,7 @@ eviction is logged (a pruned unreviewed row always warns), so it is bounded and
 visible rather than silent, but separating the two would need bulk-mail headers
 this table does not keep.
 """
+import functools
 import hashlib
 import logging
 import threading
@@ -138,22 +139,45 @@ def _db_identity() -> str:
     return f"{db.backend()}\x00{db.database_url()}\x00{db.DB_PATH}"
 
 
+# These predicates now *gate* the DDL rather than merely informing it, so each
+# has to identify the object this module will actually write to. `IF NOT EXISTS`
+# used to be the backstop for a loose answer; there is no backstop now, and a
+# false "it is already there" leaves `record` failing on every later call behind
+# a 202. On Postgres they therefore resolve through `to_regclass`, which honours
+# search_path and answers about one specific relation, instead of matching a
+# bare name anywhere in the database.
 def _table_exists(c: db.Conn) -> bool:
+    if c.pg:
+        row = c.execute("SELECT to_regclass('inbound_rejects')").fetchone()
+        return bool(row and row[0])
     return bool(db.table_columns(c, "inbound_rejects"))
 
 
 def _has_mail_date(c: db.Conn) -> bool:
+    if c.pg:
+        row = c.execute(
+            "SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('inbound_rejects') "
+            "AND attname = ? AND NOT attisdropped", ("mail_date",),
+        ).fetchone()
+        return bool(row)
     return "mail_date" in db.table_columns(c, "inbound_rejects")
 
 
-def _index_exists(c: db.Conn, name: str) -> bool:
+def _index_exists(c: db.Conn, name: str, unique: bool = False) -> bool:
     if c.pg:
+        # The name alone is not the question. The same name on another table or
+        # in another schema would skip the index `record`'s ON CONFLICT needs;
+        # and a *non-unique* index of the right name satisfies `CREATE ... IF NOT
+        # EXISTS` while failing that upsert, so uniqueness is part of it too.
         row = c.execute(
-            "SELECT 1 FROM pg_class WHERE relname=? AND relkind='i'", (name,)
+            "SELECT 1 FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid "
+            "WHERE i.relname = ? AND x.indrelid = to_regclass('inbound_rejects') "
+            "AND (x.indisunique OR NOT ?)", (name, bool(unique)),
         ).fetchone()
     else:
         row = c.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (name,)
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=? "
+            "AND tbl_name='inbound_rejects'", (name,),
         ).fetchone()
     return bool(row)
 
@@ -187,14 +211,28 @@ def _ensure_object(exists, apply) -> None:
         try:
             with db.connect() as c:
                 apply(c)
-            return
         except Exception as exc:
             # Another process got there first (or is mid-commit): re-check on a
             # fresh transaction, which blocks until the winner is done.
             last = exc
-    with db.connect() as c:
-        if exists(c):
-            return
+            continue
+        # "It did not raise" is not the same as "it is there". A statement that
+        # silently no-ops — `IF NOT EXISTS` matching something that is not what
+        # this module needs — would otherwise be recorded as success and wedge
+        # the process, since the memo above never asks again.
+        with db.connect() as c:
+            if exists(c):
+                return
+        last = last or RuntimeError(
+            "schema statement reported success but the object is still absent")
+    try:
+        with db.connect() as c:
+            if exists(c):
+                return
+    except Exception:
+        # The catalog read failing must not replace the DDL error that caused
+        # all this — that is the one a reader needs to see.
+        log.exception("Could not re-check the inbound_rejects schema")
     raise last
 
 
@@ -206,11 +244,15 @@ def _ensure_schema() -> None:
     DDL sharing that transaction is a live lead-loss window on Postgres: a
     concurrent `CREATE INDEX IF NOT EXISTS` takes a ShareLock on the table *even
     when the index already exists*, which conflicts with the RowExclusiveLock
-    another request's upsert holds. Four concurrent processes measured 12/32
-    `record()` calls raising `DeadlockDetected` in the steady state where every
-    object already exists — a permanent condition, not a deploy-window one — and
-    the ingress swallows that, answers 202, and the lead this table exists to
-    preserve is dropped. Hoisting the DDL out and changing nothing else: 0/32.
+    another request's upsert holds. Measured on PostgreSQL 16 with 4 concurrent
+    processes in the steady state where every object already exists — a
+    permanent condition, not a deploy-window one — `record()` raised
+    `DeadlockDetected` on 5 to 17 of every 32 calls depending on the run, and
+    24/32 at cold start. Every one of those is a lead dropped behind a 202,
+    because the ingress swallows it. With the DDL hoisted out and nothing else
+    changed: 0/32, every run. Putting a single `CREATE INDEX IF NOT EXISTS` back
+    onto the connection `_conn` returns brings it straight back (19/32), which is
+    what attributes the difference to this and not to anything else.
 
     So the request path gets a plain connection, and in the steady state the
     cost of this is a memo lookup: after the first call, no DDL statement is
@@ -249,7 +291,7 @@ def _ensure_schema() -> None:
         # Carries the dedup: an identical replay lands on the same row. Also the
         # conflict target of `record`'s upsert, so it must exist before any write.
         _ensure_object(
-            lambda c: _index_exists(c, "ix_inbound_rejects_fp"),
+            lambda c: _index_exists(c, "ix_inbound_rejects_fp", unique=True),
             lambda c: c.execute(
                 """CREATE UNIQUE INDEX IF NOT EXISTS ix_inbound_rejects_fp
                    ON inbound_rejects (tenant_id, site, fingerprint)"""),
@@ -268,6 +310,51 @@ def _ensure_schema() -> None:
 def _conn() -> db.Conn:
     _ensure_schema()
     return db.connect()
+
+
+# Phrases both engines use when the thing this module owns is not there. The
+# last one is Postgres refusing an upsert whose conflict target is missing,
+# i.e. the unique index gone while the table stayed.
+_SCHEMA_GONE = (
+    "no such table", "no such column", "does not exist",
+    "matching the on conflict",
+)
+
+
+def _schema_may_be_gone(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(phrase in text for phrase in _SCHEMA_GONE)
+
+
+def _repairs_schema(fn):
+    """Re-check the schema once if a call says it has gone missing.
+
+    The memo means this module asks about its table exactly once per process,
+    which is the point — but it also removed a property the old per-connection
+    `CREATE TABLE IF NOT EXISTS` had for free: recovery. Every other module here
+    still self-heals if its table is dropped, the database is recreated, or a
+    deploy rebuilds it under a running process; without this, that leaves this
+    one module wedged for the process's whole lifetime while the rest of the app
+    carries on. And wedged is expensive here: `record` failing is swallowed by
+    the ingress behind a 202 (the silent loss this table exists to end) and
+    `count_open` failing takes the dashboard down with it.
+
+    One retry only, and only for errors that name a missing relation or column —
+    a genuinely broken schema still surfaces rather than looping.
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        global _schema_ready
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            if not _schema_may_be_gone(exc):
+                raise
+            log.warning("inbound_rejects schema looks absent (%s); re-checking", exc)
+            with _schema_lock:
+                _schema_ready = None
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 def _row(r) -> dict:
@@ -338,6 +425,7 @@ def _prune(c: db.Conn, tenant_id: str, site: str) -> None:
     )
 
 
+@_repairs_schema
 def record(tenant_id: str, site: str, reason_code: str, reason: str,
            payload: dict) -> int | None:
     """Store one rejected inbound message. Returns the row id.
@@ -392,6 +480,7 @@ def record(tenant_id: str, site: str, reason_code: str, reason: str,
     return row[0] if row else None
 
 
+@_repairs_schema
 def open_for_tenant(tenant_id: str, site: str) -> list[dict]:
     """Unresolved rejections, newest first — what the review page lists."""
     tenant_id = str(tenant_id)
@@ -403,6 +492,7 @@ def open_for_tenant(tenant_id: str, site: str) -> list[dict]:
     return [_row(r) for r in rows]
 
 
+@_repairs_schema
 def count_open(tenant_id: str, site: str) -> int:
     """How many leads are currently sitting unread. Drives the dashboard banner."""
     tenant_id = str(tenant_id)
@@ -414,6 +504,7 @@ def count_open(tenant_id: str, site: str) -> int:
     return int(row[0]) if row else 0
 
 
+@_repairs_schema
 def count_all(tenant_id: str, site: str) -> int:
     """Every retained row, resolved or not — the denominator on the settings line."""
     tenant_id = str(tenant_id)
@@ -425,6 +516,7 @@ def count_all(tenant_id: str, site: str) -> int:
     return int(row[0]) if row else 0
 
 
+@_repairs_schema
 def get(tenant_id: str, site: str, rid: int) -> dict | None:
     """One row, scoped to its owner.
 
@@ -439,6 +531,7 @@ def get(tenant_id: str, site: str, rid: int) -> dict | None:
     return _row(row) if row else None
 
 
+@_repairs_schema
 def dismiss(tenant_id: str, site: str, rid: int) -> bool:
     """Take a row off the open list, keeping it as an audit record."""
     with _conn() as c:
@@ -450,6 +543,7 @@ def dismiss(tenant_id: str, site: str, rid: int) -> bool:
         return bool(cur.rowcount)
 
 
+@_repairs_schema
 def mark_recovered(tenant_id: str, site: str, rid: int, item_id: str) -> bool:
     """A retry parsed: link the row to the deal it became.
 
@@ -465,6 +559,7 @@ def mark_recovered(tenant_id: str, site: str, rid: int, item_id: str) -> bool:
         return bool(cur.rowcount)
 
 
+@_repairs_schema
 def reopen(tenant_id: str, site: str, rid: int, reason: str) -> None:
     """Put a row back on the list after a recovery attempt failed part-way.
 
@@ -481,6 +576,7 @@ def reopen(tenant_id: str, site: str, rid: int, reason: str) -> None:
         )
 
 
+@_repairs_schema
 def update_reason(tenant_id: str, site: str, rid: int, reason: str) -> None:
     """Refresh the failure detail after a retry that still could not parse."""
     with _conn() as c:

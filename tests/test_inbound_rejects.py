@@ -1734,3 +1734,136 @@ def test_recording_a_reject_issues_no_ddl_on_the_write_connection(client, monkey
     ddl = [s for s in seen
            if s.upper().startswith(("CREATE ", "ALTER ", "DROP "))]
     assert ddl == [], f"DDL in the request path is what deadlocks Postgres: {ddl}"
+
+
+def test_one_item_the_board_cannot_take_does_not_blank_the_whole_board(client, monkeypatch):
+    """Keeping a failed item is only safe if replaying it can't take the page down.
+
+    `store` now keeps the stored item so `backfill` can heal it, and `backfill`
+    runs on every dashboard load and board poll. Without per-item isolation the
+    one item that made the board write fail is replayed into an unguarded loop
+    forever: during a write outage — the very moment it was kept for — the host
+    sees no board at all, and a payload that fails deterministically would 500
+    the page for as long as it is stored. Losing one lead is bad; hiding every
+    lead is worse, and it is the fix for the first that creates the second.
+    """
+    import pipeline as pipeline_mod
+
+    tid = _tenant_with_login(client)
+
+    down = {"yes": True}
+    real_ensure = pipeline_mod.ensure
+
+    def flaky(*a, **kw):
+        if down["yes"]:
+            raise RuntimeError("database is locked")
+        return real_ensure(*a, **kw)
+
+    monkeypatch.setattr(pipeline_mod, "ensure", flaky)
+    assert _post(client, tid, body=GOOD_LEAD).status_code == 202
+
+    # The outage is still running: the operator opens their board.
+    assert client.get("/dashboard").status_code == 200, (
+        "a stored item that cannot be backfilled must not 500 the board"
+    )
+    assert client.get("/api/board").status_code == 200
+
+    # And when it clears, the item is still there to heal.
+    down["yes"] = False
+    assert client.get("/dashboard").status_code == 200
+    assert len(pipeline.all_deals(tid, SITE)) == 1, "the lead must still arrive"
+
+
+def test_a_lead_recovered_after_a_board_failure_still_gets_its_draft(client, monkeypatch):
+    """Nothing drafted this lead yet, so the retry must.
+
+    The webhook skipped drafting because `store` reported the board refused it.
+    If the retry then reports "you already had this" purely because the dedup row
+    survives, both paths decline and the guest is answered by nobody — a lead on
+    the board with no reply queued, which is the failure this feature exists to
+    prevent wearing a quieter costume.
+    """
+    import pipeline as pipeline_mod
+    import runner as runner_mod
+
+    tid = _tenant_with_login(client)
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: {
+        "kind": "lead", "id": "lead-recovered", "title": "Recovered | Emma",
+        "url": "u", "source": "email", "raw": body, "traveler": "Emma",
+        "property_name": "Recovered",
+    })
+
+    # The webhook delivery that stored the item but could not open the deal.
+    down = {"yes": True}
+    real_ensure = pipeline_mod.ensure
+    monkeypatch.setattr(pipeline_mod, "ensure", lambda *a, **kw: (
+        (_ for _ in ()).throw(RuntimeError("database is locked")) if down["yes"]
+        else real_ensure(*a, **kw)))
+    _post(client, tid, body="the same email, now parseable")
+    assert len(pipeline.all_deals(tid, SITE)) == 0, "precondition: nothing landed"
+
+    drafted = []
+    monkeypatch.setattr(runner_mod, "draft_ingested",
+                        lambda t, s, it: drafted.append(it.get("id")))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    # The outage clears and the operator opens their board on the way to the
+    # review page — so `backfill`, not the retry, is what puts the lead on the
+    # board. That ordering is the common one, and it is the one that hides this
+    # defect: the retry then finds the lead already there and stands down.
+    down["yes"] = False
+    assert client.get("/dashboard").status_code == 200
+    assert len(pipeline.all_deals(tid, SITE)) == 1, "precondition: backfill landed it"
+    assert drafted == [], "precondition: backfill drafts nothing"
+
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    assert drafted == ["lead-recovered"], (
+        f"a lead no path has drafted must be drafted by the one that recovers it; got {drafted}"
+    )
+    assert inbound_rejects.get(tid, SITE, rid)["status"] == "recovered"
+
+    # And a second click must not queue a second reply for the same guest.
+    client.post(f"/inbound/rejected/{rid}/retry")
+    assert drafted == ["lead-recovered"], "a second click must not draft again"
+
+
+def test_a_retry_during_a_live_outage_keeps_the_row_on_the_list(client, monkeypatch):
+    """A stored-but-unapplied item must not read as recovered.
+
+    The dedup row surviving a board failure means `already_seen` is true while
+    nothing is on the board. Answering the retry from that flag alone clears the
+    row off the operator's list and flashes "on your board" for a lead that is
+    still nowhere — the exact silent loss this page exists to end, now with a
+    reassuring message attached.
+    """
+    import pipeline as pipeline_mod
+
+    tid = _tenant_with_login(client)
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: {
+        "kind": "lead", "id": "still-down", "title": "Down | Emma", "url": "u",
+        "source": "email", "raw": body, "traveler": "Emma", "property_name": "Down",
+    })
+    # An outage that spans both the delivery and the retry click.
+    monkeypatch.setattr(pipeline_mod, "ensure", lambda *a, **kw: (_ for _ in ()).throw(
+        RuntimeError("database is locked")
+    ))
+
+    _post(client, tid, body="the same email, now parseable")
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    assert len(pipeline.all_deals(tid, SITE)) == 0, "precondition: still nothing on the board"
+    assert inbound_rejects.get(tid, SITE, rid)["status"] == "open", (
+        "the row must stay on the list while the lead is not on the board"
+    )
+    assert inbound_rejects.count_open(tid, SITE) == 1

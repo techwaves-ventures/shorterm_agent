@@ -543,7 +543,18 @@ def inbound_rejected_retry(rid):
     # Note this is the full ingest follow-through, so with the scheduler on it
     # can send, not just draft — which is why the already-ingested case must not
     # fall through to here.
-    if not already_had_it and os.getenv("ANTHROPIC_API_KEY"):
+    #
+    # A lead gets one more question asked of it. Since `store` keeps its item
+    # through a board failure, `backfill` can put that lead on the board on any
+    # dashboard load — and backfill opens deals without drafting anything. So
+    # "already ingested" stopped implying "already answered", and gating on it
+    # alone left a recovered lead on the board that no path had ever drafted:
+    # the webhook skipped it because the board refused it, and the retry skipped
+    # it because the dedup row had outlived the failure. The response store
+    # answers this directly for a lead, and it is also the safer gate — a second
+    # click cannot double-draft something already drafted.
+    should_draft = not already_had_it or not inbound.already_answered(tenant_id, item, SITE)
+    if should_draft and os.getenv("ANTHROPIC_API_KEY"):
         try:
             runner.draft_ingested(tenant_id, SITE, item)
         except Exception:

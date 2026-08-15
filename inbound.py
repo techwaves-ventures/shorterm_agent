@@ -347,6 +347,61 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
     return True
 
 
+def already_answered(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
+    """Whether a reply has already been drafted for this item.
+
+    For a **lead** the response store answers directly: a lead owns its own
+    response row, so this distinguishes "on the board" from "on the board and
+    already answered" — which `backfill` made two different things, since it
+    opens deals and drafts nothing.
+
+    For a **message** this answers `True`, which is the conservative direction
+    and the one that preserves the existing rule. A threaded reply's draft is
+    stored against the *parent* deal, where that conversation's own introduction
+    already sits, so the store cannot tell "this reply was answered" from "this
+    conversation was ever answered". Answering False here would draft a reply on
+    every click of Try again — a second answer to a guest who wrote once, which
+    is a filed defect on this path. So a message keeps the older rule: it is
+    drafted when this attempt is the one that applied it, and not otherwise.
+    """
+    import storage
+
+    if item.get("kind", "lead") == "message":
+        return True
+    return bool(storage.get_responses(tenant_id, site).get(str(item.get("id", ""))))
+
+
+def _applied(tenant_id: str, item: dict, site: str) -> bool:
+    """Whether a *stored* item's effect is already on the board.
+
+    Only meaningful for an item `storage` has already seen. It answers "did the
+    ingest that recorded this actually finish?", which stopped being the same
+    question as "is it seen?" once `store` began keeping its row through a board
+    failure so `backfill` could heal it.
+
+    A **lead** owns a deal row, so the board answers directly.
+
+    A **message** is answered `True` by policy, not by evidence, and that is the
+    conservative direction on purpose. A threaded reply owns no deal of its own;
+    the only trace it leaves is the stamp on its parent, and that cannot be
+    attributed to *this* reply. Comparing the stored `first_seen` against the
+    parent's `last_guest_reply_at` — the comparison `backfill` uses — is sound
+    there only because `store` writes `first_seen` *before* attempting the board
+    write. `recover` inverts that order, so a reply recovered through here lands
+    its stamp before its row and would read as un-applied on the next click, at
+    second precision, sometimes. Re-applying a reply is not a harmless retry: it
+    cancels the deal's queued follow-up and drafts a second answer to a guest who
+    wrote once, which is a filed defect on this very path. So the ambiguous case
+    stands down and leaves recovery to `backfill`, whose own predicate is
+    evaluated against the ordering it is sound for.
+    """
+    import pipeline
+
+    if item.get("kind", "lead") == "message":
+        return True
+    return bool(pipeline.get(tenant_id, site, str(item.get("id", ""))))
+
+
 def _thread_parent(tenant_id: str, item: dict, site: str):
     """The open deal this item continues, or None if it starts its own."""
     import pipeline
@@ -425,26 +480,26 @@ def recover(tenant_id: str, item: dict, site: str = "furnishedfinder") -> tuple[
 
     kind = item.get("kind", "lead")
     if storage.already_seen(tenant_id, site, kind, item.get("id", "")):
-        # Ingested by an earlier delivery, so do not apply it a second time.
-        #
-        # Nothing further is checked, and that is the point. There is no board
-        # state that answers "did *this message* land?" after the fact: a reply
-        # leaves no deal of its own, so the only thing to look at is the parent
-        # conversation, which was already there before the message arrived and
-        # is gone once the deal closes. Reading it says "safe" for a reply that
-        # never landed, and "lost" for one that landed and was since completed —
-        # wrong in both directions, and the second leaves a row no click can
-        # ever clear.
-        #
-        # `seen` does not mean "landed" — `store` keeps its row even when the
-        # board refuses the item — and this still reports on_board, because the
-        # stored payload is precisely what `pipeline.backfill` opens a deal from
-        # on every dashboard load and board poll. So a seen item is either on
-        # the board already or is one page load away from it, without anyone
-        # clicking anything; what it is not is lost, which is the only question
-        # this review row exists to answer. The path below marks nothing until
-        # the board has taken it, so the flag is never set by a failed attempt.
-        return (True, True)
+        # `seen` does not mean "landed": `store` keeps its dedup row even when
+        # the board refuses the item, so that the stored payload survives for
+        # `pipeline.backfill` to heal from. Reporting on_board from the flag
+        # alone would therefore be a guess, and a wrong one in exactly the case
+        # the operator is clicking Try again for — nothing landed, and this
+        # would clear the row off their list saying it had.
+        if _applied(tenant_id, item, site):
+            # Applied by an earlier delivery, so do not apply it a second time:
+            # re-running a reply cancels the deal's queued follow-up and drafts
+            # a second answer for a guest who only ever wrote once.
+            return (True, True)
+        # Stored, never applied. This attempt is the one that lands it, and it
+        # says so: a lead recovered through here has had no draft queued by any
+        # path (the webhook skipped it too, for the same failure), so reporting
+        # "you already had this" would quietly cost it its answer.
+        try:
+            return (False, open_deal(tenant_id, item, site))
+        except Exception:
+            log.exception("Could not open a deal for stored item %s", item.get("id"))
+            return (False, False)
 
     try:
         on_board = open_deal(tenant_id, item, site)

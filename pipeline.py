@@ -613,60 +613,76 @@ def backfill(tenant_id: str, site: str, items: dict[str, dict],
     now = _now()
     created = 0
     for item_id, item in items.items():
-        deal = existing.get(item_id)
-        if deal is not None:
-            # Already open — re-derive only when the stored clock is wrong:
-            # either impossible (a future "inquiry" date, from the old row-based
-            # parsing) or superseded by a trustworthy `received_at` that a later
-            # detail scrape backfilled onto the item. Otherwise leave it alone,
-            # so the steady-state cost of this pass stays one SELECT.
-            stored = str(deal.get("inquiry_at") or "")
-            truth = inquiry_date(item)
-            if stored > now or (truth and stored[:10] != truth):
-                ensure(tenant_id, site, {**item, "id": item_id},
-                       responses.get(item_id), units=units)
-            continue
-        item = {**item, "id": item_id}
-        # A message belonging to a conversation we already have joins it rather
-        # than opening a second deal — the same rule the live ingest path uses.
-        # Without this, backfilling a mailbox re-creates exactly the duplicate
-        # deals that threading exists to prevent.
-        if item.get("kind") == "message":
-            parent = find_thread(tenant_id, site, thread_key(item),
-                                 exclude_item_id=item_id)
-            if parent:
-                # Only stamp a reply *newer* than the one already recorded.
-                # A threaded message never gets a deal row of its own, so it is
-                # never in `existing` and this branch re-runs on every backfill
-                # — and backfill runs on every dashboard load. Re-stamping
-                # unconditionally would re-clear next_action_at each time, so
-                # any deal that had ever received a guest message could never
-                # hold a scheduled follow-up again. That is the opposite of what
-                # threading is for.
-                # Both sides normalized, or the comparison lies again. The
-                # column goes through `norm_ts` on every write, but
-                # `first_seen` is a raw space-separated UTC database default —
-                # comparing one against the other as strings put a same-day
-                # *follow-up* reply below the stamp already recorded, so it was
-                # silently dropped on every backfill. That is the original
-                # defect's exact symptom, one path over.
-                at = norm_ts(item.get("first_seen")) or ""
-                seen_at = norm_ts(parent.get("last_guest_reply_at")) or ""
-                if at and at > seen_at:
-                    record_guest_reply(tenant_id, site, parent["item_id"], at=at)
-                elif not at and not seen_at:
-                    record_guest_reply(tenant_id, site, parent["item_id"])
-                continue
-        deal = ensure(tenant_id, site, item, responses.get(item_id), units=units)
-        # A reply already went out before the pipeline existed: reflect that so
-        # the deal doesn't reappear in "needs you" and skew response metrics.
-        resp = responses.get(item_id) or {}
-        if deal and resp.get("status") == "sent":
-            update(tenant_id, site, item_id, stage=CONTACTED,
-                   first_reply_at=resp.get("sent_at"),
-                   last_contact_at=resp.get("sent_at"))
-        created += 1
+        try:
+            created += _backfill_one(tenant_id, site, item_id, item, existing,
+                                     responses, units, now)
+        except Exception:
+            # One unusable item must not blank the whole board. This runs on
+            # every dashboard load and board poll, so an item that fails here —
+            # a transient locked database, or a payload this code cannot derive
+            # a deal from — would otherwise 500 the page for as long as it is
+            # stored, turning one lead that needs backfilling into no visible
+            # leads at all. The item stays stored and the next pass retries it.
+            log.exception("Backfill skipped item %s", item_id)
     return created
+
+
+def _backfill_one(tenant_id: str, site: str, item_id: str, item: dict,
+                  existing: dict, responses: dict, units, now: str) -> int:
+    """Put one stored item on the board if it isn't there. Returns 1 if it opened a deal."""
+    deal = existing.get(item_id)
+    if deal is not None:
+        # Already open — re-derive only when the stored clock is wrong:
+        # either impossible (a future "inquiry" date, from the old row-based
+        # parsing) or superseded by a trustworthy `received_at` that a later
+        # detail scrape backfilled onto the item. Otherwise leave it alone,
+        # so the steady-state cost of this pass stays one SELECT.
+        stored = str(deal.get("inquiry_at") or "")
+        truth = inquiry_date(item)
+        if stored > now or (truth and stored[:10] != truth):
+            ensure(tenant_id, site, {**item, "id": item_id},
+                   responses.get(item_id), units=units)
+        return 0
+    item = {**item, "id": item_id}
+    # A message belonging to a conversation we already have joins it rather
+    # than opening a second deal — the same rule the live ingest path uses.
+    # Without this, backfilling a mailbox re-creates exactly the duplicate
+    # deals that threading exists to prevent.
+    if item.get("kind") == "message":
+        parent = find_thread(tenant_id, site, thread_key(item),
+                             exclude_item_id=item_id)
+        if parent:
+            # Only stamp a reply *newer* than the one already recorded.
+            # A threaded message never gets a deal row of its own, so it is
+            # never in `existing` and this branch re-runs on every backfill
+            # — and backfill runs on every dashboard load. Re-stamping
+            # unconditionally would re-clear next_action_at each time, so
+            # any deal that had ever received a guest message could never
+            # hold a scheduled follow-up again. That is the opposite of what
+            # threading is for.
+            # Both sides normalized, or the comparison lies again. The
+            # column goes through `norm_ts` on every write, but
+            # `first_seen` is a raw space-separated UTC database default —
+            # comparing one against the other as strings put a same-day
+            # *follow-up* reply below the stamp already recorded, so it was
+            # silently dropped on every backfill. That is the original
+            # defect's exact symptom, one path over.
+            at = norm_ts(item.get("first_seen")) or ""
+            seen_at = norm_ts(parent.get("last_guest_reply_at")) or ""
+            if at and at > seen_at:
+                record_guest_reply(tenant_id, site, parent["item_id"], at=at)
+            elif not at and not seen_at:
+                record_guest_reply(tenant_id, site, parent["item_id"])
+            return 0
+    deal = ensure(tenant_id, site, item, responses.get(item_id), units=units)
+    # A reply already went out before the pipeline existed: reflect that so
+    # the deal doesn't reappear in "needs you" and skew response metrics.
+    resp = responses.get(item_id) or {}
+    if deal and resp.get("status") == "sent":
+        update(tenant_id, site, item_id, stage=CONTACTED,
+               first_reply_at=resp.get("sent_at"),
+               last_contact_at=resp.get("sent_at"))
+    return 1
 
 
 # --- Reads ------------------------------------------------------------------
