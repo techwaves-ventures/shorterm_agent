@@ -450,9 +450,15 @@ def inbound_rejected_retry(rid):
     try:
         is_new = inbound.store(tenant_id, item, SITE)
     except Exception:
-        # Hand the row back rather than leaving it marked recovered with nothing
-        # on the board — that would be the silent loss this page exists to end.
         app.logger.exception("Could not store recovered inbound item")
+        is_new = False
+
+    # Confirm the deal exists rather than trusting the call returned. `store`
+    # logs and swallows a `pipeline.ensure` failure and still reports success,
+    # so "it didn't raise" is not evidence the guest reached the board. Hand the
+    # row back if they didn't — a message marked recovered with nothing to show
+    # for it is the silent loss this page exists to end.
+    if not pipeline.get(tenant_id, SITE, item.get("id", "")):
         inbound_rejects.reopen(
             tenant_id, SITE, rid, "parsed, but the lead could not be opened"
         )

@@ -83,6 +83,22 @@ def _tenant_with_login(client):
     return tid
 
 
+def _rows_everywhere() -> int:
+    """Every reject row in the database, for any tenant.
+
+    The "must not be persisted" tests count globally on purpose. Scoping them to
+    the tenant under test made them blind: a change that filed pre-auth traffic
+    under a synthetic tenant id wrote rows freely and still passed.
+    """
+    import db
+
+    with db.connect() as c:
+        try:
+            return int(c.execute("SELECT COUNT(*) FROM inbound_rejects").fetchone()[0])
+        except Exception:
+            return 0  # table not created yet == no rows
+
+
 def _post(client, tid, body=DIGEST, subject="Your weekly digest",
           sender="no-reply@furnishedfinder.com", headers=None, recipient=None):
     return client.post(
@@ -142,21 +158,27 @@ def test_a_readable_lead_is_not_recorded_as_rejected(client):
 def test_bad_webhook_secret_stores_nothing(client):
     """Persisting pre-auth rejections would make a public endpoint a write amplifier."""
     tid = _tenant()
-    resp = _post(client, tid, headers={"X-Inbound-Secret": "wrong"})
+    before = _rows_everywhere()
+    resp = _post(client, tid, body=DIGEST + " probe-bad-secret",
+                 headers={"X-Inbound-Secret": "wrong"})
 
     assert resp.status_code == 202
-    assert inbound_rejects.count_all(tid, SITE) == 0
+    assert _rows_everywhere() == before, "a pre-auth rejection was persisted somewhere"
 
 
 def test_unrecognised_recipient_stores_nothing(client):
     """No tenant resolved means no one to show it to — and no way to bound it."""
     tid = _tenant()
+    before = _rows_everywhere()
+    # A distinct body, so a row written under some other tenant can't be hidden
+    # by deduping onto one another pre-auth test already created.
     resp = _post(
-        client, tid, recipient="leads+999-deadbeefdeadbeef@inbound.example.com"
+        client, tid, body=DIGEST + " probe-unknown-recipient",
+        recipient="leads+999-deadbeefdeadbeef@inbound.example.com",
     )
 
     assert resp.status_code == 202
-    assert inbound_rejects.count_all(tid, SITE) == 0
+    assert _rows_everywhere() == before, "an unattributable rejection was persisted somewhere"
 
 
 def test_the_allowlist_itself_gates_persistence_not_just_the_tenant_id(client, monkeypatch):
@@ -173,11 +195,12 @@ def test_the_allowlist_itself_gates_persistence_not_just_the_tenant_id(client, m
         def reject(*a, _code=code, **kw):
             raise inbound.Rejected(f"simulated {_code}", code=_code, tenant_id=tid)
 
+        before = _rows_everywhere()
         monkeypatch.setattr(inbound, "accept", reject)
-        resp = _post(client, tid)
+        resp = _post(client, tid, body=f"{DIGEST} probe-{code}")
 
         assert resp.status_code == 202
-        assert inbound_rejects.count_all(tid, SITE) == 0, (
+        assert _rows_everywhere() == before, (
             f"{code} was persisted; only {inbound.RECORDABLE_CODES} may be"
         )
 
@@ -194,10 +217,11 @@ def test_oversized_payload_stores_nothing(client):
     which the test client recomputes from the real payload.
     """
     tid = _tenant()
+    before = _rows_everywhere()
     resp = _post(client, tid, body="x" * (inbound.MAX_PAYLOAD_BYTES + 1))
 
     assert resp.status_code == 202
-    assert inbound_rejects.count_all(tid, SITE) == 0
+    assert _rows_everywhere() == before, "an oversized payload was persisted somewhere"
 
 
 # --- Bounds, because this content comes from outside -----------------------
@@ -345,6 +369,34 @@ def test_settings_states_what_happened_including_when_nothing_was_lost(client):
     assert "nothing unread right now" in page
 
 
+def test_the_banner_reports_the_actual_count(client):
+    """A hardcoded number would satisfy a test that only greps for the wording."""
+    tid = _tenant_with_login(client)
+    for i in range(3):
+        _post(client, tid, body=f"{DIGEST} ref {i}", subject=f"digest {i}")
+
+    page = client.get("/dashboard").get_data(as_text=True)
+    assert "3 forwarded emails" in page
+    assert inbound_rejects.count_open(tid, SITE) == 3
+
+
+def test_each_row_shows_what_the_operator_needs_to_act(client):
+    """Sender, time, reason, an excerpt, and both actions — the whole point of the page."""
+    tid = _tenant_with_login(client)
+    _post(client, tid, body="A guest asked about the loft.", subject="An enquiry")
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    page = client.get("/inbound/rejected").get_data(as_text=True)
+
+    assert "An enquiry" in page, "subject"
+    assert "no-reply@furnishedfinder.com" in page, "sender"
+    assert "UTC" in page, "received time"
+    assert "Couldn't find a guest name" in page, "reason in plain language"
+    assert "A guest asked about the loft." in page, "body excerpt"
+    assert f"/inbound/rejected/{rid}/retry" in page, "retry action"
+    assert f"/inbound/rejected/{rid}/dismiss" in page, "dismiss action"
+
+
 def test_stored_content_is_escaped_not_executed(client):
     """The body is attacker-influenced and rendered into the operator's browser."""
     tid = _tenant_with_login(client)
@@ -447,6 +499,67 @@ def test_a_retry_whose_store_fails_hands_the_row_back(client, monkeypatch):
     assert row["status"] == "open", "a failed store must not leave the row marked recovered"
     assert row["resolved_item_id"] in (None, ""), "must not claim a deal that was never opened"
     assert inbound_rejects.count_open(tid, SITE) == 1, "the lead must stay visible"
+
+
+def test_a_retry_whose_deal_never_opens_hands_the_row_back(client, monkeypatch):
+    """`inbound.store` swallows a pipeline failure and still reports success.
+
+    So "the call returned" is not evidence the guest reached the board. Without
+    checking, the row is marked recovered, leaves the list, and points at a deal
+    that does not exist — the silent loss wearing the fix's clothes.
+    """
+    import pipeline as pipeline_mod
+
+    tid = _tenant_with_login(client)
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+        "kind": "lead", "id": "gap-1", "title": "Gap | Emma", "url": "u",
+        "source": "email", "raw": body, "traveler": "Emma", "property_name": "Gap",
+    })
+
+    def no_deal(*a, **kw):
+        raise RuntimeError("pipeline is down")
+
+    # Fails *inside* inbound.store, which logs it and returns True anyway.
+    monkeypatch.setattr(pipeline_mod, "ensure", no_deal)
+
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    assert len(pipeline.all_deals(tid, SITE)) == 0, "precondition: no deal was opened"
+    row = inbound_rejects.get(tid, SITE, rid)
+    assert row["status"] == "open", "row marked recovered with nothing on the board"
+    assert inbound_rejects.count_open(tid, SITE) == 1, "the lead must stay visible"
+
+
+def test_retrying_a_lead_already_on_the_board_does_not_duplicate_it(client, monkeypatch):
+    """Recovery reuses the scrape path, so its dedup applies — verify, don't assume."""
+    tid = _tenant_with_login(client)
+
+    # A real lead arrives normally and opens a deal.
+    _post(client, tid, body=GOOD_LEAD, subject="New lead from Emma M.")
+    assert len(pipeline.all_deals(tid, SITE)) == 1
+    existing = pipeline.all_deals(tid, SITE)[0]["item_id"]
+
+    # The same guest also produced an unreadable forward that we recorded.
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    # A fixed parser now reads it as the lead that is already on the board.
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+        "kind": "lead", "id": existing, "title": "Dup | Emma", "url": "u",
+        "source": "email", "raw": body, "traveler": "Emma M.", "property_name": "Dup",
+    })
+
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    assert len(pipeline.all_deals(tid, SITE)) == 1, "recovery opened a duplicate deal"
+    assert inbound_rejects.get(tid, SITE, rid)["status"] == "recovered"
 
 
 def test_retry_that_still_fails_leaves_the_row_open(client):

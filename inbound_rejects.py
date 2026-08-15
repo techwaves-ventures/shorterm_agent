@@ -91,6 +91,12 @@ def _conn() -> db.Conn:
         """CREATE UNIQUE INDEX IF NOT EXISTS ix_inbound_rejects_fp
            ON inbound_rejects (tenant_id, site, fingerprint)"""
     )
+    # Every read here is tenant-scoped, and the dashboard counts open rows on
+    # each load, so the scoping columns carry their own index.
+    c.execute(
+        """CREATE INDEX IF NOT EXISTS ix_inbound_rejects_tenant
+           ON inbound_rejects (tenant_id, site, status)"""
+    )
     return c
 
 
@@ -130,6 +136,16 @@ def _prune(c: db.Conn, tenant_id: str, site: str) -> None:
     is the portable form; the SQLite-only shorthand passes tests locally and
     fails on the hosted database.
     """
+    # Cheap guard first. Pruning means two `NOT IN` scans, and almost every
+    # message arrives with the table nowhere near full — doing that work per
+    # ingest put ~20ms of DB on a public endpoint's request thread.
+    total = c.execute(
+        "SELECT COUNT(*) FROM inbound_rejects WHERE tenant_id=? AND site=?",
+        (tenant_id, site),
+    ).fetchone()
+    if not total or total[0] <= MAX_ROWS_PER_TENANT:
+        return
+
     keep = (tenant_id, site, OPEN) + _KEEP_PARAMS + (MAX_ROWS_PER_TENANT,)
 
     # A cap that quietly discards evidence is indistinguishable from the bug.
