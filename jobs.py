@@ -247,7 +247,34 @@ def _cooldown_remaining(recent: dict | None) -> int:
     FurnishedFinder login emails, so it only applies to errors from an actual
     browser/login attempt. A reaper-induced error (STALE_JOB_MESSAGE) means the
     worker crashed/restarted before finishing — no login/email happened — so the
-    user must be able to retry immediately (acceptance criterion #1)."""
+    user must be able to retry immediately (acceptance criterion #1).
+
+    A *negative* age means `updated_at` is in the future: the host that wrote it
+    has a clock ahead of ours. Stamping absolutely (VEN-142) removes the timezone
+    cause of that, but not the remaining one — NTP skew between two machines —
+    and `int(ERROR_RETRY_COOLDOWN_SECONDS - age)` on an unclamped negative is
+    what actually produced the harm this ticket filed: a worker 12h fast renders
+    as "Please wait 43309s", a half-day lockout from a 120-second guard.
+
+    Clamped to the full cooldown rather than to 0, deliberately. Both directions
+    are defensible and each re-creates one of the two harms named in the ticket,
+    so the tiebreaker is which one we can take back:
+
+      * Clamping to 0 lets the tenant retry at once, but under a persistently
+        fast writer *every* stamp reads future, so the guard is not merely
+        skipped once — it is off for as long as the skew lasts. Each Check-now
+        click then bursts a real FurnishedFinder login email. That harm lands on
+        a third party's system and we cannot undo it.
+      * Clamping to the cap bounds the wait, and the displayed number, at
+        `ERROR_RETRY_COOLDOWN_SECONDS`. The guard keeps working and nothing
+        leaves the building.
+
+    The residual, stated plainly so the next reader does not think it is cured:
+    while the writer's clock stays ahead, each poll re-reports the cap, so the
+    tenant's wait persists until real time catches up to the stamp. That is also
+    what the previous release did — it simply lied about the number as well.
+    Repairing a future-dated stamp at the source is VEN-133's territory, not this
+    reader's; this function's job is to refuse to turn one into a half-day ban."""
     if not recent or recent.get("status") != ERROR:
         return 0
     if (recent.get("message") or "") == STALE_JOB_MESSAGE:
@@ -255,6 +282,8 @@ def _cooldown_remaining(recent: dict | None) -> int:
     age = _age_seconds(recent.get("updated_at"))
     if age is None or age >= ERROR_RETRY_COOLDOWN_SECONDS:
         return 0
+    if age < 0:
+        return ERROR_RETRY_COOLDOWN_SECONDS
     return int(ERROR_RETRY_COOLDOWN_SECONDS - age)
 
 
@@ -421,9 +450,26 @@ def worker_online() -> bool:
     `last_seen` is written on the worker and read here on the web host, so the
     comparison must be absolute — it goes through `_age_seconds` rather than
     subtracting wall clocks, which also means an unreadable stamp is handled in
-    exactly one place instead of two. An unknown age reads as offline: that is
-    what an empty `ff_worker` table already meant, and it fails towards crash
-    recovery (a stranded job gets reaped) instead of stranding the dashboard.
+    exactly one place instead of two.
+
+    The two non-ordinary ages fail in *opposite* directions, which is worth
+    naming because the safe-sounding half is only half the story:
+
+      * An *unknown* age (None — unparseable, or absent row) reads offline. That
+        is what an empty `ff_worker` table already meant, and it fails towards
+        crash recovery: a stranded job gets reaped rather than the dashboard
+        being stranded.
+      * A *future-dated* stamp — a worker whose clock is ahead of ours — gives a
+        negative age, which is `<= WORKER_TTL_SECONDS` and so reads **online**.
+        That fails open: a worker that is dead but skewed keeps reading alive,
+        and because `reap_stale` gates its crash-recovery arm on this, the other
+        reap paths stay shut too. Deliberate and unchanged from the previous
+        release — clamping it here would newly reap a live skewed worker's jobs,
+        a regression rather than a fix — and pinned by
+        `test_future_dated_stamp_still_reads_online_as_before`. Future-dated
+        stamps as a class are VEN-133; see also `_cooldown_remaining`, which
+        does clamp its negative case because there the failure is a lockout
+        rather than a lost backstop.
     """
     with _conn() as c:
         row = c.execute("SELECT last_seen FROM ff_worker WHERE id=1").fetchone()
