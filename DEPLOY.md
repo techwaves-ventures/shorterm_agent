@@ -313,11 +313,24 @@ web host wrote (or the reverse) while the two are on different code.
 # drainer SECOND: the off-host drainer is the thing that empties the queue, so
 # stopping it first leaves step 2 waiting on a queue that can no longer drain.
 
-# 1. Let the queue empty on the OLD code, with the drainer still running, then
-#    confirm it reached zero:
-#    (psql, or: sqlite3 "$SQLITE_PATH")
-#      SELECT count(*) FROM outbox WHERE status IN ('queued','sending');
-#    Anything still queued is a legacy-frame row — see the next section.
+# 1. Let the queue drain on the OLD code, with the drainer still running, then
+#    confirm nothing DELIVERABLE is left. Do NOT wait for a plain count of
+#    queued rows to reach zero — it generally never will. `outbox.next_queued`
+#    only picks up rows whose `scheduled_at` has arrived, so any send the
+#    quiet-hours clamp deferred to tomorrow morning sits in `queued`,
+#    undrainable on purpose, for up to ~12h. Gate on what is actually due:
+#    (psql)
+#      SELECT count(*) FROM outbox WHERE status='sending'
+#         OR (status='queued'
+#             AND scheduled_at <= to_char(now() AT TIME ZONE 'utc',
+#                                         'YYYY-MM-DD"T"HH24:MI:SS'));
+#    (sqlite3 "$SQLITE_PATH")
+#      SELECT count(*) FROM outbox WHERE status='sending'
+#         OR (status='queued'
+#             AND scheduled_at <= strftime('%Y-%m-%dT%H:%M:%S','now'));
+#    Future-dated `queued` rows are expected and are NOT an error. They are
+#    legacy-frame rows that will outlive the deploy, which draining cannot fix
+#    — the next section covers what happens to them.
 
 # 2. Now stop the off-host drainer, so nothing reads new-frame rows with old
 #    code during the cutover.
@@ -333,10 +346,25 @@ web host wrote (or the reverse) while the two are on different code.
 # 4. Start the worker again (scale back to 1, or restart `python worker.py`).
 ```
 
-Between steps 1 and 3 the web host can still accept approvals, and those rows
-are written in whichever frame the web host is currently running. That window is
-the reason step 3 is a single cutover of both hosts rather than a rolling one —
-draining bounds the *backlog*, not the approvals that arrive while you deploy.
+Nothing here stops the web host accepting approvals, so from step 1 until step 3
+completes the queue is a moving target: each approve adds a row in whichever
+frame the web host is *currently* running. Do not chase the count to a stable
+zero — take the reading, and move on to step 2 promptly.
+
+Two things make that window survivable, and it is worth being exact about which
+does the work, because a single cutover on its own does **not** close it. A row
+approved by the old web code before step 3 still exists after step 3 and is read
+by the new-code worker at step 4 — the legacy-frame case. What saves the common
+path is `automation.start_drainer` (`automation.py`): the web host runs its own
+in-process drainer immediately after an approve, so a send that is due *now* is
+written and delivered by the same host on the same code, and never crosses the
+frame boundary at all. What the single cutover buys is the narrower guarantee
+that no host is left reading one frame while another writes the other.
+
+The rows that genuinely survive are the ones the clamp deferred — approved
+during the window, not yet due, still queued at step 4. On a non-UTC fleet those
+are offset by the old frame; see the next section, which is why that section
+exists rather than being replaced by "just drain it first."
 
 ### Pre-existing rows are not rewritten (deliberate)
 
