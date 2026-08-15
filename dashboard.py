@@ -860,6 +860,9 @@ def outbox_cancel(msg_id):
     # Same 409 as approve, and for a sharper reason: cancelling an already-sent
     # row drops it out of `sent_bodies()`, which is the only thing stopping
     # /responder/send from queueing a second copy of text the guest has read.
+    # A row already `sending` refuses for the same reason — the drainer holding
+    # it delivers regardless of what we answer here, so "cancelled" would be a
+    # green toast for a message the guest receives. See `outbox.CANCELABLE`.
     if msg["status"] not in outbox.CANCELABLE:
         return jsonify({
             "ok": False, "already": True,

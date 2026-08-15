@@ -252,13 +252,79 @@ def test_an_already_sent_message_cannot_be_cancelled(tenant):
 
 
 @pytest.mark.parametrize("status", [
-    outbox.PENDING, outbox.QUEUED, outbox.SENDING, outbox.FAILED,
+    outbox.PENDING, outbox.QUEUED, outbox.FAILED,
 ])
 def test_a_message_that_has_not_reached_the_guest_can_still_be_cancelled(status, tenant):
     """The guard must not cost the operator the ability to call a message off —
-    that is the whole point of the button."""
+    that is the whole point of the button.
+
+    `sending` is deliberately absent; see the test directly below. It is the one
+    open state in which the guest is already being written to.
+    """
     msg = _queued(tenant)
     outbox.set_status(msg["id"], status)
+    outbox.cancel(msg["id"])
+    assert outbox.get(msg["id"])["status"] == outbox.CANCELED
+
+
+# --- cancel-of-`sending` is not a cancel, and must not claim to be -----------
+
+def test_cancelling_an_in_flight_send_is_refused_rather_than_reported_as_ok(tenant):
+    """A drainer that has claimed the row is already driving the browser, and
+    nothing in `runner._send_worker` consults outbox status — so the guest is
+    written to no matter what `cancel` answers. Accepting the cancel gave the
+    operator a green success toast for a message that was delivered anyway, and
+    `send_next` then overwrote the row with the real outcome.
+
+    This is the twin of the already-`sent` case above and is reached the same
+    way: the button renders only on `pending` cards, so both are stale-tab and
+    back-button replays.
+    """
+    msg = _queued(tenant, body="Yes! It is available from Sept 1.")
+    # Exactly what automation.send_next does immediately before send_reply().
+    outbox.set_status(msg["id"], outbox.SENDING)
+
+    outbox.cancel(msg["id"])
+
+    assert outbox.get(msg["id"])["status"] == outbox.SENDING, (
+        "an in-flight send cannot be called off; the honest answer is 'too late'")
+    assert outbox.SENDING not in outbox.CANCELABLE, (
+        "the route reads CANCELABLE to decide between 409 and a success toast")
+
+
+def test_a_called_off_in_flight_send_does_not_come_back_as_retryable(tenant):
+    """The mirror of the above. When the in-flight send then *fails*, the row
+    lands in `FAILED`, which is `APPROVABLE` — so a message the operator
+    believed they had called off is offered back to them as retryable. With the
+    cancel refused there is no such belief to contradict.
+    """
+    msg = _queued(tenant)
+    outbox.set_status(msg["id"], outbox.SENDING)
+
+    # The route reads the status of the row `cancel` hands back to choose
+    # between a 409 and a green "cancelled" toast.
+    assert outbox.cancel(msg["id"])["status"] == outbox.SENDING, (
+        "reporting a cancel here is what makes the later FAILED row a "
+        "contradiction of what the operator was told")
+
+    outbox.set_status(msg["id"], outbox.FAILED, error="send failed")
+    assert outbox.get(msg["id"])["status"] in outbox.APPROVABLE, (
+        "a failed send stays retryable — which is only correct because it was "
+        "never reported as called off")
+
+
+def test_a_wedged_send_is_still_recoverable_and_then_cancelable(tenant):
+    """Dropping `sending` from CANCELABLE must not strand a row left behind by a
+    crashed process. `reclaim_stuck_sending` returns it to `queued`, which is
+    cancelable again — so the operator keeps a route to call it off, just not
+    while it is genuinely in flight.
+    """
+    msg = _queued(tenant)
+    outbox.set_status(msg["id"], outbox.SENDING)
+
+    assert outbox.reclaim_stuck_sending(max_age_seconds=-1) == 1
+    assert outbox.get(msg["id"])["status"] == outbox.QUEUED
+
     outbox.cancel(msg["id"])
     assert outbox.get(msg["id"])["status"] == outbox.CANCELED
 
@@ -267,13 +333,18 @@ def test_a_message_that_has_not_reached_the_guest_can_still_be_cancelled(status,
 
 def test_a_cancelled_message_is_not_resurrected_by_the_busy_release(tenant):
     """`release_unattempted` re-queued the row unconditionally, so a cancel that
-    landed while the drainer held the claim was silently undone and the message
-    the human called off went to the guest anyway. Reporting same-tenant
-    collisions as busy routes every collision through this path, so the race is
-    now reachable on the common scrape-vs-send case and retried every few
-    seconds by `_drain_loop`."""
+    landed while a drainer held the claim was silently undone and the message
+    the human called off went to the guest anyway.
+
+    Now that `sending` is not cancelable, the cancel can no longer land *during*
+    the claim — but the guard is still load-bearing on the sequence below, which
+    is reachable whenever a wedged row is reclaimed while its original drainer
+    is still alive: reclaim returns it to `queued`, the operator cancels it, and
+    the old drainer's busy path then releases a claim it no longer owns.
+    """
     msg = _queued(tenant)
     outbox.set_status(msg["id"], outbox.SENDING)
+    assert outbox.reclaim_stuck_sending(max_age_seconds=-1) == 1
     outbox.cancel(msg["id"])
     assert outbox.get(msg["id"])["status"] == outbox.CANCELED
 
