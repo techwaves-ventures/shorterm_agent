@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Unread emails — Shorterm</title>
+  {% include "_theme.html" %}
+  <style>
+    .rej { background: var(--surface); border: 1px solid var(--border);
+      border-left: 3px solid var(--err); border-radius: var(--radius-lg);
+      overflow: hidden; margin-bottom: 18px; }
+    .rej__head { padding: 15px 20px; border-bottom: 1px solid var(--border);
+      background: var(--surface-2); display: flex; align-items: baseline;
+      gap: 10px; flex-wrap: wrap; }
+    .rej__subject { font-weight: 600; font-size: .98rem; }
+    .rej__meta { color: var(--muted); font-size: .82rem; display: flex;
+      gap: 8px; flex-wrap: wrap; align-items: baseline; }
+    .rej__body { padding: 16px 20px; }
+    .rej__reason { font-size: .84rem; color: var(--err); margin-bottom: 10px; }
+    /* Attacker-influenced text. Rendered as preformatted plain text and never
+       marked safe, so a forwarded <script> stays visible characters. */
+    .rej__excerpt { background: var(--surface-2); border: 1px solid var(--border);
+      border-radius: var(--radius); padding: 12px 14px; font-size: .82rem;
+      line-height: 1.5; white-space: pre-wrap; word-break: break-word;
+      max-height: 260px; overflow: auto; color: var(--muted); margin: 0; }
+    .rej__actions { display: flex; gap: 10px; flex-wrap: wrap;
+      padding: 0 20px 16px; }
+    .rej__actions form { margin: 0; }
+    .empty { background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius-lg); padding: 34px 22px; text-align: center; }
+    .empty h2 { font-size: 1.02rem; margin-bottom: 6px; }
+    .empty p { color: var(--muted); font-size: .88rem; }
+
+    @media (max-width: 560px) {
+      .rej__head { padding: 13px 15px; }
+      .rej__body { padding: 14px 15px; }
+      .rej__actions { padding: 0 15px 14px; }
+      .rej__actions .btn { flex: 1 1 auto; }
+    }
+  </style>
+</head>
+<body>
+  {% include "_appnav.html" %}
+  <main class="app-main">
+    <div class="page-head">
+      <h1>Emails we couldn't read</h1>
+      <p>These arrived at your forwarding address but didn't look like a lead or a
+         message, so no deal was opened. Nothing here was replied to.</p>
+    </div>
+
+    {% with flashes = get_flashed_messages() %}
+      {% for f in flashes %}<div class="flash">{{ f }}</div>{% endfor %}
+    {% endwith %}
+
+    {% if not rows %}
+      <div class="empty">
+        <h2>Nothing unread</h2>
+        <p>Every forwarded email so far has been understood. If a guest says they
+           wrote and you don't see them on the board, check back here.</p>
+      </div>
+    {% else %}
+      {% for r in rows %}
+      <div class="rej">
+        <div class="rej__head">
+          <span class="rej__subject">{{ r.subject or '(no subject)' }}</span>
+          <span class="rej__meta">
+            <span>{{ r.sender or 'unknown sender' }}</span>
+            <span>·</span>
+            {# Written by one Python writer as tz-aware ISO-8601 UTC, so this is
+               a display trim, not a timezone conversion. The exact value stays
+               in the tooltip. #}
+            <span title="{{ r.received_at }}">{{ r.received_at[:16].replace('T', ' ') }} UTC</span>
+            {% if r.seen_count and r.seen_count > 1 %}
+            <span>·</span><span>seen {{ r.seen_count }}×</span>
+            {% endif %}
+          </span>
+        </div>
+        <div class="rej__body">
+          <div class="rej__reason">
+            {% if r.reason_code == 'sender_not_allowed' %}
+              Sent from an address we don't recognise as FurnishedFinder.
+            {% else %}
+              Couldn't find a guest name and a property or date in this email.
+            {% endif %}
+          </div>
+          <pre class="rej__excerpt">{{ r.body or '(empty message)' }}</pre>
+        </div>
+        <div class="rej__actions">
+          <form method="post" action="{{ url_for('inbound_rejected_retry', rid=r.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="btn btn--primary btn--sm">Try again</button>
+          </form>
+          <form method="post" action="{{ url_for('inbound_rejected_dismiss', rid=r.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button type="submit" class="btn btn--ghost btn--sm">Dismiss</button>
+          </form>
+        </div>
+      </div>
+      {% endfor %}
+    {% endif %}
+  </main>
+</body>
+</html>

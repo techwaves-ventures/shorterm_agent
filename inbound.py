@@ -178,7 +178,24 @@ def extract_subject(payload: dict) -> str:
 
 
 class Rejected(Exception):
-    """Inbound message failed a check. The reason is for logs, never the caller."""
+    """Inbound message failed a check. The reason is for logs, never the caller.
+
+    `code` and `tenant_id` exist so the route can tell a *lost lead* from a
+    *probe*. Only a rejection that got past the provider secret AND resolved to
+    a real tenant is worth persisting; anything earlier is unauthenticated or
+    unattributable, and storing it would turn this public endpoint into a write
+    amplifier pointed at the operator's own screen.
+    """
+
+    def __init__(self, message, code: str = "other", tenant_id: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.tenant_id = tenant_id
+
+
+# Rejections worth showing an operator: past the provider secret, attributed to
+# a tenant, and representing a lead that was genuinely lost rather than refused.
+RECORDABLE_CODES = ("unparsed", "sender_not_allowed")
 
 
 def accept(payload: dict, webhook_secret: str, raw_size: int = 0) -> tuple[str, dict]:
@@ -187,26 +204,36 @@ def accept(payload: dict, webhook_secret: str, raw_size: int = 0) -> tuple[str, 
     Raises `Rejected` on any failure. The caller returns a flat 202 either way,
     so a probe learns nothing about which tenants or addresses exist.
     """
+    # Everything above `tenant_id` is pre-authentication: the caller could be
+    # anyone, so these carry no tenant and are never persisted.
     if not configured():
-        raise Rejected("inbound email is not configured")
+        raise Rejected("inbound email is not configured", code="not_configured")
     if raw_size and raw_size > MAX_PAYLOAD_BYTES:
-        raise Rejected("payload too large")
+        raise Rejected("payload too large", code="too_large")
     if not verify_webhook(webhook_secret):
-        raise Rejected("bad webhook secret")
+        raise Rejected("bad webhook secret", code="bad_secret")
 
     tenant_id = tenant_for_address(extract_recipient(payload))
     if not tenant_id:
-        raise Rejected("unrecognised recipient")
+        raise Rejected("unrecognised recipient", code="unknown_recipient")
 
     sender = extract_sender(payload)
     if not sender_allowed(sender):
-        raise Rejected(f"sender not allowed: {sender[:80]!r}")
+        raise Rejected(
+            f"sender not allowed: {sender[:80]!r}",
+            code="sender_not_allowed",
+            tenant_id=tenant_id,
+        )
 
     from sites import ff_email
 
     item = ff_email.parse(extract_subject(payload), extract_body(payload))
     if not item:
-        raise Rejected("could not parse a lead from the message")
+        raise Rejected(
+            "could not parse a lead from the message",
+            code="unparsed",
+            tenant_id=tenant_id,
+        )
     return tenant_id, item
 
 

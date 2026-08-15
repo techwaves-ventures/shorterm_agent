@@ -157,6 +157,16 @@
       {% for f in flashes %}<div class="flash">{{ f }}</div>{% endfor %}
     {% endwith %}
 
+    {# Outside the can_scrape branch on purpose: a host who ingests by email may
+       never connect an account, and they're exactly the one losing leads. #}
+    {% if rejected_count %}
+    <div class="banner show error" style="margin-bottom:18px">
+      <span>{{ rejected_count }} forwarded email{{ 's' if rejected_count > 1 }}
+        couldn't be read, so {{ 'they' if rejected_count > 1 else 'it' }} never reached your board.</span>
+      <a href="{{ url_for('inbound_rejected') }}" class="btn btn--primary btn--sm">Review</a>
+    </div>
+    {% endif %}
+
   {% if not can_scrape %}
     <div class="connect-card">
       <h2>Connect your FurnishedFinder account</h2>
