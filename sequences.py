@@ -186,6 +186,26 @@ SEQUENCES: dict[str, dict] = {
 }
 
 
+# Answering a guest who has just written to us. Deliberately *not* a rung on the
+# nurture ladder: every step in `SEQUENCES` is a scheduled push into silence,
+# indexed by `step_index`, whereas this one is a reaction that can happen at any
+# point in a conversation and must not move the deal's position in its sequence.
+# It is still a real step so that a mid-conversation auto-reply passes the same
+# `can_auto_send` governance as everything else — off by default, armable by the
+# tenant, rather than bypassing the rails because no step described it.
+GUEST_REPLY = {
+    "id": "guest_reply",
+    "label": "Reply to guest",
+    "auto_send_default": False,
+    "guidance": (
+        "The guest has just written to you — answer THEM. Respond directly to "
+        "what they actually asked, using concrete catalog facts. Do not "
+        "introduce the place as though this were first contact, and do not "
+        "repeat anything already said earlier in the thread."
+    ),
+}
+
+
 def get(sequence_id: str | None) -> dict | None:
     return SEQUENCES.get(sequence_id or "")
 
@@ -217,7 +237,7 @@ def can_auto_send(step: dict, enabled_steps: set[str]) -> bool:
     """
     if step.get("never_auto"):
         return False
-    return step["id"] in enabled_steps
+    return bool(step.get("id")) and step["id"] in enabled_steps
 
 
 def default_enabled_steps() -> set[str]:
@@ -250,6 +270,16 @@ def _anchor_dt(deal: dict, anchor: str) -> datetime | None:
         return datetime.fromisoformat(str(raw))
     except ValueError:
         return None
+
+
+def next_send_time(now: datetime | None = None) -> str:
+    """The soonest moment a message may go out — now, or the next waking hour.
+
+    An immediate send still has to respect quiet hours: "reply instantly" is the
+    product's advantage right up until it wakes a prospect at 3am, at which
+    point it reads as a bot and burns the trust the product is selling.
+    """
+    return _clamp_quiet_hours(now or datetime.now()).isoformat(timespec="seconds")
 
 
 def _clamp_quiet_hours(dt: datetime) -> datetime:

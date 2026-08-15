@@ -32,6 +32,7 @@ import hmac
 import logging
 import os
 import re
+from email.utils import parseaddr
 
 log = logging.getLogger(__name__)
 
@@ -105,12 +106,27 @@ def verify_webhook(supplied_secret: str) -> bool:
 
 
 def sender_allowed(sender: str) -> bool:
-    """Whether the original sender is a FurnishedFinder address."""
-    addr = (sender or "").strip().lower()
-    m = re.search(r"[\w.+-]+@([\w.-]+)", addr)
-    if not m:
+    """Whether the original sender is a FurnishedFinder address.
+
+    Parsed with `parseaddr` rather than searched with a regex. A regex takes the
+    first address-shaped run of characters *anywhere* in the header, and the
+    display name comes first — so
+
+        "no-reply@furnishedfinder.com" <attacker@evil.com>
+
+    matched on the quoted display name and was accepted, while the mail actually
+    came from the attacker. The address that matters is the one in the angle
+    brackets, which is the one `parseaddr` returns.
+    """
+    _, addr = parseaddr((sender or "").strip())
+    addr = addr.strip().lower()
+    # parseaddr yields '' for junk, and a bare 'a@b@c' must not be split into a
+    # trusted tail — so require exactly one '@' and a non-empty local part.
+    if addr.count("@") != 1:
         return False
-    domain = m.group(1)
+    local, _, domain = addr.partition("@")
+    if not local or not domain:
+        return False
     return any(domain == d or domain.endswith("." + d) for d in ALLOWED_SENDER_DOMAINS)
 
 
@@ -138,7 +154,21 @@ def extract_recipient(payload: dict) -> str:
 
 
 def extract_sender(payload: dict) -> str:
-    for key in ("from", "sender", "From", "envelope_from", "reply_to"):
+    """Who sent this, for the allowlist check in `sender_allowed`.
+
+    Ordered by how hard the field is to forge: the provider's envelope sender
+    first (it comes from the SMTP transaction, not the message body), then the
+    `From` header.
+
+    `Reply-To` and `X-Forwarded-For` are deliberately *not* consulted. Reply-To
+    says where a reply should go, not where the mail came from, and an attacker
+    sending from anywhere can set it to a FurnishedFinder address to clear the
+    allowlist; X-Forwarded-For is an HTTP proxy header that has no business
+    authorizing mail at all. Both were treated as sender evidence, which meant
+    the allowlist could be satisfied by a field the sender fully controls
+    without ever touching the envelope.
+    """
+    for key in ("envelope_from", "sender", "from", "From"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
             return value
@@ -146,8 +176,11 @@ def extract_sender(payload: dict) -> str:
             return value.get("email") or value.get("address") or ""
     headers = payload.get("headers")
     if isinstance(headers, dict):
-        # A forward wraps the original; these headers preserve who really sent it.
-        for key in ("X-Forwarded-For", "X-Original-From", "Reply-To", "From"):
+        # A forward wraps the original; X-Original-From is set by the forwarder
+        # to preserve who really sent it, so a host relaying their FF mail into
+        # us still passes. It is only as trustworthy as the forwarding mailbox,
+        # which is why it ranks below the envelope.
+        for key in ("X-Original-From", "From"):
             if headers.get(key):
                 return str(headers[key])
     return ""
@@ -174,6 +207,26 @@ def extract_subject(payload: dict) -> str:
     for key in ("subject", "Subject"):
         if isinstance(payload.get(key), str):
             return payload[key]
+    return ""
+
+
+def extract_date(payload: dict) -> str:
+    """When the provider says this mail was sent, for the message id fallback.
+
+    Only used when the notification itself carries no date. Two messages whose
+    guest wrote the identical text — "Any update?" sent twice — are otherwise
+    indistinguishable, and the second was discarded as already-seen while the
+    lifecycle marked the guest lost for not replying.
+    """
+    for key in ("date", "Date", "timestamp", "Timestamp"):
+        value = payload.get(key)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return str(value).strip()
+    headers = payload.get("headers")
+    if isinstance(headers, dict):
+        for key in ("Date", "date"):
+            if headers.get(key):
+                return str(headers[key]).strip()
     return ""
 
 
@@ -204,7 +257,8 @@ def accept(payload: dict, webhook_secret: str, raw_size: int = 0) -> tuple[str, 
 
     from sites import ff_email
 
-    item = ff_email.parse(extract_subject(payload), extract_body(payload))
+    item = ff_email.parse(extract_subject(payload), extract_body(payload),
+                          received_at=extract_date(payload))
     if not item:
         raise Rejected("could not parse a lead from the message")
     return tenant_id, item
@@ -215,6 +269,12 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
 
     Deliberately the same path a scrape uses — dedup, deal creation and drafting
     behave identically no matter how the lead arrived.
+
+    A *message* that belongs to a conversation we already have joins that deal
+    rather than opening a second one beside it. Without this a guest's reply
+    became a new deal: the owner saw the same person twice, the reply carried
+    none of the original's booking facts, and the nurture sequence on the
+    original kept chasing someone who had just written back.
     """
     import config
     import pipeline
@@ -225,7 +285,16 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
     if not new_items:
         return False
     try:
-        pipeline.ensure(tenant_id, site, item, None, units=config.get_units(tenant_id))
+        parent = None
+        if kind == "message":
+            parent = pipeline.find_thread(
+                tenant_id, site, pipeline.thread_key(item),
+                exclude_item_id=item.get("id"))
+        if parent:
+            pipeline.record_guest_reply(tenant_id, site, parent["item_id"])
+        else:
+            pipeline.ensure(tenant_id, site, item, None,
+                            units=config.get_units(tenant_id))
     except Exception:
         log.exception("Could not open a deal for ingested item %s", item.get("id"))
     return True

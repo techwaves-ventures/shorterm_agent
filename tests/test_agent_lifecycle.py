@@ -5,6 +5,7 @@ the only gate between a draft and a guest's inbox, the scheduler decides when
 the system acts unattended, and pipeline decides what the owner is shown as
 needing them. A regression here is a wrong message to a customer's customer.
 """
+import hashlib
 import json
 import os
 import tempfile
@@ -17,6 +18,7 @@ os.environ.setdefault("SQLITE_PATH", tempfile.mktemp(suffix=".db"))
 os.environ.setdefault("FF_CRED_KEY", "c9jwUi0L-fUjf3wjbq74M0lK3ah7fmEfGhjxZ7RehQk=")
 os.environ.setdefault("SECRET_KEY", "test-secret")
 
+import automation  # noqa: E402
 import config  # noqa: E402
 import digest  # noqa: E402
 import models  # noqa: E402
@@ -44,10 +46,22 @@ def tenant(tmp_path, monkeypatch):
     return tid
 
 
-def _lead(tenant_id, item_id="L1", received="July 20, 2026", **extra):
+def _days_ago(n: int) -> str:
+    """A `received_at` stamp n days before today, in the format FF emits.
+
+    These fixtures used to hardcode calendar dates. `pipeline.LIVE_WINDOW_DAYS`
+    drops a lead out of the "needs you" queue once it's been waiting that long,
+    so a fixed date silently ages past the window and the test starts failing on
+    a date nobody changed any code on. Anchoring to today keeps the *relative*
+    age — which is the thing under test — constant.
+    """
+    return (datetime.now() - timedelta(days=n)).strftime("%B %-d, %Y")
+
+
+def _lead(tenant_id, item_id="L1", received=None, **extra):
     item = {"id": item_id, "kind": "lead", "traveler": "Dana R.",
             "title": "Unit 1 | Washington, District of Columbia | Dana R.",
-            "received_at": received, **extra}
+            "received_at": received or _days_ago(2), **extra}
     storage.filter_new(tenant_id, SITE, "lead", [item])
     pipeline.ensure(tenant_id, SITE, item, None)
     return item
@@ -84,15 +98,15 @@ def test_needs_action_excludes_clean_skips_but_keeps_draft_errors(tenant):
 
 
 def test_needs_action_sorted_oldest_waiting_first(tenant):
-    _lead(tenant, "new", received="July 20, 2026")
-    _lead(tenant, "old", received="July 12, 2026")
+    _lead(tenant, "new", received=_days_ago(2))
+    _lead(tenant, "old", received=_days_ago(10))
     deals = pipeline.all_deals(tenant, SITE)
     order = [d["item_id"] for d in pipeline.needs_action(deals, {})]
     assert order == ["old", "new"], "longest-waiting guest must come first"
 
 
 def test_stale_leads_drop_out_of_the_queue(tenant):
-    _lead(tenant, "ancient", received="January 15, 2026")
+    _lead(tenant, "ancient", received=_days_ago(pipeline.LIVE_WINDOW_DAYS + 30))
     deals = pipeline.all_deals(tenant, SITE)
     assert pipeline.needs_action(deals, {}) == []
 
@@ -427,6 +441,601 @@ def test_same_notification_twice_dedups(inbox, tenant):
     _tid, again = inbox.accept(_payload(inbox), "provider-secret")
     assert again["id"] == item["id"], "id must be stable across re-forwards"
     assert inbox.store(tenant, again, SITE) is False
+
+
+FF_MESSAGE_EMAIL = """You have a new message from your traveler.
+
+Property: Quiet Spacious Home in NW DC - Unit 1
+Traveler: Emma M.
+Date received: {received}
+
+{text}
+
+Reply to this message in your account.
+"""
+
+
+def _message_payload(inbound_mod, text, received="July 19, 2026"):
+    return _payload(
+        inbound_mod,
+        body=FF_MESSAGE_EMAIL.format(received=received, text=text),
+        subject="New message from Emma M.",
+    )
+
+
+def test_message_email_carries_no_dates_to_key_on(inbox):
+    """The precondition that made replies collide: on the message template the
+    date fields the id used to hash are simply absent."""
+    _tid, item = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                              "provider-secret")
+    assert item["kind"] == "message"
+    assert not item.get("move_in") and not item.get("move_out")
+
+
+def test_a_lead_whose_move_in_is_asap_is_still_a_lead(inbox):
+    """"ASAP" and "Flexible" are ordinary FurnishedFinder move-in values. They
+    are not dates, so they must not be stored as one — but they are still
+    evidence that this is a real lead, and validating before the "is this a
+    notification" gate silently discarded the whole lead at the webhook."""
+    for stated in ("ASAP", "Flexible", "Negotiable"):
+        body = (f"You have a new tenant lead.\n\nTraveler: Jordan K.\n"
+                f"Move in: {stated}\nTravelers: 1\n")
+        _tid, item = inbox.accept(
+            _payload(inbox, body=body, subject="New lead from Jordan K."),
+            "provider-secret")
+        assert item["traveler"] == "Jordan K."
+        assert not item.get("move_in"), "a non-date must not be stored as a date"
+
+
+def test_two_leads_differing_only_in_an_unlabelled_move_in_stay_distinct(inbox):
+    """Same collision class B1 fixed for messages: if the id hashed the
+    validated date, both would hash to an empty move-in and the second lead
+    would be dropped as already-seen."""
+    def lead(stated):
+        body = (f"You have a new tenant lead.\n\nProperty: Unit 1\n"
+                f"Traveler: Jordan K.\nMove in: {stated}\n")
+        return inbox.accept(_payload(inbox, body=body,
+                                     subject="New lead from Jordan K."),
+                            "provider-secret")[1]
+
+    assert lead("ASAP")["id"] != lead("Flexible")["id"]
+
+
+def test_guest_prose_is_never_mistaken_for_a_requested_date(inbox):
+    """A traveler writing "can I move in a week earlier?" used to set
+    move_in="a week earlier?" — the label matcher doesn't know it left the
+    template and entered the guest's own sentence. Junk like that lands on the
+    deal and reads as a real requested date in the UI."""
+    _tid, item = inbox.accept(
+        _message_payload(inbox, "Great — can I move in a week earlier?"),
+        "provider-secret")
+    assert not item.get("move_in")
+
+    # The real labelled field is still read.
+    _tid, lead = inbox.accept(_payload(inbox), "provider-secret")
+    assert lead["move_in"] == "8/16/26"
+
+
+def test_template_prose_does_not_hijack_the_name_label(inbox):
+    """The message template opens "You have a new message from your traveler."
+    That sentence matched the *Traveler* label ahead of the real field, so the
+    guest's name parsed as "." — no name to thread on, and "." written onto the
+    deal as who the owner is talking to. A label must win from the start of its
+    own line before it wins from the middle of a sentence."""
+    _tid, item = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                              "provider-secret")
+    assert item["sender"] == "Emma M."
+
+
+def test_the_thread_shows_what_the_guest_wrote_not_the_wrapper(inbox):
+    """The whole notification email was stored as the message body, so the
+    thread view had the guest apparently saying "You have a new message from
+    your traveler. Property: ... Traveler: ..." before reaching their sentence.
+    That is FurnishedFinder talking, not them."""
+    _tid, item = inbox.accept(
+        _message_payload(inbox, "Is parking included?\nAlso, is it furnished?"),
+        "provider-secret")
+    assert item["body"] == "Is parking included?\nAlso, is it furnished?"
+    # The untrimmed notification is still kept, so nothing is unrecoverable.
+    assert "Property:" in item["raw"]
+
+
+def test_an_unfamiliar_layout_shows_too_much_rather_than_nothing(inbox):
+    """Failing open matters here: swallowing the message is worse than showing
+    a line of chrome alongside it."""
+    weird = _payload(
+        inbox,
+        body="Traveler: Emma M.\nHELLO THIS IS THE WHOLE MESSAGE",
+        subject="New message from Emma M.")
+    _tid, item = inbox.accept(weird, "provider-secret")
+    assert "HELLO THIS IS THE WHOLE MESSAGE" in item["body"]
+
+
+def test_trimming_the_body_does_not_change_the_message_id(inbox, tenant):
+    """The id fingerprints the raw notification. If it fingerprinted the trimmed
+    text instead, tightening the trimmer later would re-open every message in
+    the mailbox as new and re-notify the owner about old conversations."""
+    _tid, first = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                               "provider-secret")
+    assert inbox.store(tenant, first, SITE) is True
+    _tid, again = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                               "provider-secret")
+    assert again["id"] == first["id"]
+    assert inbox.store(tenant, again, SITE) is False
+
+
+def test_second_message_from_one_guest_is_not_swallowed_as_a_duplicate(inbox, tenant):
+    """Regression: every message from a guest used to hash to the same id.
+
+    The id was derived from name + move-in + move-out + property + kind. A
+    message email carries no dates (see the test above), so a guest's second,
+    third and fourth messages all produced the *first* message's id and
+    `storage.filter_new` dropped them as already-seen. The agent could read an
+    opening message and never the reply to its own answer — which is the whole
+    conversation.
+    """
+    _tid, first = inbox.accept(
+        _message_payload(inbox, "Is parking included?", received="July 19, 2026"),
+        "provider-secret")
+    _tid, second = inbox.accept(
+        _message_payload(inbox, "Great — could I start a week earlier?",
+                         received="July 21, 2026"),
+        "provider-secret")
+
+    assert first["id"] != second["id"], "two different messages must be two items"
+    assert inbox.store(tenant, first, SITE) is True
+    assert inbox.store(tenant, second, SITE) is True, "the reply must reach the agent"
+
+
+def test_two_messages_sent_the_same_day_are_still_distinct(inbox, tenant):
+    """The received stamp alone is only day-granular, so the body has to count
+    too — otherwise a guest who writes twice in one day loses the second one."""
+    _tid, first = inbox.accept(
+        _message_payload(inbox, "Is parking included?"), "provider-secret")
+    _tid, second = inbox.accept(
+        _message_payload(inbox, "Sorry, also: is the unit furnished?"), "provider-secret")
+    assert first["id"] != second["id"]
+    assert inbox.store(tenant, first, SITE) is True
+    assert inbox.store(tenant, second, SITE) is True
+
+
+def test_the_same_message_re_forwarded_still_dedups(inbox, tenant):
+    """Distinguishing messages must not cost us re-forward dedup: the id is
+    derived from the email's own text, never from arrival time, so the same
+    message arriving twice is still one item."""
+    _tid, item = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                              "provider-secret")
+    _tid, again = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                               "provider-secret")
+    assert again["id"] == item["id"]
+    assert inbox.store(tenant, item, SITE) is True
+    assert inbox.store(tenant, again, SITE) is False
+
+
+def test_re_forward_through_a_different_text_converter_still_dedups(inbox, tenant):
+    """HTML-to-text conversion re-wraps lines and pads table cells. That is the
+    same message, so it must not read as a new one."""
+    _tid, item = inbox.accept(_message_payload(inbox, "Is parking included?"),
+                              "provider-secret")
+    rewrapped = _message_payload(inbox, "Is  parking\n  included?")
+    _tid, again = inbox.accept(rewrapped, "provider-secret")
+    assert again["id"] == item["id"]
+    assert inbox.store(tenant, item, SITE) is True
+    assert inbox.store(tenant, again, SITE) is False
+
+
+def test_lead_ids_are_unchanged_by_the_message_fix(inbox):
+    """Leads still key on who + when + which property — existing rows keep
+    their ids, so the fix can't orphan a deal that is already open."""
+    _tid, item = inbox.accept(_payload(inbox), "provider-secret")
+    assert item["id"] == hashlib.sha1(
+        "||".join(["Emma M.", "8/16/26", "7/16/27",
+                   "Quiet Spacious Home in NW DC - Unit 1", "lead"]).encode()
+    ).hexdigest()[:16]
+
+
+# --- threading: a reply joins the conversation it answers --------------------
+
+
+def _ingest_lead(inbox, tenant):
+    _tid, item = inbox.accept(_payload(inbox), "provider-secret")
+    inbox.store(tenant, item, SITE)
+    return item
+
+
+def _ingest_message(inbox, tenant, text, received="July 21, 2026"):
+    _tid, item = inbox.accept(_message_payload(inbox, text, received=received),
+                              "provider-secret")
+    inbox.store(tenant, item, SITE)
+    return item
+
+
+def test_a_guest_reply_joins_the_deal_instead_of_opening_a_second_one(inbox, tenant):
+    """Deals key on item_id and every message has its own, so a reply used to
+    become a brand-new deal: the owner saw Emma twice, and the second row
+    carried none of the dates or value from the inquiry it was answering."""
+    lead = _ingest_lead(inbox, tenant)
+    _ingest_message(inbox, tenant, "Is parking included?")
+
+    deals = pipeline.all_deals(tenant, SITE)
+    assert len(deals) == 1, "one guest, one conversation"
+    assert deals[0]["item_id"] == lead["id"]
+    assert deals[0]["check_in"] == "2026-08-16", "the booking facts survive"
+
+
+def test_the_reply_is_stamped_so_the_system_knows_they_answered(inbox, tenant):
+    """`last_contact_at` only ever recorded our own sends, so nothing could tell
+    'silent for four days' from 'answered us an hour ago'."""
+    lead = _ingest_lead(inbox, tenant)
+    assert pipeline.get(tenant, SITE, lead["id"])["last_guest_reply_at"] is None
+    _ingest_message(inbox, tenant, "Is parking included?")
+    assert pipeline.get(tenant, SITE, lead["id"])["last_guest_reply_at"]
+
+
+def test_a_reply_stands_the_follow_up_machine_down(inbox, tenant):
+    """The nurture cadence chases silence. A guest who has written back is not
+    silent, and must not be chased."""
+    lead = _ingest_lead(inbox, tenant)
+    pipeline.update(tenant, SITE, lead["id"], stage=pipeline.NURTURING,
+                    next_action_at="2099-01-01T09:00:00",
+                    next_action_step="presale_followup_1")
+
+    _ingest_message(inbox, tenant, "Sorry for the slow reply — still interested!")
+
+    deal = pipeline.get(tenant, SITE, lead["id"])
+    assert deal["next_action_at"] is None, "queued chase must be cancelled"
+    assert deal["next_action_step"] is None
+    assert deal["stage"] == pipeline.CONTACTED, "no longer chasing silence"
+
+
+def test_a_different_guest_still_gets_their_own_deal(inbox, tenant):
+    """Threading must not merge strangers."""
+    _ingest_lead(inbox, tenant)
+    body = FF_MESSAGE_EMAIL.format(received="July 21, 2026",
+                                   text="Hi, is the unit still free?")
+    body = body.replace("Traveler: Emma M.", "Traveler: Priya S.")
+    _tid, other = inbox.accept(
+        _payload(inbox, body=body, subject="New message from Priya S."),
+        "provider-secret")
+    inbox.store(tenant, other, SITE)
+
+    names = {d["guest_name"] for d in pipeline.all_deals(tenant, SITE)}
+    assert names == {"Emma M.", "Priya S."}
+
+
+def test_a_finished_stay_does_not_swallow_a_new_enquiry(inbox, tenant):
+    """A guest writing in months after checkout is starting a conversation, not
+    continuing a closed one."""
+    lead = _ingest_lead(inbox, tenant)
+    pipeline.update(tenant, SITE, lead["id"], stage=pipeline.COMPLETED)
+    _ingest_message(inbox, tenant, "Hi again — do you have anything for spring?")
+    assert len(pipeline.all_deals(tenant, SITE)) == 2
+
+
+def test_threading_survives_the_two_paths_disagreeing_about_the_property(tenant):
+    """A notification email names the property; a scraped row often doesn't.
+    Requiring both halves of the key to match would orphan the reply."""
+    lead = {"id": "L9", "kind": "lead", "traveler": "Emma M.",
+            "title": "Emma M.", "received_at": "July 19, 2026"}
+    storage.filter_new(tenant, SITE, "lead", [lead])
+    pipeline.ensure(tenant, SITE, lead, None)
+
+    reply = {"id": "M9", "kind": "message", "sender": "Emma M.",
+             "property_name": "Quiet Spacious Home in NW DC - Unit 1"}
+    found = pipeline.find_thread(tenant, SITE, pipeline.thread_key(reply),
+                                 exclude_item_id="M9")
+    assert found and found["item_id"] == "L9"
+
+
+def test_backfill_does_not_re_cancel_the_follow_up_on_every_page_load(tenant):
+    """A threaded message never gets a deal row of its own, so it is never in
+    `existing` and backfill's message branch re-runs on every dashboard load.
+    Re-stamping the reply unconditionally re-cleared next_action_at each time,
+    so any deal that had ever received a guest message could never hold a
+    scheduled follow-up again — the opposite of what threading is for."""
+    lead = {"id": "L1", "kind": "lead", "traveler": "Emma M.",
+            "property_name": "Unit 1", "received_at": _days_ago(2)}
+    reply = {"id": "M1", "kind": "message", "sender": "Emma M.",
+             "property_name": "Unit 1", "body": "Still interested!"}
+    storage.filter_new(tenant, SITE, "lead", [lead])
+    storage.filter_new(tenant, SITE, "message", [reply])
+    items = storage.all_items(tenant, SITE)
+
+    pipeline.backfill(tenant, SITE, items, {})
+    assert len(pipeline.all_deals(tenant, SITE)) == 1
+
+    # The operator answers, and the agent schedules the next nurture touch.
+    pipeline.update(tenant, SITE, "L1", next_action_at="2099-01-01T09:00:00",
+                    next_action_step="presale_followup_1")
+
+    pipeline.backfill(tenant, SITE, items, {})
+    deal = pipeline.get(tenant, SITE, "L1")
+    assert deal["next_action_at"] == "2099-01-01T09:00:00", \
+        "a page load must not erase the scheduled follow-up"
+    assert deal["next_action_step"] == "presale_followup_1"
+
+
+def test_a_message_about_another_unit_is_a_separate_conversation(tenant):
+    """thread_key's own definition says one guest asking about two units is two
+    conversations. Falling back to guest-only whenever the exact key missed
+    swallowed the second unit's enquiry into the first unit's deal, losing its
+    dates, value and unit entirely."""
+    lead = {"id": "A1", "kind": "lead", "traveler": "Emma M.",
+            "property_name": "Unit A", "received_at": _days_ago(2)}
+    storage.filter_new(tenant, SITE, "lead", [lead])
+    pipeline.ensure(tenant, SITE, lead, None)
+
+    other_unit = {"id": "B1", "kind": "message", "sender": "Emma M.",
+                  "property_name": "Unit B"}
+    assert pipeline.find_thread(tenant, SITE, pipeline.thread_key(other_unit),
+                                exclude_item_id="B1") is None
+
+    # ...but a reply that names the same unit still threads.
+    same_unit = {"id": "A2", "kind": "message", "sender": "Emma M.",
+                 "property_name": "Unit A"}
+    found = pipeline.find_thread(tenant, SITE, pipeline.thread_key(same_unit),
+                                 exclude_item_id="A2")
+    assert found and found["item_id"] == "A1"
+
+
+def test_a_thread_never_shows_another_units_messages(tenant):
+    """The operator would otherwise read a Unit B enquiry as part of the Unit A
+    conversation, and reply to the wrong one."""
+    items = {
+        "A1": {"id": "A1", "kind": "lead", "traveler": "Emma M.",
+               "property_name": "Unit A", "first_seen": "2026-08-01"},
+        "B1": {"id": "B1", "kind": "message", "sender": "Emma M.",
+               "property_name": "Unit B", "first_seen": "2026-08-02"},
+        "A2": {"id": "A2", "kind": "message", "sender": "Emma M.",
+               "property_name": "Unit A", "first_seen": "2026-08-03"},
+        # No property stated — belongs to whichever conversation is asking.
+        "U1": {"id": "U1", "kind": "message", "sender": "Emma M.",
+               "first_seen": "2026-08-04"},
+    }
+    key = pipeline.thread_key(items["A1"])
+    assert [i["id"] for i in pipeline.thread_items(key, items)] == ["A1", "A2", "U1"]
+
+
+def test_thread_key_treats_one_guest_as_one_person(tenant):
+    """FurnishedFinder renders the same traveler three different ways."""
+    keys = {pipeline.thread_key({"traveler": n, "property_name": "Unit 1"})
+            for n in ("Emma M.", "Emma M", "emma  m.")}
+    assert len(keys) == 1
+    assert pipeline.thread_key({"traveler": "", "property_name": "Unit 1"}) == "", \
+        "no name means no thread — never a key that matches other blanks"
+
+
+# --- the lifecycle closes itself ---------------------------------------------
+
+
+def _days_from_today(n: int) -> str:
+    return (datetime.now() + timedelta(days=n)).date().isoformat()
+
+
+def test_a_booked_guest_moves_to_prearrival_then_staying_then_completed(tenant):
+    """STAYING and COMPLETED were declared, filtered on and labelled, but no code
+    path ever wrote them — a booked guest stayed "booked" through arrival, their
+    whole stay and checkout."""
+    _lead(tenant, "D1")
+    pipeline.mark_booked(tenant, SITE, "D1",
+                         check_in=_days_from_today(3), check_out=_days_from_today(60))
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "D1")["stage"] == pipeline.PRE_ARRIVAL
+
+    pipeline.update(tenant, SITE, "D1", check_in=_days_from_today(0))
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "D1")["stage"] == pipeline.STAYING
+
+    pipeline.update(tenant, SITE, "D1", check_out=_days_from_today(-1))
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "D1")["stage"] == pipeline.COMPLETED
+
+
+def test_a_booking_added_after_checkout_lands_on_completed_not_staying(tenant):
+    """Backfilling an old booking must not park a finished stay in `staying`."""
+    _lead(tenant, "D1")
+    pipeline.mark_booked(tenant, SITE, "D1",
+                         check_in=_days_from_today(-90), check_out=_days_from_today(-30))
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "D1")["stage"] == pipeline.COMPLETED
+
+
+def test_a_deal_that_went_cold_closes_itself(tenant):
+    """mark_lost was reachable only from a human click, so the pipeline had no
+    terminal state that didn't require someone to remember to press something."""
+    _lead(tenant, "cold")
+    old = (datetime.now() - timedelta(days=pipeline.STALE_CLOSE_DAYS + 5)
+           ).isoformat(timespec="seconds")
+    pipeline.update(tenant, SITE, "cold", stage=pipeline.NURTURING,
+                    last_contact_at=old, next_action_at=None)
+    with pipeline._conn() as c:
+        c.execute("UPDATE deals SET inquiry_at=? WHERE tenant_id=? AND item_id=?",
+                  (old, tenant, "cold"))
+
+    assert pipeline.advance_lifecycle(tenant, SITE)["lost"] == 1
+    deal = pipeline.get(tenant, SITE, "cold")
+    assert deal["stage"] == pipeline.LOST
+    assert deal["closed_reason"], "a close the owner didn't make must say why"
+
+
+def test_a_deal_with_a_follow_up_still_queued_is_never_closed(tenant):
+    """Closing it would cancel the very message that might have won it."""
+    _lead(tenant, "pending")
+    old = (datetime.now() - timedelta(days=pipeline.STALE_CLOSE_DAYS + 5)
+           ).isoformat(timespec="seconds")
+    pipeline.update(tenant, SITE, "pending", stage=pipeline.NURTURING,
+                    last_contact_at=old, next_action_at="2099-01-01T09:00:00")
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "pending")["stage"] == pipeline.NURTURING
+
+
+def test_a_guest_waiting_on_us_is_never_written_off_as_lost(tenant):
+    """The guest spoke last. That deal is waiting on the owner, not dead."""
+    _lead(tenant, "waiting")
+    old = (datetime.now() - timedelta(days=pipeline.STALE_CLOSE_DAYS + 5)
+           ).isoformat(timespec="seconds")
+    pipeline.update(tenant, SITE, "waiting", stage=pipeline.NURTURING,
+                    last_contact_at=old, last_guest_reply_at=old[:10] + "T23:59:59",
+                    next_action_at=None)
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "waiting")["stage"] != pipeline.LOST
+
+
+def test_a_booking_with_only_a_checkout_date_still_closes(tenant):
+    """mark_booked takes check_in and check_out independently. Gating the close
+    on check_in left such a booking in `booked` forever, permanently inflating
+    booked_count and the arrivals list."""
+    _lead(tenant, "D1")
+    pipeline.mark_booked(tenant, SITE, "D1", check_out=_days_from_today(-2))
+    assert pipeline.get(tenant, SITE, "D1")["check_in"] is None
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.get(tenant, SITE, "D1")["stage"] == pipeline.COMPLETED
+
+
+def test_a_stay_that_has_ended_closes_from_any_booked_stage(tenant):
+    for stage in (pipeline.BOOKED, pipeline.PRE_ARRIVAL, pipeline.STAYING):
+        item_id = f"D-{stage}"
+        _lead(tenant, item_id)
+        pipeline.update(tenant, SITE, item_id, stage=stage,
+                        check_in=_days_from_today(-30),
+                        check_out=_days_from_today(-1))
+    pipeline.advance_lifecycle(tenant, SITE)
+    for stage in (pipeline.BOOKED, pipeline.PRE_ARRIVAL, pipeline.STAYING):
+        assert pipeline.get(tenant, SITE, f"D-{stage}")["stage"] == pipeline.COMPLETED
+
+
+def test_a_fresh_deal_is_left_alone(tenant):
+    _lead(tenant, "fresh")
+    assert pipeline.advance_lifecycle(tenant, SITE) == {
+        "pre_arrival": 0, "staying": 0, "completed": 0, "lost": 0}
+
+
+def test_the_lifecycle_sweep_is_safe_to_run_every_pass(tenant):
+    """The worker calls this on every cycle; a second run must change nothing."""
+    _lead(tenant, "D1")
+    pipeline.mark_booked(tenant, SITE, "D1",
+                         check_in=_days_from_today(-1), check_out=_days_from_today(30))
+    pipeline.advance_lifecycle(tenant, SITE)
+    assert pipeline.advance_lifecycle(tenant, SITE) == {
+        "pre_arrival": 0, "staying": 0, "completed": 0, "lost": 0}
+
+
+# --- autopilot may not launder its sends through the approval record ---------
+
+
+def test_autopilot_does_not_record_a_human_approval_that_never_happened(tenant):
+    """The outbox is the audit record of who authorized contact with a guest.
+    Autopilot stamped every send `reason="Approved by you"` with `approved_at`
+    set, so the one path that sends without review was the one path whose record
+    claimed a person had reviewed it."""
+    _lead(tenant, "L1")
+    config.save_settings(tenant, automation_enabled="0")
+    msg = automation.enqueue_autopilot_reply(tenant, SITE, "L1", "Hi there!")
+    assert "approved by you" not in (msg["reason"] or "").lower()
+    assert msg["status"] == outbox.PENDING, "unarmed autopilot must still ask"
+    assert msg["approved_at"] is None
+
+
+def test_autopilot_respects_the_step_rails_it_used_to_skip(tenant):
+    """It called enqueue_send directly, so it never consulted can_auto_send: the
+    intro step is not auto-send-eligible by default precisely because a weak
+    first impression to a live prospect is expensive and hard to undo."""
+    _lead(tenant, "L1")
+    # Master switch on, but the intro step not armed → still needs approval.
+    config.save_settings(tenant, automation_enabled="1", auto_steps="followup_1")
+    assert automation.enqueue_autopilot_reply(
+        tenant, SITE, "L1", "Hi!")["status"] == outbox.PENDING
+
+    # Owner explicitly arms the intro step → it may send unattended, and says so.
+    config.save_settings(tenant, automation_enabled="1", auto_steps="intro")
+    msg = automation.enqueue_autopilot_reply(tenant, SITE, "L1", "Hi!")
+    assert msg["status"] == outbox.QUEUED
+    assert "autopilot" in msg["reason"].lower()
+
+
+def test_the_human_send_button_still_records_a_human(tenant):
+    """The honest case must keep saying so."""
+    _lead(tenant, "L1")
+    msg = automation.enqueue_send(tenant, SITE, "L1", "Hi there!")
+    assert msg["status"] == outbox.QUEUED
+    assert msg["reason"] == "Approved by you"
+
+
+def test_approving_a_future_scheduled_message_sends_it_now(tenant):
+    """A person pressing approve means "send this", not "send this at the hour
+    some sequence picked". With delivery gated on scheduled_at, leaving a future
+    stamp would hold the message back — the operator clicks, nothing happens,
+    and they click again."""
+    _lead(tenant, "L1")
+    msg = outbox.add(tenant, SITE, "L1", sequence="presale", step_id="intro",
+                     step_label="First reply", body="Morning!", auto=False,
+                     scheduled_at="2099-01-01T08:00:00")
+    outbox.approve(msg["id"])
+    assert outbox.next_queued(tenant) is not None, "approve must release it now"
+
+
+def test_approving_an_already_due_message_keeps_its_place_in_the_queue(tenant):
+    """Pulling the time forward must not let a just-approved message jump ahead
+    of one that has been waiting longer."""
+    _lead(tenant, "L1")
+    old = outbox.add(tenant, SITE, "L1", sequence="presale", step_id="intro",
+                     step_label="First reply", body="Older", auto=False,
+                     scheduled_at="2020-01-01T09:00:00")
+    outbox.approve(old["id"])
+    assert outbox.get(old["id"])["scheduled_at"] == "2020-01-01T09:00:00"
+
+
+def test_a_send_scheduled_for_the_morning_is_not_delivered_at_night(tenant):
+    """The quiet-hours clamp only ever ordered the queue — it never gated it, so
+    a send pushed to a civilised hour went out the moment a drainer woke."""
+    _lead(tenant, "L1")
+    outbox.add(tenant, SITE, "L1", sequence="presale", step_id="intro",
+               step_label="First reply", body="Morning!", auto=True,
+               scheduled_at="2026-08-20T08:00:00")
+    assert outbox.next_queued(tenant, now_iso="2026-08-20T03:00:00") is None
+    assert outbox.next_queued(tenant, now_iso="2026-08-20T09:00:00") is not None
+
+
+# --- the one derived state ---------------------------------------------------
+
+
+def test_lead_state_answers_open_closed_responded_from_one_place(tenant):
+    unlooked = {"stage": pipeline.NEW}
+    assert pipeline.lead_state(unlooked, None) == pipeline.NEEDS_YOU
+    assert pipeline.lead_state(unlooked, {"status": "draft"}) == pipeline.NEEDS_YOU
+    assert pipeline.lead_state(
+        {"stage": pipeline.CONTACTED}, {"status": "sent"}) == pipeline.AWAITING_GUEST
+    assert pipeline.lead_state(
+        {"stage": pipeline.NURTURING, "next_action_at": "2099-01-01T09:00:00"},
+        {"status": "sent"}) == pipeline.SCHEDULED
+    assert pipeline.lead_state(
+        {"stage": pipeline.BOOKED}, {"status": "sent"}) == pipeline.CLOSED
+    assert pipeline.lead_state(
+        {"stage": pipeline.CONTACTED}, {"status": "dismissed"}) == pipeline.CLOSED
+    # A clean agent skip is a handled decision, not work sitting in the queue.
+    assert pipeline.lead_state(
+        {"stage": pipeline.NEW}, {"status": "skipped",
+                                  "reason": "Budget below the unit price."}) == pipeline.CLOSED
+    # A drafting *failure* is not a decision — it still needs a human.
+    assert pipeline.lead_state(
+        {"stage": pipeline.NEW},
+        {"status": "skipped", "reason": "draft error: API key missing"}) == pipeline.NEEDS_YOU
+    assert pipeline.lead_state(
+        {"stage": pipeline.CONTACTED}, {"status": "sent"},
+        has_failed_send=True) == pipeline.NEEDS_YOU
+
+
+def test_a_waiting_guest_outranks_a_patient_draft(tenant):
+    """Both want the owner. The person actually waiting on an answer wins."""
+    replied = {"stage": pipeline.CONTACTED,
+               "last_contact_at": "2026-08-01T10:00:00",
+               "last_guest_reply_at": "2026-08-01T11:00:00",
+               "next_action_at": "2099-01-01T09:00:00"}
+    assert pipeline.lead_state(replied, {"status": "draft"}) == pipeline.GUEST_REPLIED
+    # Our reply going out after theirs hands the ball back to them.
+    answered = {**replied, "last_contact_at": "2026-08-01T12:00:00",
+                "next_action_at": None}
+    assert pipeline.lead_state(answered, {"status": "sent"}) == pipeline.AWAITING_GUEST
 
 
 def test_email_mode_is_never_scheduled_for_a_scrape(tenant):

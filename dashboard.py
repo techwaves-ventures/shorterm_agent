@@ -248,10 +248,19 @@ def _board(tenant_id: str) -> dict:
     send_states = outbox.latest_by_item(tenant_id, SITE)
     # Self-heal on view: requeue sends stranded by a crashed process, and make
     # sure something is draining if messages are waiting (e.g. after a restart).
-    if _can_deliver_in_process():
-        outbox.reclaim_stuck_sending()
-        if outbox.queued_tenants():
-            automation.start_drainer(SITE)
+    #
+    # The reclaim is deliberately *not* gated on `_can_deliver_in_process()`.
+    # It is pure DB work — it drives no browser — and the topology that cannot
+    # deliver in-process is exactly the one that most needs it: `start_drainer`
+    # on the approve route is ungated, so this process claims rows into
+    # `sending` whether or not it can finish them, and worker.py is then the
+    # only other reclaimer. With no worker running, gating this stranded the
+    # row forever: `sending` is not cancelable (see `outbox.CANCELABLE`), and
+    # `has_open_step` counts it as open, so the agent never re-drafts that step
+    # for that guest again.
+    outbox.reclaim_stuck_sending()
+    if _can_deliver_in_process() and outbox.queued_tenants():
+        automation.start_drainer(SITE)
 
     def card(deal: dict) -> dict:
         item = items.get(deal["item_id"], {})
@@ -568,6 +577,211 @@ def api_board():
 
 
 # ---------------------------------------------------------------------------
+# Inbox — one filterable list of every lead and message
+# ---------------------------------------------------------------------------
+
+
+def _int_arg(value, default: int) -> int:
+    """A query-string integer, or the default. Never raises on hand-typed URLs."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _failed_item_ids(tenant_id: str) -> tuple:
+    """Items whose last send failed — they need the owner, whatever their stage."""
+    return tuple(m["item_id"]
+                 for m in outbox.for_tenant(tenant_id, SITE, (outbox.FAILED,)))
+
+
+@app.route("/inbox")
+@login_required
+def inbox():
+    """The list the operator manages from: every lead and message, filterable.
+
+    Deliberately side-effect free. `_board()` mutates on read — it backfills
+    deals and starts the send drainer — which is defensible for one dashboard
+    but not for a list the operator will page and re-filter constantly, where it
+    would turn every click into a write.
+    """
+    tenant_id = current_user.tenant_id
+    kind = request.args.get("kind") or "all"
+    state = request.args.get("state") or ""
+    unit = request.args.get("unit") or ""
+    q = (request.args.get("q") or "").strip()
+
+    result = pipeline.inbox_page(
+        tenant_id, SITE,
+        state=state,
+        kind=kind if kind in ("lead", "message") else None,
+        unit=unit or None,
+        q=q or None,
+        page=_int_arg(request.args.get("page"), 1),
+        per_page=_int_arg(request.args.get("per_page"), pipeline.DEFAULT_PER_PAGE),
+        failed_item_ids=_failed_item_ids(tenant_id),
+    )
+
+    # Payloads for this page only — never the whole mailbox.
+    items = storage.items_by_ids(
+        tenant_id, SITE, [r["deal"]["item_id"] for r in result["rows"]])
+    rows = []
+    for row in result["rows"]:
+        deal = row["deal"]
+        item = items.get(deal["item_id"], {})
+        rows.append({
+            **row,
+            "item": item,
+            "id": deal["item_id"],
+            "title": item.get("title") or deal.get("guest_name") or deal["item_id"],
+            "age": pipeline.humanize_age(deal.get("inquiry_at")),
+            "stage_label": pipeline.STAGE_LABELS.get(deal.get("stage"), deal.get("stage")),
+            "state_label": pipeline.LEAD_STATE_LABELS.get(row["state"], row["state"]),
+        })
+
+    return render_template(
+        "inbox.html",
+        nav_active="inbox",
+        account=current_user.email,
+        rows=rows,
+        counts=result["counts"],
+        page=result["page"],
+        pages=result["pages"],
+        total=result["total"],
+        per_page=result["per_page"],
+        filters={"state": state, "kind": kind, "unit": unit, "q": q},
+        states=[(s, pipeline.LEAD_STATE_LABELS[s]) for s in pipeline.LEAD_STATES],
+        units=config.get_units(tenant_id) or [],
+        billing_label=billing.status_label(billing.get_subscription(tenant_id)),
+    )
+
+
+def _entry_text(item: dict) -> str:
+    """What to show in a thread bubble for one inbound item.
+
+    Deliberately does not fall back to `raw`: that is the entire notification
+    email, so a lead's bubble would render "You have a new tenant lead.
+    Property: ... Traveler: ..." as though the guest had typed it. The facts in
+    that wrapper are already on the header of this page. A message has the
+    guest's own text in `body`; a lead's substance is its detail line.
+    """
+    for key in ("body", "detail", "title"):
+        value = (item.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _sent_state(tenant_id: str, item_id: str, response: dict | None) -> str:
+    """Why the approve-and-send control must not be offered, or "" if it may be.
+
+    Two distinct "already handled" cases, both of which previously still showed
+    an enabled Approve & send button over the text that had just gone out:
+    a reply that has been delivered, and one that is queued or mid-flight.
+    """
+    msgs = [m for m in outbox.for_tenant(tenant_id, SITE, outbox.IN_FLIGHT)
+            if m["item_id"] == item_id]
+    if msgs:
+        return outbox.STATUS_LABELS.get(msgs[0]["status"], "Sending…")
+    if (response or {}).get("status") == "sent":
+        at = (response or {}).get("sent_at") or ""
+        return f"Sent{' ' + str(at) if at else ''}."
+    # `response.status` is a single mutable field, so it is not a reliable record
+    # that something was delivered: any later write to the row — including a
+    # draft *failure* on a guest reply, which flips it to "skipped" while leaving
+    # the previously-sent text in `draft` — erases the only evidence the guard
+    # above depends on, and the control comes back live over a message the guest
+    # already has. The outbox keeps one durable row per delivery, so ask it
+    # whether these exact words have gone out before. Comparing the text rather
+    # than merely "has ever sent" is what still lets the thread reopen: a fresh
+    # draft for the guest's new question is different text, and is offered.
+    draft = ((response or {}).get("draft") or "").strip()
+    delivered = [b.strip() for b in outbox.sent_bodies(tenant_id, SITE, item_id)]
+    if delivered and (not draft or draft in set(delivered)):
+        # Either these exact words already went out, or a reply went out and
+        # there is no new draft to put in its place (a failed re-draft clears
+        # it). Neither is something to offer a send button for.
+        return "Sent."
+    return ""
+
+
+@app.route("/thread/<item_id>")
+@login_required
+def thread(item_id):
+    """One conversation: the guest's messages and ours, in order.
+
+    This is the surface "I want to see all the messages" reduces to. Everything
+    the guest sent lives in `seen`; everything we sent lives in the outbox.
+    Neither alone is the conversation.
+    """
+    tenant_id = current_user.tenant_id
+    deal = _deal_or_404(tenant_id, item_id)
+    key = deal.get("thread_key") or ""
+
+    # Threading matches on guest identity rather than an indexed id, so this
+    # reads the tenant's items and filters in Python. Acceptable for a single
+    # conversation; it is the reason /inbox deliberately does not do the same.
+    inbound_items = pipeline.thread_items(key, storage.all_items(tenant_id, SITE))
+    if not inbound_items:
+        item = storage.get_item(tenant_id, SITE, item_id)
+        inbound_items = [item] if item else []
+
+    entries = [{
+        "who": "guest",
+        "name": deal.get("guest_name") or "Guest",
+        "at": it.get("first_seen") or "",
+        "body": _entry_text(it),
+        "kind": it.get("kind") or "lead",
+    } for it in inbound_items]
+
+    for msg in outbox.for_tenant(tenant_id, SITE, (outbox.SENT,)):
+        if msg["item_id"] == item_id:
+            entries.append({"who": "us", "name": "You", "at": msg.get("sent_at") or "",
+                            "body": msg.get("body") or "", "kind": "reply"})
+    entries.sort(key=lambda e: str(e["at"]))
+
+    response = storage.get_responses(tenant_id, SITE).get(item_id)
+    state = pipeline.lead_state(
+        deal, response, has_failed_send=item_id in _failed_item_ids(tenant_id))
+    return render_template(
+        "thread.html",
+        sent_state=_sent_state(tenant_id, item_id, response),
+        nav_active="inbox",
+        account=current_user.email,
+        deal=deal,
+        entries=entries,
+        response=response,
+        state=state,
+        state_label=pipeline.LEAD_STATE_LABELS.get(state, state),
+        stage_label=pipeline.STAGE_LABELS.get(deal.get("stage"), deal.get("stage")),
+        can_scrape=_can_scrape(),
+        billing_label=billing.status_label(billing.get_subscription(tenant_id)),
+    )
+
+
+@app.route("/deal/<item_id>/notes", methods=["POST"])
+@login_required
+def deal_notes(item_id):
+    """Free-text notes on a deal — the context that never fits a stage."""
+    tenant_id = current_user.tenant_id
+    _deal_or_404(tenant_id, item_id)
+    (notes,) = _form("notes")
+    pipeline.update(tenant_id, SITE, item_id, notes=(notes or "").strip()[:4000])
+    return jsonify({"ok": True})
+
+
+@app.route("/deal/<item_id>/reopen", methods=["POST"])
+@login_required
+def deal_reopen(item_id):
+    """Undo a close. A one-click close nobody can undo is a trap."""
+    tenant_id = current_user.tenant_id
+    _deal_or_404(tenant_id, item_id)
+    pipeline.update(tenant_id, SITE, item_id, stage=pipeline.CONTACTED,
+                    closed_reason=None)
+    return jsonify({"ok": True})
+
+
+# ---------------------------------------------------------------------------
 # Deal lifecycle actions
 # ---------------------------------------------------------------------------
 
@@ -631,7 +845,16 @@ def _own_message_or_404(tenant_id: str, msg_id: int) -> dict:
 def outbox_approve(msg_id):
     """Approve (optionally edited) agent copy and release it to the send queue."""
     tenant_id = current_user.tenant_id
-    _own_message_or_404(tenant_id, msg_id)
+    msg = _own_message_or_404(tenant_id, msg_id)
+    # The guard /responder/send carries, on the button the dashboard card
+    # actually posts to — this is the primary approval surface, and it had none.
+    # A sent message re-approved here went back on the queue and was delivered a
+    # second time.
+    if msg["status"] not in outbox.APPROVABLE:
+        return jsonify({
+            "ok": False, "already": True,
+            "error": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
+        }), 409
     (text,) = _form("text")
     outbox.approve(msg_id, (text or "").strip() or None)
     automation.start_drainer(SITE)  # deliver in the background; don't block the click
@@ -642,7 +865,18 @@ def outbox_approve(msg_id):
 @login_required
 def outbox_cancel(msg_id):
     tenant_id = current_user.tenant_id
-    _own_message_or_404(tenant_id, msg_id)
+    msg = _own_message_or_404(tenant_id, msg_id)
+    # Same 409 as approve, and for a sharper reason: cancelling an already-sent
+    # row drops it out of `sent_bodies()`, which is the only thing stopping
+    # /responder/send from queueing a second copy of text the guest has read.
+    # A row already `sending` refuses for the same reason — the drainer holding
+    # it delivers regardless of what we answer here, so "cancelled" would be a
+    # green toast for a message the guest receives. See `outbox.CANCELABLE`.
+    if msg["status"] not in outbox.CANCELABLE:
+        return jsonify({
+            "ok": False, "already": True,
+            "error": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
+        }), 409
     outbox.cancel(msg_id)
     return jsonify({"ok": True, "counts": outbox.counts(tenant_id, SITE)})
 
@@ -811,6 +1045,13 @@ def responder_send():
         return jsonify({"ok": False, "error": "item not found"}), 404
     if not (text or "").strip():
         return jsonify({"ok": False, "error": "empty reply"}), 400
+    # Hiding the button is not a guard: a double-click, a stale tab or a
+    # back-button replay all re-POST this, and every one of them used to put a
+    # second copy of the same message in front of the guest.
+    blocked = _sent_state(tenant_id, item_id,
+                          storage.get_responses(tenant_id, SITE).get(item_id))
+    if blocked:
+        return jsonify({"ok": False, "already": True, "error": blocked}), 409
     msg = automation.enqueue_send(tenant_id, SITE, item_id, text.strip())
     return jsonify({
         "ok": True,
