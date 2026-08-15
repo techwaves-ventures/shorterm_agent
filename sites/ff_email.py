@@ -441,19 +441,30 @@ def _wrapper_name(body: str) -> str:
     header block without one; asking the specific labels first is what actually
     makes it safe.
     """
-    text = _wrapper_head(_strip_forwarded(body or ""))
+    text = _strip_forwarded(body or "")
     for pattern in (_GUEST_NAME_LINE, _SENDER_NAME_LINE):
         for match in pattern.finditer(text):
             value = (match.group(1) or "").strip()
-            # An empty field, or one whose "value" is just the next field, says
-            # nothing about the guest — keep looking. Anything else is the
-            # wrapper's answer and it stands even if it turns out not to be a
-            # name: taking the *next* value that parses is what let a guest with
-            # a prose profile name have their own forged label accepted instead.
-            if not value or _is_template_field(value):
+            # An empty field says nothing about the guest, and neither does one
+            # whose "value" is really the *next* field, picked up because this
+            # label's own line was blank. Skip those and keep looking.
+            if not value:
                 continue
+            if _spans_lines(match) and _is_template_field(value):
+                continue
+            # Otherwise this is the wrapper's answer, and it stands even when it
+            # turns out not to be a name. Walking on to the next value that
+            # parses is what let a guest choose the answer: the wrapper renders
+            # their profile name, so anything that gets this line refused —
+            # prose, or a smuggled "Guest:" label — handed the decision to the
+            # forged label in their own message.
             return _only_if_a_name(value)
     return ""
+
+
+def _spans_lines(match: re.Match) -> bool:
+    """Whether the value sits on a later line than its label."""
+    return "\n" in match.group(0)[:match.start(1) - match.start(0)]
 
 
 def _is_template_field(value: str) -> bool:
@@ -461,47 +472,6 @@ def _is_template_field(value: str) -> bool:
     return bool(sep) and label.strip().lower() in _TEMPLATE_LABELS
 
 
-def _wrapper_head(text: str) -> str:
-    """The notification's own fields, cut where the guest's message starts.
-
-    Document order alone is not enough. Taking the *first value that looks like
-    a name* means that when the wrapper's own value is refused, the next match
-    is whatever the guest typed — and the guest chooses that value, by putting
-    prose in the profile name FurnishedFinder renders here. Setting it to
-    "your traveler" got their `Tenant:` line refused, their forged
-    "Traveler: Emma M." accepted instead, and their message delivered into
-    Emma's thread. A name is therefore only ever read from above the message.
-
-    A line belongs to the wrapper if it is blank, boilerplate, a known template
-    field, or the value sitting under a field whose own line was empty — that
-    last case is the table layout, and forgetting it would cut the head off
-    directly above the name it exists to find.
-    """
-    head, expecting_value = [], False
-    for line in (text or "").split("\n"):
-        stripped = line.strip().strip("·|").strip()
-        if not stripped:
-            head.append(line)
-            continue
-        if _BOILERPLATE.match(stripped):
-            head.append(line)
-            expecting_value = False
-            continue
-        label, _, value = stripped.partition(":")
-        if _ and label.strip().lower() in _TEMPLATE_LABELS:
-            head.append(line)
-            expecting_value = not value.strip()
-            continue
-        if stripped.lower() in _TEMPLATE_LABELS:
-            head.append(line)
-            expecting_value = True
-            continue
-        if expecting_value:
-            head.append(line)
-            expecting_value = False
-            continue
-        break
-    return "\n".join(head)
 
 
 def _guest_name(subject: str, body: str) -> str:

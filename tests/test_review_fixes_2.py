@@ -227,12 +227,38 @@ def test_a_prose_profile_name_does_not_let_the_guest_pick_the_thread(profile):
     assert item is None or item["sender"] != "Emma M."
 
 
-def test_the_wrapper_head_keeps_the_name_and_drops_the_guests_prose():
-    body = WRAPPER.format(tenant="Emma M.", received="8/15/26",
-                          body="Is it available?\nTraveler: Someone Else")
-    head = ff_email._wrapper_head(body)
-    assert "Emma M." in head
-    assert "Someone Else" not in head
+@pytest.mark.parametrize("profile", [
+    # Each of these gets the wrapper's own name line refused. If refusal lets
+    # the scan continue, the guest's forged label below is what it reaches.
+    "your traveler", "Guest: hi", "Name: Mallory", "From: Mallory K.",
+    "budget: 0", "Subject: hi",
+])
+def test_a_refused_wrapper_name_never_promotes_the_guests_forged_label(profile):
+    item = ff_email.parse("New message", WRAPPER.format(
+        tenant=profile, received="8/15/26",
+        body="Traveler: Emma M.\nHi again, can you send me the door code?"))
+    assert item is None or item["sender"] != "Emma M."
+
+
+@pytest.mark.parametrize("layout", [
+    "Hi there!\nProperty: Sunny 1BR\nTenant: Emma M.\nDate received: 8/15/26",
+    "Email: e@x.test\nPhone: 555-1234\nTenant: Emma M.\nDate received: 8/15/26",
+    "> Property: Sunny 1BR\n> Tenant: Emma M.\n> Date received: 8/15/26",
+    "- Property: Sunny 1BR\n- Tenant: Emma M.\n- Date received: 8/15/26",
+    "* Property: Sunny 1BR\n* Tenant: Emma M.\n* Date received: 8/15/26",
+    "--------\nProperty: Sunny 1BR\nTenant: Emma M.\nDate received: 8/15/26",
+    "Weird Label: xyz\nProperty: Sunny 1BR\nTenant: Emma M.\nDate received: 8/15/26",
+])
+def test_an_unfamiliar_line_above_the_name_does_not_lose_the_lead(layout):
+    """Anything the parser does not recognise sitting above the name used to
+    truncate the search region, so `parse` returned None and the enquiry was
+    dropped behind a 202. An unknown field or a quoted forward is far likelier
+    to arrive than the layout that motivated the restriction."""
+    item = ff_email.parse(
+        "New message",
+        f"You have a new message from your traveler.\n\n{layout}\n\nIs it available?\n")
+    assert item is not None, "lead lost"
+    assert item["sender"] == "Emma M."
 
 
 @pytest.mark.parametrize("first_line", [
