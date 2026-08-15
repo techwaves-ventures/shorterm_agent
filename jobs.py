@@ -461,9 +461,14 @@ def worker_online() -> bool:
         being stranded.
       * A *future-dated* stamp — a worker whose clock is ahead of ours — gives a
         negative age, which is `<= WORKER_TTL_SECONDS` and so reads **online**.
-        That fails open: a worker that is dead but skewed keeps reading alive,
-        and because `reap_stale` gates its crash-recovery arm on this, the other
-        reap paths stay shut too. Deliberate and unchanged from the previous
+        That fails open, but only on one arm: it shuts off `reap_stale`'s
+        crash-recovery path (`not online`), which is the one that exists to
+        catch a worker that stopped. Its other two arms are independent `or`
+        branches and still fire — the `MAX_ACTIVE_JOB_SECONDS` cap and the
+        orphaned-worker-id check both reap normally with `online` True (see
+        `test_hard_cap_backstop`). So a dead-but-skewed worker's job is not
+        stranded forever; it waits for the cap instead of the 90s TTL.
+        Deliberate and unchanged from the previous
         release — clamping it here would newly reap a live skewed worker's jobs,
         a regression rather than a fix — and pinned by
         `test_future_dated_stamp_still_reads_online_as_before`. Future-dated
