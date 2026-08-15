@@ -394,6 +394,21 @@ def recover(tenant_id: str, item: dict, site: str = "furnishedfinder") -> tuple[
     cancels the deal's queued follow-up and re-opens the drafting path, so a second
     click would cancel a scheduled nurture step and queue a *second* reply to a
     guest who only ever wrote once.
+
+    The cost of that inversion is a race, and it is accepted rather than
+    unnoticed. `store`'s single `filter_new` is one atomic claim; reading first
+    and writing after leaves a window in which a retry and the identical webhook
+    delivery both find the item unseen and both apply it. Two *retries* cannot
+    collide — the route's `mark_recovered` is a conditional UPDATE and the loser
+    stops before reaching here — so it needs a retry racing an ingest of the same
+    message within the board write. Review measured 0 occurrences in 40
+    barrier-synchronised trials; only an injected delay reproduces it.
+
+    Closing it means claiming before the write, which is precisely the ordering
+    that produced the two defects above: a failed claim-first attempt leaves the
+    message unreachable forever, because every later delivery short-circuits at
+    the dedup. That is a permanent silent loss on a common path traded against a
+    duplicated reply on a rare one, so the window stays.
     """
     import storage
 
