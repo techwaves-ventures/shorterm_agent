@@ -977,6 +977,88 @@ def test_a_recovered_reply_whose_thread_write_fails_hands_the_row_back(client, m
     assert inbound_rejects.count_open(tid, SITE) == 1, "the lead must stay visible"
 
 
+def test_a_reply_whose_thread_write_quietly_declines_hands_the_row_back(client, monkeypatch):
+    """The same D1 harm by the failure mode that does *not* raise.
+
+    Its sibling above makes `record_guest_reply` explode, which `recover` catches
+    in its `except`. But the function's own documented "I did nothing" answer is a
+    plain `None` return (`pipeline.py:496` — the parent deal no longer resolves),
+    and that path never goes near the `except`. Round 5 replaced the old
+    state-inference with `open_deal` *reporting* whether the board took the item,
+    and this return value is the entire mechanism: if it ever reports success
+    unconditionally, a reply that was never written is marked recovered and the
+    operator is told the guest is safe.
+
+    Without this test that mechanism is unguarded — making `open_deal` return a
+    bare `True` keeps the whole suite green.
+    """
+    tid = _tenant_with_login(client)
+    _post(client, tid, body=GOOD_LEAD, subject="New lead from Emma M.")
+    deals = pipeline.all_deals(tid, SITE)
+    assert len(deals) == 1, "precondition: one deal for Emma"
+    parent = deals[0]
+
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    reply = {
+        "kind": "message", "id": "reply-emma-quiet", "title": "Emma M.",
+        "traveler": "Emma M.",
+        "property_name": parent.get("property_name") or "Quiet Spacious Home in NW DC - Unit 1",
+        "url": "u", "source": "email", "raw": "Any update?",
+    }
+    monkeypatch.setattr(ff_email, "parse",
+                        lambda subject, body, received_at=None: dict(reply))
+
+    # Preconditions asserted before the act: this really is a threaded reply, and
+    # the parent has no reply stamp yet — so a pass cannot come from the item not
+    # being a thread, nor from comparing two empty values.
+    assert pipeline.find_thread(
+        tid, SITE, pipeline.thread_key(reply), exclude_item_id=reply["id"]
+    ), "precondition: the reply really does belong to Emma's thread"
+    assert not pipeline.get(tid, SITE, parent["item_id"]).get("last_guest_reply_at"), (
+        "precondition: the parent has recorded no guest reply yet"
+    )
+
+    import pipeline as pipeline_mod
+
+    calls = []
+
+    def declines(*a, **kw):
+        # Exactly what the real function returns when the deal has gone.
+        calls.append(1)
+        return None
+
+    monkeypatch.setattr(pipeline_mod, "record_guest_reply", declines)
+
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    # Positive control: the code really did attempt the write and really did get
+    # the declining answer, so a blind probe would be detectable here.
+    assert calls, "control: the retry must actually have attempted the thread write"
+    assert not pipeline.get(tid, SITE, parent["item_id"]).get("last_guest_reply_at"), (
+        "control: the guest's reply really was never recorded"
+    )
+    assert len(pipeline.all_deals(tid, SITE)) == 1, "control: no deal was opened either"
+
+    row = inbound_rejects.get(tid, SITE, rid)
+    assert row["status"] == "open", (
+        "a reply whose thread write declined must not read as recovered"
+    )
+    assert row["resolved_item_id"] in (None, ""), "must not claim a deal that was never opened"
+    assert inbound_rejects.count_open(tid, SITE) == 1, "the lead must stay visible"
+
+    # The item must not have been marked seen either: a recovery that did not
+    # reach the board has to stay retryable, which is the ordering round 5
+    # inverted (board write first, dedup only once it landed).
+    import storage
+    assert not storage.already_seen(tid, SITE, "message", reply["id"]), (
+        "a failed recovery must leave nothing behind, so it can be retried"
+    )
+
+
 def test_two_sends_of_the_same_words_recover_onto_two_deals(client, monkeypatch):
     """D2: retry dropped the mail `Date`, so a re-send collapsed onto the first.
 
