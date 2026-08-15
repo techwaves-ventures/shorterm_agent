@@ -400,12 +400,15 @@ def test_worker_restart_recovery():
 
 def test_hard_cap_backstop():
     print("test_hard_cap_backstop")
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     t = "t-wedged"
     jobs.enqueue(t)
     jobs.heartbeat("worker-wedged")           # worker ONLINE the whole time
     job = _claim_for("worker-wedged", t)
-    old = (datetime.now() - timedelta(seconds=jobs.MAX_ACTIVE_JOB_SECONDS + 60)).isoformat(timespec="seconds")
+    # Aware, matching what `jobs.enqueue()` writes (VEN-142) — a naive value ages
+    # the same but routes this check down the legacy compatibility branch.
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=jobs.MAX_ACTIVE_JOB_SECONDS + 60)).isoformat(timespec="seconds")
     with jobs._conn() as c:
         c.execute("UPDATE ff_jobs SET created_at=? WHERE id=?", (old, job["id"]))
     check(jobs.reap_stale(active_worker_id="worker-wedged") >= 1,
@@ -427,7 +430,7 @@ def test_magic_link_required_error():
 
 def test_retry_cooldown_blocks_burst():
     print("test_retry_cooldown_blocks_burst")
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     t = "t-cooldown"
     j = jobs.enqueue(t)
     jobs.set_status(j["id"], jobs.ERROR, "Couldn't verify your FurnishedFinder login.")
@@ -436,7 +439,9 @@ def test_retry_cooldown_blocks_burst():
           "retry within cooldown coalesces onto the errored job (no burst)")
     ps = jobs.public_state(t)
     check("wait" in ps["message"].lower(), "cooldown surfaces a wait message in the banner")
-    old = (datetime.now() - timedelta(seconds=jobs.ERROR_RETRY_COOLDOWN_SECONDS + 5)).isoformat(timespec="seconds")
+    # Aware, matching what `jobs.set_status()` writes (VEN-142).
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=jobs.ERROR_RETRY_COOLDOWN_SECONDS + 5)).isoformat(timespec="seconds")
     with jobs._conn() as c:
         c.execute("UPDATE ff_jobs SET updated_at=? WHERE id=?", (old, j["id"]))
     fresh = jobs.enqueue(t)

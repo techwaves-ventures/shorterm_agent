@@ -326,6 +326,35 @@ def test_a_writer_whose_clock_is_ahead_cannot_produce_an_absurd_cooldown(hosts, 
     )
 
 
+def test_an_unreadable_updated_at_does_not_reach_the_negative_clamp(hosts):
+    """Pin the guard ORDER: `age is None` must be tested before `age < 0`.
+
+    `_age_seconds` returns None for an unreadable stamp, and `None < 0` raises
+    `TypeError`. `_cooldown_remaining` feeds `public_state` and `enqueue`, neither
+    of which is wrapped, so that raise is a 500 on the dashboard, `/api/status`
+    and `/refresh` rather than a bad number — the same unwrapped-request-path
+    hazard that keeps `_age_seconds`'s own `except` deliberately broad.
+
+    Swapping the two guards left the full suite green (360 passed), so nothing
+    stopped a future reorder from shipping that 500. This is what notices.
+    """
+    _reset()
+    tenant = "t-unreadable"
+    hosts(WEB)
+    job = jobs.enqueue(tenant)
+    jobs.set_status(job["id"], jobs.ERROR, "Couldn't verify your FF login.")
+    with jobs._conn() as c:
+        c.execute("UPDATE ff_jobs SET updated_at=? WHERE id=?",
+                  ("not-a-timestamp", job["id"]))
+
+    assert jobs._age_seconds(jobs.latest(tenant)["updated_at"]) is None, (
+        "the stamp is still readable, so this test is not exercising the None path"
+    )
+    # Must not raise, and an unknown age means no evidence of a recent login.
+    assert jobs._cooldown_remaining(jobs.latest(tenant)) == 0
+    assert jobs.public_state(tenant)["status"] == "error"
+
+
 def test_a_normal_cooldown_is_untouched_by_the_skew_clamp(hosts):
     """The control for the clamp: an ordinary recent error still counts down.
 
@@ -654,6 +683,17 @@ def test_the_connect_flow_suite_can_actually_fail_and_tests_the_shipped_path():
 
     src = Path(__file__).with_name("test_ff_connect_flow.py").read_text()
 
+    # All three cross-host columns, not just `last_seen`: that file back-dates
+    # `created_at` (hard-cap backstop) and `updated_at` (retry cooldown) too, and
+    # fixing only `_expire_worker` would leave two of the three still testing the
+    # legacy branch while looking fixed.
+    assert "datetime.now()" not in src, (
+        "test_ff_connect_flow.py back-dates a cross-host column with a naive "
+        "`datetime.now()`. It still expires/ages correctly, so every assertion "
+        "keeps passing — but silently down the legacy-naive branch of "
+        "`_age_seconds`, leaving the shipped offset-aware path uncovered"
+    )
+
     start = src.index("def _expire_worker(")
     expire_body = src[start:src.index("\ndef ", start + 1)]
     assert "timezone.utc" in expire_body, (
@@ -708,4 +748,20 @@ def test_no_unstamped_writer_is_added_to_this_module():
         "`timezone.utc`. Every timestamp in this module crosses the web/worker "
         "host boundary, so a naive local now is the VEN-142 defect: stamp with "
         "`_now_utc()`, and derive a local wall clock from an aware now."
+    )
+
+    # `datetime.now()` is not the only way to get a naive stamp, and it is not
+    # even the likeliest one. `utcnow()` returns a naive datetime holding UTC —
+    # it *reads* as already-correct, which is exactly why it slips through
+    # review — and `time.strftime`/`fromtimestamp`/`date.today` are naive too.
+    # An earlier version of this test checked only `datetime.now()`, and a new
+    # writer using `utcnow()` left the suite green.
+    forbidden = ["utcnow(", "time.strftime(", "fromtimestamp(", "date.today("]
+    found = [t for t in forbidden if t in src]
+    assert found == [], (
+        f"jobs.py uses {found}, which produce NAIVE timestamps. `utcnow()` in "
+        "particular looks UTC-correct and is not: it drops the tzinfo, so the "
+        "reader cannot tell it from a local wall clock and `_age_seconds` takes "
+        "the legacy branch. Every stamp in this module crosses a host boundary — "
+        "use `_now_utc()`."
     )
