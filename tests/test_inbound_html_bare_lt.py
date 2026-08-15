@@ -45,6 +45,23 @@ def notification(inner: str, prefix: str = "") -> str:
             TABLE + inner + "</body></html>")
 
 
+def notification_with_markup_at(markup: str) -> str:
+    """The same notification with `markup` wedged immediately before the Traveler
+    row — the placement that actually discriminates.
+
+    Mutation testing found this: with the markup at the top of the document a
+    leak lands on a harmless line and every drop assertion passes even for the
+    rejected `<[a-zA-Z!/][^<>]*>` candidate. Adjacent to the Traveler cell, the
+    same leak un-anchors `_guest_name` and `parse` returns None. Placement, not
+    the markup, is what makes this test able to fail.
+    """
+    return ("<html><body><p>You have a new message from your traveler.</p><table>"
+            "<tr><td>Property</td><td>Sunny 1BR</td></tr>" + markup +
+            "<tr><td>Traveler</td><td>Emma M.</td></tr>"
+            "<tr><td>Date received</td><td>8/14/26</td></tr>"
+            "</table><p>Is the unit still available?</p></body></html>")
+
+
 def test_the_bare_less_than_no_longer_eats_the_guests_address_and_ask():
     """The ticket's repro, in the form that reaches `parse` as a real item.
 
@@ -78,13 +95,19 @@ def test_a_bare_less_than_with_a_later_greater_than_survives():
 @pytest.mark.parametrize("label,prefix", [
     # Outlook emits a conditional comment in nearly every HTML mail it sends,
     # so this is the common case rather than an exotic one.
-    ("outlook conditional", "<!--[if !mso]><!--><span>x</span><!--<![endif]-->"),
+    ("outlook conditional", "<!--[if !mso]><!--><span></span><!--<![endif]-->"),
     ("comment containing <", "<!-- a < b -->"),
     ("processing instruction", "<?xml version=\"1.0\"?>"),
     ("cdata containing <", "<![CDATA[ if (a<b) x ]]>"),
     ("doctype", "<!DOCTYPE html>"),
-    ("attribute containing >", "<a href=\"x\" title=\"a > b\">link</a>"),
-    ("attribute containing <", "<a href=\"x\" title=\"a < b\">link</a>"),
+    # Content-free on purpose. An anchor with visible text puts real words next
+    # to the Traveler cell, which un-anchors `_guest_name` on *every* head
+    # including base — a pre-existing `sites.ff_email` fragility, not this
+    # extractor's business. Empty elements isolate leaked *markup* from
+    # legitimate *text*, which is what these cases are actually about.
+    ("attribute containing >", "<a href=\"x\" title=\"a > b\"></a>"),
+    ("attribute containing <", "<a href=\"x\" title=\"a < b\"></a>"),
+    ("img alt containing >", "<img src=\"x\" alt=\"a > b\">"),
 ])
 def test_markup_grammars_never_drop_the_enquiry(label, prefix):
     """The critical one: no candidate fix may turn an enquiry into nothing.
@@ -95,16 +118,22 @@ def test_markup_grammars_never_drop_the_enquiry(label, prefix):
     provider never retries — the enquiry is destroyed with no trace. This killed
     the `<[a-zA-Z!/][^<>]*>` candidate, which passed every other check.
     """
-    html = notification("<p>Is the unit still available?</p>", prefix=prefix)
-    item = ff_email.parse(MESSAGE_SUBJECT, inbound.extract_body({"HtmlBody": html}))
+    for placement, html in (
+            ("at the top of the document",
+             notification("<p>Is the unit still available?</p>", prefix=prefix)),
+            ("immediately before the Traveler cell",
+             notification_with_markup_at(prefix)),
+    ):
+        item = ff_email.parse(MESSAGE_SUBJECT, inbound.extract_body({"HtmlBody": html}))
 
-    assert item is not None, f"{label}: the enquiry was dropped entirely"
-    assert item["sender"] == "Emma M.", f"{label}: guest name corrupted"
-    assert "still available" in item["body"], f"{label}: the guest's words were lost"
+        where = f"{label} {placement}"
+        assert item is not None, f"{where}: the enquiry was dropped entirely"
+        assert item["sender"] == "Emma M.", f"{where}: guest name corrupted"
+        assert "still available" in item["body"], f"{where}: the guest's words were lost"
 
 
 @pytest.mark.parametrize("label,prefix", [
-    ("outlook conditional", "<!--[if !mso]><!--><span>x</span><!--<![endif]-->"),
+    ("outlook conditional", "<!--[if !mso]><!--><span></span><!--<![endif]-->"),
     ("comment containing <", "<!-- a < b -->"),
     ("processing instruction", "<?xml version=\"1.0\"?>"),
     ("cdata containing <", "<![CDATA[ if (a<b) x ]]>"),
@@ -124,6 +153,30 @@ def test_no_markup_innards_leak_into_a_stored_field(label, prefix):
         value = item.get(field) or ""
         for token in ("<!", "<?", "CDATA", "[if ", "endif"):
             assert token not in value, f"{label}: {token!r} leaked into {field}: {value[:80]!r}"
+
+
+@pytest.mark.parametrize("markup", [
+    "<a href=\"x\" title=\"a > b\"></a>",
+    "<img src=\"x\" alt=\"Save > 20%\">",
+])
+def test_an_attribute_containing_a_greater_than_no_longer_destroys_the_enquiry(markup):
+    """A second total-ingestion-loss bug on base, found while testing this fix.
+
+    `<[^>]+>` ends the tag at the first `>`, which for `alt="Save > 20%"` is
+    *inside the attribute*, so the remainder (`20%">`) is emitted as text. Landing
+    next to the Traveler cell it un-anchors the name and `parse` returns None —
+    the enquiry is destroyed and the webhook still answers 202. A parser reads
+    the quoted value properly, so this class disappears with the same change.
+
+    Not in the ticket; recorded here because it shares the fix and would
+    otherwise look like an unexplained id drift in the differential corpus.
+    """
+    item = ff_email.parse(
+        MESSAGE_SUBJECT,
+        inbound.extract_body({"HtmlBody": notification_with_markup_at(markup)}))
+
+    assert item is not None, "base drops this enquiry outright"
+    assert item["sender"] == "Emma M."
 
 
 def test_script_and_style_bodies_still_never_reach_the_guest_text():
