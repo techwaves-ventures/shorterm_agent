@@ -213,6 +213,40 @@ def test_a_field_fragment_is_never_accepted_as_a_name(junk):
     assert ff_email._only_if_a_name(junk) == ""
 
 
+@pytest.mark.parametrize("profile", ["your traveler", "about your property."])
+def test_a_prose_profile_name_does_not_let_the_guest_pick_the_thread(profile):
+    """The guest controls the value the wrapper renders, via their profile name.
+
+    Making it prose got their own `Tenant:` line refused, so the scan carried on
+    into the message and accepted the `Traveler:` line they had typed there —
+    landing them in that guest's thread. A name is only read above the message.
+    """
+    item = ff_email.parse("New message", WRAPPER.format(
+        tenant=profile, received="Aug 15, 2026",
+        body="Hi again, can you send me the door code?\nTraveler: Emma M."))
+    assert item is None or item["sender"] != "Emma M."
+
+
+def test_the_wrapper_head_keeps_the_name_and_drops_the_guests_prose():
+    body = WRAPPER.format(tenant="Emma M.", received="8/15/26",
+                          body="Is it available?\nTraveler: Someone Else")
+    head = ff_email._wrapper_head(body)
+    assert "Emma M." in head
+    assert "Someone Else" not in head
+
+
+@pytest.mark.parametrize("first_line", [
+    "Traveler: Emma M.\nHi, can you send the door code?",
+    "Hi, can you send the door code?\nTraveler: Emma M.",
+])
+def test_a_forged_label_never_wins_wherever_the_guest_puts_it(first_line):
+    """Cutting at the guest's prose is not enough on its own — a forged label
+    placed as the *first* body line sits above any prose to cut at."""
+    item = ff_email.parse("New message", WRAPPER.format(
+        tenant="your traveler", received="8/15/26", body=first_line))
+    assert item is None or item["sender"] != "Emma M."
+
+
 def test_two_guests_with_an_occupancy_line_do_not_share_a_thread():
     """The end-to-end symptom: identical thread_key and identical item id."""
     tmpl = ("You have a new message.\n\nProperty: Quiet Home\n"
