@@ -271,16 +271,22 @@ shared database:
 
 | fleet zone | web=new / worker=old | web=old / worker=new |
 |---|---|---|
-| `America/Los_Angeles` (−7) | **approved sends stall** | sends |
-| `UTC` | sends | sends |
-| `Europe/Berlin` (+2) | sends | **approved sends stall** |
+| `America/Los_Angeles` (−7) | **approved sends stall** | **deferred sends fire early** |
+| `UTC` | safe | safe |
+| `Europe/Berlin` (+2) | **deferred sends fire early** | **approved sends stall** |
 
-A stalled send is silent: the operator clicks **Approve & send**, gets a success
-UI, and the message sits `queued` for up to the full offset. `reclaim_stuck_sending`
-does not rescue it — that reaper only looks at rows in `sending`, and these are
-`queued`. In the mirror direction a send deliberately deferred to a civilised
-hour is released *early*, which is the quiet-hours clamp being defeated rather
-than a message being late.
+**Neither column is a safe choice on a non-UTC fleet** — read both cells in your
+row before picking an order. The two failures are different, and the second one
+is easy to mistake for success:
+
+- **Stalled** — the operator clicks **Approve & send**, gets a success UI, and
+  the message sits `queued` for up to the full offset. `reclaim_stuck_sending`
+  does not rescue it: that reaper only looks at rows in `sending`, and these are
+  `queued`. Nothing surfaces it.
+- **Fired early** — a send deliberately deferred to a civilised hour goes out
+  ahead of its scheduled time, i.e. the quiet-hours clamp is defeated and a guest
+  can be messaged inside quiet hours. Queue metrics look *healthy* here, because
+  messages are moving.
 
 ### What to actually do
 
@@ -307,9 +313,9 @@ web host wrote (or the reverse) while the two are on different code.
 
 # 1. Stop the off-host drainer so nothing reads new-frame rows with old code.
 #    However you run it — a Procfile `worker` dyno, a Render/Fly worker, or a
-#    bare `python worker.py` on a VM. There is no systemd unit for it in
-#    deploy/; the units there (str-leads-dashboard, str-leads-check) are the
-#    single-VM topology, which has no separate worker host and is unaffected.
+#    bare `python worker.py` on a VM. Note that NONE of the units in deploy/
+#    runs worker.py: that directory is the single-VM topology, which has no
+#    separate worker host and is therefore unaffected by any of this.
 #      Render/Heroku-style:  scale the `worker` process to 0
 #      VM:                   stop/kill the `python worker.py` process
 
@@ -325,11 +331,32 @@ web host wrote (or the reverse) while the two are on different code.
 
 ### Pre-existing rows are not rewritten (deliberate)
 
-**There is no backfill, and that is a decision, not an oversight.** A row written
-before this release holds the *writing host's* local time, and the database does
-not record which host wrote it or what zone that host was in. Any backfill would
-have to guess an offset and apply it to every row; guessing wrong silently moves
-real customer sends, which is worse than the bounded problem it would fix.
+**Nothing rewrites the schedule columns into the new frame, and that is a
+decision, not an oversight.** A row written before this release holds the
+*writing host's* local time, and the database does not record which host wrote it
+or what zone that host was in. Any backfill would have to guess an offset and
+apply it to every row; guessing wrong silently moves real customer sends, which
+is worse than the bounded problem it would fix.
+
+One at-rest sweep does exist and is easy to mistake for a backfill:
+`pipeline._normalize_legacy_timestamps` runs on the first query in every process
+and rewrites deal timestamps that are still in the database's space-separated
+`YYYY-MM-DD HH:MM:SS` form, converting them UTC→**host-local**. `next_action_at`
+is in its column list, so it is worth being precise about why this is not a
+frame problem:
+
+- The sweep only touches *space-separated* values, and every schedule stamp this
+  release writes is `isoformat()` — `"T"`-separated. Those pass through
+  `pipeline.norm_ts` byte-identical, which is pinned by
+  `test_norm_ts_leaves_schedule_frame_stamps_alone`.
+- `next_action_at` has no database default (see the `deals` DDL) and is only ever
+  written by application code, so in practice it is never space-separated.
+
+The residual inconsistency is a comment, not behaviour: `_TS_COLS` still
+describes the canonical shape for those columns as "local time", which is no
+longer true of `next_action_at` specifically. If a space-separated
+`next_action_at` ever did appear, that sweep would convert it to host-local —
+i.e. out of the schedule frame.
 
 So on a **non-UTC** fleet, rows already in the queue at deploy time are read one
 offset out for the rest of their (short) life:
@@ -340,8 +367,10 @@ offset out for the rest of their (short) life:
   hours.
 - Mixed frames also mis-sort `ORDER BY scheduled_at`, so the drainer can pick a
   legacy row ahead of a correctly-framed one.
-- `automation.reschedule` copies an existing `next_action_at` into a new outbox
-  row, so a legacy stamp can survive one extra hop after the upgrade.
+- `automation.run_due` copies a deal's existing `next_action_at` straight into
+  the new outbox row it creates (`automation.py`, the `outbox.add(...)` call with
+  `scheduled_at=deal.get("next_action_at")`), so a legacy stamp can survive one
+  extra hop after the upgrade.
 
 This is bounded and self-healing — every row is rewritten in the new frame the
 next time it is scheduled — and step 2 above (drain the queue before cutting

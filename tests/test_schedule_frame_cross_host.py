@@ -27,7 +27,17 @@ import pipeline
 import responder
 import sequences
 import storage
-import timeframe
+
+# NB: `timeframe` is imported inside each test that needs it, never at module
+# scope. It does not exist on the pre-fix head, and a module-level import turns
+# this file's differential run there into one collection error instead of the
+# per-test failures that actually demonstrate the defect ("22 failed, 5 passed,
+# 1 xfailed" vs. "1 error"). Keeping the file runnable against unfixed code is
+# the point of it — see the module docstring.
+#
+# Two of those 22 fail on the pre-fix head only because the module is absent
+# rather than because of a frame mismatch, and the xfail below is likewise
+# inconclusive there for the same reason; 20 demonstrate the defect itself.
 
 SITE = "furnishedfinder"
 
@@ -355,6 +365,8 @@ def test_quiet_hours_clamp_uses_the_property_zone():
     and a strict xfail would then report a green suite as a failure for a reason
     that has nothing to do with the defect.
     """
+    import timeframe
+
     prop = ZoneInfo("America/Los_Angeles")
     with host_tz("UTC") as offset:
         assert offset == timedelta(0), "host zone must be pinned for this to mean anything"
@@ -388,6 +400,8 @@ def test_norm_ts_leaves_schedule_frame_stamps_alone():
     out, which is precisely the bug VEN-134 removed. Pin it on both sides of UTC
     so the assertion cannot pass by the offset happening to be zero.
     """
+    import timeframe
+
     for zone in ZONES:
         with host_tz(zone) as offset:
             assert offset is not None

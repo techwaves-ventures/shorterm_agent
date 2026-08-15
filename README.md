@@ -179,9 +179,16 @@ or ambiguous is a question to ask in the reply — not a rejection.
 
 One email at the end of each day (18:00 **property-local** by default) covering
 what the agent sent, who is still waiting on a reply, anything that failed, and
-arrivals in the next week. Set the property's timezone in **Settings** — every
-schedule follows that clock, not the server's, so a DC host gets 6pm Eastern
-even when the app runs in UTC.
+arrivals in the next week. Set the property's timezone in **Settings** — the
+digest and the daily check follow that clock, not the server's, so a DC host
+gets 6pm Eastern even when the app runs in UTC. Schedule times on the dashboard
+are displayed in that clock too.
+
+One exception, until VEN-141 lands: the quiet-hours guard that stops the agent
+messaging a guest overnight still computes in the *server's* zone. On a non-UTC
+deploy a send it considers safely inside waking hours can therefore show an
+out-of-hours time. The displayed time is the truthful one — read it as a real
+finding rather than a rendering bug.
 
 On a quiet day nothing is sent. An empty daily email trains people to ignore the
 channel, and this is the one place the product reaches an owner who isn't logged
