@@ -235,6 +235,22 @@ def mark_recovered(tenant_id: str, site: str, rid: int, item_id: str) -> bool:
         return bool(cur.rowcount)
 
 
+def reopen(tenant_id: str, site: str, rid: int, reason: str) -> None:
+    """Put a row back on the list after a recovery attempt failed part-way.
+
+    The claim in `mark_recovered` happens before the lead is stored, so that two
+    retries can't both create a deal. If the store then fails, this undoes the
+    claim — otherwise the row would read as recovered with nothing on the board,
+    which is the silent loss this table exists to end.
+    """
+    with _conn() as c:
+        c.execute(
+            "UPDATE inbound_rejects SET status=?, resolved_at=NULL, "
+            "resolved_item_id=NULL, reason=? WHERE id=? AND tenant_id=? AND site=?",
+            (OPEN, (reason or "")[:_MAX_REASON], rid, str(tenant_id), site),
+        )
+
+
 def update_reason(tenant_id: str, site: str, rid: int, reason: str) -> None:
     """Refresh the failure detail after a retry that still could not parse."""
     with _conn() as c:

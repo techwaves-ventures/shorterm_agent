@@ -446,7 +446,15 @@ def inbound_rejected_retry(rid):
     try:
         inbound.store(tenant_id, item, SITE)
     except Exception:
+        # Hand the row back rather than leaving it marked recovered with nothing
+        # on the board — that would be the silent loss this page exists to end.
         app.logger.exception("Could not store recovered inbound item")
+        inbound_rejects.reopen(
+            tenant_id, SITE, rid, "parsed, but the lead could not be opened"
+        )
+        flash("Read that email, but couldn't open the lead — it stays on this list.")
+        return redirect(url_for("inbound_rejected"))
+
     flash("Recovered — %s is on your board." % (item.get("title") or "the lead"))
     return redirect(url_for("index"))
 

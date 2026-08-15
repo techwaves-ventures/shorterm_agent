@@ -298,6 +298,37 @@ def test_retry_recovers_the_lead_and_cannot_create_two_deals(client, monkeypatch
     assert len(pipeline.all_deals(tid, SITE)) == 1
 
 
+def test_a_retry_whose_store_fails_hands_the_row_back(client, monkeypatch):
+    """The row is claimed before the lead is stored; a failed store must undo that.
+
+    Otherwise the message reads as recovered with nothing on the board — the
+    silent loss this whole table exists to end, reintroduced by the fix.
+    """
+    tid = _tenant_with_login(client)
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+        "kind": "lead", "id": "boom-1", "title": "Boom | Emma", "url": "u",
+        "source": "email", "raw": body, "traveler": "Emma", "property_name": "Boom",
+    })
+
+    def explode(*a, **kw):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(inbound, "store", explode)
+
+    resp = client.post(f"/inbound/rejected/{rid}/retry")
+    assert resp.status_code == 302
+
+    row = inbound_rejects.get(tid, SITE, rid)
+    assert row["status"] == "open", "a failed store must not leave the row marked recovered"
+    assert row["resolved_item_id"] in (None, ""), "must not claim a deal that was never opened"
+    assert inbound_rejects.count_open(tid, SITE) == 1, "the lead must stay visible"
+
+
 def test_retry_that_still_fails_leaves_the_row_open(client):
     tid = _tenant_with_login(client)
     _post(client, tid)
