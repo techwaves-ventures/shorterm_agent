@@ -19,10 +19,13 @@ two platforms stays two rows until a future merge step reconciles them).
 Times are stored as ISO strings we control, so scheduling math happens in
 Python and stays portable across SQLite and Postgres (same rationale as jobs.py).
 """
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 
 import db
+
+log = logging.getLogger(__name__)
 
 # --- Lifecycle stages -------------------------------------------------------
 NEW = "new"                  # inquiry landed, nothing sent yet
@@ -125,7 +128,60 @@ def _conn() -> db.Conn:
         "CREATE INDEX IF NOT EXISTS deals_tenant_stage "
         "ON deals (tenant_id, site, stage, inquiry_at)"
     )
+    _normalize_legacy_timestamps()
     return c
+
+
+# Set once the legacy-timestamp sweep has run in this process. The sweep is
+# idempotent, but `_conn()` is called on every query and the scan is not free.
+_TS_NORMALIZED = False
+
+
+def _normalize_legacy_timestamps() -> None:
+    """Convert deal timestamps written before `norm_ts` into the canonical shape.
+
+    Every write goes through `norm_ts` today, so the only values that still
+    carry the database's own "YYYY-MM-DD HH:MM:SS" UTC default are rows created
+    before it existed. Those are also the only values that need a clock
+    conversion — and SQL cannot express one portably: SQLite spells it
+    `datetime(col,'localtime')`, Postgres spells it `col AT TIME ZONE 'UTC'`,
+    and this app deliberately speaks a single dialect (see db.py).
+
+    Converting them here, once, is what keeps `lead_state` and its SQL twin
+    honest. Otherwise Python converted UTC->local while the SQL only swapped the
+    separator, so on any non-UTC host the two derivations disagreed about the
+    same deal: the inbox list badged "Guest replied" while the deal page said
+    the guest was still waiting. Doing it at rest means neither side has to
+    convert at read time, so neither side can drift from the other.
+    """
+    global _TS_NORMALIZED
+    if _TS_NORMALIZED:
+        return
+    try:
+        # A connection of its own, committed here rather than riding on the
+        # caller's. Sharing the caller's connection meant that if *it* went on to
+        # raise, `db.Conn.__exit__` rolled the sweep back with it — while the
+        # latch below stayed set, so the conversion was lost for the life of the
+        # process and every reader then compared unconverted values.
+        with db.connect() as c:
+            where = " OR ".join(f"{col} LIKE '% %'" for col in _TS_COLS)
+            rows = c.execute(
+                f"SELECT id, {', '.join(_TS_COLS)} FROM deals WHERE {where}"
+            ).fetchall()
+            for row in rows:
+                values = [norm_ts(v) for v in row[1:]]
+                c.execute(
+                    f"UPDATE deals SET {', '.join(f'{col}=?' for col in _TS_COLS)} "
+                    "WHERE id=?",
+                    values + [row[0]],
+                )
+        # Only latch once the work is durably committed.
+        _TS_NORMALIZED = True
+        if rows:
+            log.info("Normalized legacy timestamps on %d deal(s)", len(rows))
+    except Exception:  # never block the app booting on a data migration
+        log.exception("Could not normalize legacy deal timestamps")
+        _TS_NORMALIZED = True  # but don't retry it on every single query either
 
 
 # --- One timestamp format, or the comparisons lie -------------------------—
@@ -155,8 +211,6 @@ def _conn() -> db.Conn:
 _TS_COLS = ("inquiry_at", "first_reply_at", "last_contact_at",
             "last_guest_reply_at", "next_action_at", "created_at", "updated_at")
 
-_UTC_OFFSET = datetime.now() - datetime.now(timezone.utc).replace(tzinfo=None)
-
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -184,8 +238,37 @@ def norm_ts(value) -> str | None:
     if dt.tzinfo is not None:
         dt = dt.astimezone().replace(tzinfo=None)
     elif was_utc:
-        dt += _UTC_OFFSET
+        # A real UTC->local conversion, not a cached offset. The offset used to
+        # be the delta of two `datetime.now()` calls taken at import: a few
+        # microseconds *negative*, which `timespec="seconds"` then truncated
+        # downward, so every database stamp came out one second early — the
+        # wrong direction for the comparison this exists to fix, and it reopened
+        # a one-second window of the original bug on a UTC host where the
+        # conversion should have been a no-op. Being computed once, it was also
+        # frozen across a DST transition.
+        dt = (dt.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None))
     return dt.isoformat(timespec="seconds")
+
+
+def cmp_ts(value) -> str:
+    """A deal timestamp in the shape *both* readers compare it in.
+
+    Mirrors `_state_sql`'s REPLACE exactly — separator only, no clock shift — so
+    the Python derivation of a deal's state and the SQL one cannot disagree
+    about the same row.
+
+    Readers deliberately do not convert. The clock conversion happens once on
+    write (`norm_ts`), plus once for rows that predate it
+    (`_normalize_legacy_timestamps`). Doing it a third time at read time is what
+    made the inbox list and the deal page contradict each other on a non-UTC
+    host: Python shifted UTC->local, SQL could not (no portable spelling across
+    SQLite and Postgres), so the same deal was "Guest replied" in the list and
+    "Awaiting guest" on its own page. Symmetric readers make that impossible
+    rather than merely unlikely.
+    """
+    if value is None:
+        return ""
+    return str(value).strip().replace(" ", "T", 1)
 
 
 def _row(row) -> dict | None:
@@ -560,8 +643,15 @@ def backfill(tenant_id: str, site: str, items: dict[str, dict],
                 # any deal that had ever received a guest message could never
                 # hold a scheduled follow-up again. That is the opposite of what
                 # threading is for.
-                at = str(item.get("first_seen") or "")
-                seen_at = str(parent.get("last_guest_reply_at") or "")
+                # Both sides normalized, or the comparison lies again. The
+                # column goes through `norm_ts` on every write, but
+                # `first_seen` is a raw space-separated UTC database default —
+                # comparing one against the other as strings put a same-day
+                # *follow-up* reply below the stamp already recorded, so it was
+                # silently dropped on every backfill. That is the original
+                # defect's exact symptom, one path over.
+                at = norm_ts(item.get("first_seen")) or ""
+                seen_at = norm_ts(parent.get("last_guest_reply_at")) or ""
                 if at and at > seen_at:
                     record_guest_reply(tenant_id, site, parent["item_id"], at=at)
                 elif not at and not seen_at:
@@ -764,10 +854,10 @@ def _is_abandoned(deal: dict, stale_before: str) -> bool:
         return False
     if _guest_is_waiting(deal):
         return False
-    last = max(norm_ts(deal.get("last_guest_reply_at")) or "",
-               norm_ts(deal.get("last_contact_at")) or "",
-               norm_ts(deal.get("inquiry_at")) or "")
-    return bool(last) and last < (norm_ts(stale_before) or stale_before)
+    last = max(cmp_ts(deal.get("last_guest_reply_at")),
+               cmp_ts(deal.get("last_contact_at")),
+               cmp_ts(deal.get("inquiry_at")))
+    return bool(last) and last < cmp_ts(stale_before)
 
 
 # --- The one state the operator actually thinks in --------------------------
@@ -825,10 +915,10 @@ def lead_state(deal: dict, response: dict | None = None,
 
 def _guest_is_waiting(deal: dict) -> bool:
     """True when the guest's last message came after our last one."""
-    replied = norm_ts(deal.get("last_guest_reply_at")) or ""
+    replied = cmp_ts(deal.get("last_guest_reply_at"))
     if not replied:
         return False
-    return replied > (norm_ts(deal.get("last_contact_at")) or "")
+    return replied > cmp_ts(deal.get("last_contact_at"))
 
 
 def state_counts(rows: list[dict]) -> dict[str, int]:
@@ -861,8 +951,13 @@ def _state_sql(failed_count: int) -> str:
         WHEN d.stage IN ('{BOOKED}','{PRE_ARRIVAL}','{STAYING}','{COMPLETED}','{LOST}')
             THEN '{CLOSED}'
         WHEN r.status = 'dismissed' THEN '{CLOSED}'
-        -- REPLACE mirrors `norm_ts`'s separator handling for rows written
-        -- before it existed; every new write is already canonical.
+        -- Both columns are canonical local "T" time by the time they are read:
+        -- every write goes through `norm_ts`, and rows predating it are
+        -- converted once by `_normalize_legacy_timestamps`. That is deliberate
+        -- — the UTC->local shift cannot be written portably in one SQL dialect,
+        -- so doing it at rest is what stops this CASE and `lead_state` from
+        -- disagreeing about the same deal on a non-UTC host. The REPLACE stays
+        -- as a cheap separator guard for anything written straight to the table.
         WHEN d.last_guest_reply_at IS NOT NULL
              AND REPLACE(d.last_guest_reply_at, ' ', 'T')
                  > REPLACE(COALESCE(d.last_contact_at, ''), ' ', 'T')

@@ -122,11 +122,36 @@ def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]
         return
     for it in new_items:
         it.setdefault("kind", kind)  # ensure the responder sees the right mode
+        # A message that continues a conversation we already have joins it
+        # instead of opening a second deal — the same rule `inbound.store` and
+        # `pipeline.backfill` apply. This path was missing it, so every scraped
+        # guest reply created a duplicate deal at step 0 carrying the same
+        # thread_key, which then shadowed the real one in `find_thread`
+        # (newest-id-first) and left the original's follow-up clock running at a
+        # guest who had just written back.
+        #
+        # Resolved *before* drafting so the draft can be stored against the deal
+        # the operator will actually open. Storing it under the per-message id
+        # while the deal and the outbox were retargeted to the parent left
+        # /thread/<parent> rendering the stale cold intro over the guest's
+        # question — the deal-level duplicate was fixed but the symptom the user
+        # sees survived on the render path.
+        target_id, parent = it["id"], None
+        try:
+            if it.get("kind") == "message":
+                parent = pipeline.find_thread(
+                    tenant_id, site, pipeline.thread_key(it),
+                    exclude_item_id=it["id"])
+            if parent:
+                target_id = parent["item_id"]
+        except Exception:
+            log.exception("Could not resolve the thread for %s", it.get("id"))
+
         decision = None
         try:
             decision = responder.evaluate_lead(it, tenant_id, units=units)
             storage.save_response(
-                tenant_id, site, kind, it["id"],
+                tenant_id, site, kind, target_id,
                 status="draft" if decision.get("fit") else "skipped",
                 unit_id=decision.get("unit_id"),
                 reason=decision.get("reason"),
@@ -136,26 +161,19 @@ def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]
             )
         except Exception as e:
             log.exception("Auto-draft failed for %s", it.get("id"))
+            # Clear the draft as well as recording the error. `save_response`
+            # only writes the columns it is given, so on a threaded reply this
+            # row belongs to the *parent* — and leaving its previous text in
+            # place while flipping the status off "sent" left the thread page
+            # offering an enabled "Approve & send" over the message the guest
+            # had already received.
             storage.save_response(
-                tenant_id, site, kind, it["id"], status="skipped",
-                reason=f"draft error: {e}",
+                tenant_id, site, kind, target_id, status="skipped",
+                reason=f"draft error: {e}", draft=None,
             )
-        # A message that continues a conversation we already have joins it
-        # instead of opening a second deal — the same rule `inbound.store` and
-        # `pipeline.backfill` apply. This path was missing it, so every scraped
-        # guest reply created a duplicate deal at step 0 carrying the same
-        # thread_key, which then shadowed the real one in `find_thread`
-        # (newest-id-first) and left the original's follow-up clock running at a
-        # guest who had just written back.
-        target_id, parent = it["id"], None
         try:
-            if it.get("kind") == "message":
-                parent = pipeline.find_thread(
-                    tenant_id, site, pipeline.thread_key(it),
-                    exclude_item_id=it["id"])
             if parent:
                 pipeline.record_guest_reply(tenant_id, site, parent["item_id"])
-                target_id = parent["item_id"]
             else:
                 # Open the deal regardless of whether drafting succeeded — the
                 # lifecycle (and the owner's queue) shouldn't depend on the model
@@ -184,8 +202,10 @@ def _draft_new_items(tenant_id: str, site: str, kind: str, new_items: list[dict]
                 if scheduler.is_on(tenant_id):
                     # Queue against the deal the conversation actually lives on,
                     # and say which step this is: a reply to a guest who wrote
-                    # back is not the intro. Using the parent's id also restores
-                    # the `has_open_step` dedupe, which a per-message id defeated.
+                    # back is not the intro. (This does not engage the
+                    # `has_open_step` dedupe — that is only consulted by
+                    # `automation.run_due_steps`, never by
+                    # `enqueue_autopilot_reply`.)
                     msg = automation.enqueue_autopilot_reply(
                         tenant_id, site, target_id, decision["draft"],
                         step=sequences.GUEST_REPLY if parent else None,

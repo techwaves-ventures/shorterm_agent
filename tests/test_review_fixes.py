@@ -44,6 +44,32 @@ def tenant(tmp_path, monkeypatch):
     return tid
 
 
+@pytest.fixture()
+def utc_host():
+    """Pin the clock so the two tests below measure the separator, not the offset.
+
+    Both compare a UTC database stamp against a local app stamp and describe the
+    first as "an hour later" — which is only true when local *is* UTC. On a host
+    that is genuinely offset, "2026-08-15 10:00:00" UTC really is earlier than
+    "2026-08-15T09:00:00" local, and `norm_ts` is right to say so. These tests
+    are about the separator inverting the comparison, so the clock is pinned to
+    isolate that; the offset itself is covered by `test_review_fixes_2.py`.
+    """
+    import time
+
+    before = os.environ.get("TZ")
+    os.environ["TZ"] = "UTC"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if before is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = before
+        time.tzset()
+
+
 def _deal(tenant_id, item_id, *, kind="lead", guest="Dana R.", **fields):
     item = {"id": item_id, "kind": kind, "traveler": guest,
             "title": f"Unit | {guest}", "property_name": ""}
@@ -56,7 +82,7 @@ def _deal(tenant_id, item_id, *, kind="lead", guest="Dana R.", **fields):
 
 # --- D1: the two clocks -----------------------------------------------------
 
-def test_a_guest_reply_stamped_by_the_database_still_counts_as_a_reply(tenant):
+def test_a_guest_reply_stamped_by_the_database_still_counts_as_a_reply(tenant, utc_host):
     """The defect that hid the whole "Guest replied" tab.
 
     `last_guest_reply_at` is copied from `seen.first_seen`, which the database
@@ -79,7 +105,7 @@ def test_a_guest_reply_stamped_by_the_database_still_counts_as_a_reply(tenant):
     assert [r["deal"]["item_id"] for r in page["rows"]] == ["d1"]
 
 
-def test_the_raw_comparison_that_used_to_invert(tenant):
+def test_the_raw_comparison_that_used_to_invert(tenant, utc_host):
     """The ordering itself, stated plainly: a space-separated stamp one hour
     later must not read as earlier than a T-separated one."""
     later_utc = "2026-08-15 10:00:00"

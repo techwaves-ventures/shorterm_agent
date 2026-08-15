@@ -280,17 +280,47 @@ def save_response(tenant_id: str, site: str, kind: str, item_id: str, **fields) 
 
 
 def update_response(tenant_id: str, site: str, item_id: str, **fields) -> None:
-    """Patch fields on an existing response row (e.g. mark sent)."""
+    """Patch fields on a response row, creating it if there isn't one yet.
+
+    An upsert rather than a bare UPDATE, because "no row yet" is not a rare
+    case: a deal opened by `pipeline.backfill` goes through `pipeline.ensure`
+    only, which writes no `responses` row at all. Marking such a reply `sent`
+    then updated nothing and reported success, so `status` stayed unset — and
+    both things that gate the second send read that status. The thread page went
+    on showing an enabled "Approve & send" over a message the guest had already
+    received, and the 409 behind it did not fire either. The guard failed
+    *open*, which is the dangerous direction for a duplicate-message bug.
+    """
     allowed = _RESPONSE_FIELDS + ("sent_at", "emailed_at")
     sets = [f for f in fields if f in allowed]
     if not sets:
         return
     assignments = ", ".join(f"{f}=?" for f in sets)
-    vals = [fields[f] for f in sets] + [tenant_id, site, item_id]
+    vals = [fields[f] for f in sets] + [tenant_id, site, str(item_id)]
     with _conn() as c:
-        c.execute(
+        cur = c.execute(
             f"UPDATE responses SET {assignments} WHERE tenant_id=? AND site=? AND item_id=?",
             vals,
+        )
+        if getattr(cur, "rowcount", 0) > 0:
+            return
+        # `kind` and `status` are NOT NULL. Take the kind from the stored item
+        # so the new row matches what `save_response` would have written, and
+        # only default the status when the caller isn't setting one.
+        row = c.execute(
+            "SELECT kind FROM seen WHERE tenant_id=? AND site=? AND item_id=? LIMIT 1",
+            (tenant_id, site, str(item_id)),
+        ).fetchone()
+        cols = ["tenant_id", "site", "kind", "item_id"] + sets
+        values = [tenant_id, site, (row[0] if row else None) or "lead",
+                  str(item_id)] + [fields[f] for f in sets]
+        if "status" not in sets:
+            cols.append("status")
+            values.append("draft")
+        c.execute(
+            f"INSERT INTO responses ({','.join(cols)}) "
+            f"VALUES ({','.join('?' * len(cols))})",
+            values,
         )
 
 

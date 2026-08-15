@@ -77,7 +77,7 @@
 
     <div class="page-head">
       <h1>Inbox</h1>
-      <p>Every lead and message in one place. {{ total }} conversation{{ '' if total == 1 else 's' }} match this view.</p>
+      <p>Every lead and message in one place. {{ total }} conversation{{ '' if total == 1 else 's' }} {{ 'matches' if total == 1 else 'match' }} this view.</p>
     </div>
 
     {# Tabs carry the current kind/unit/search so switching state doesn't reset

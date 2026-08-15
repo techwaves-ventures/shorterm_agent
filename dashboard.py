@@ -677,6 +677,22 @@ def _sent_state(tenant_id: str, item_id: str, response: dict | None) -> str:
     if (response or {}).get("status") == "sent":
         at = (response or {}).get("sent_at") or ""
         return f"Sent{' ' + str(at) if at else ''}."
+    # `response.status` is a single mutable field, so it is not a reliable record
+    # that something was delivered: any later write to the row — including a
+    # draft *failure* on a guest reply, which flips it to "skipped" while leaving
+    # the previously-sent text in `draft` — erases the only evidence the guard
+    # above depends on, and the control comes back live over a message the guest
+    # already has. The outbox keeps one durable row per delivery, so ask it
+    # whether these exact words have gone out before. Comparing the text rather
+    # than merely "has ever sent" is what still lets the thread reopen: a fresh
+    # draft for the guest's new question is different text, and is offered.
+    draft = ((response or {}).get("draft") or "").strip()
+    delivered = [b.strip() for b in outbox.sent_bodies(tenant_id, SITE, item_id)]
+    if delivered and (not draft or draft in set(delivered)):
+        # Either these exact words already went out, or a reply went out and
+        # there is no new draft to put in its place (a failed re-draft clears
+        # it). Neither is something to offer a send button for.
+        return "Sent."
     return ""
 
 
@@ -820,7 +836,16 @@ def _own_message_or_404(tenant_id: str, msg_id: int) -> dict:
 def outbox_approve(msg_id):
     """Approve (optionally edited) agent copy and release it to the send queue."""
     tenant_id = current_user.tenant_id
-    _own_message_or_404(tenant_id, msg_id)
+    msg = _own_message_or_404(tenant_id, msg_id)
+    # The guard /responder/send carries, on the button the dashboard card
+    # actually posts to — this is the primary approval surface, and it had none.
+    # A sent message re-approved here went back on the queue and was delivered a
+    # second time.
+    if msg["status"] not in outbox.APPROVABLE:
+        return jsonify({
+            "ok": False, "already": True,
+            "error": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
+        }), 409
     (text,) = _form("text")
     outbox.approve(msg_id, (text or "").strip() or None)
     automation.start_drainer(SITE)  # deliver in the background; don't block the click

@@ -217,9 +217,11 @@ def send_next(tenant_id: str, site: str, timeout: int = 300) -> dict | None:
     # Claim it before dispatching so a second drainer can't pick up the same row.
     outbox.set_status(msg["id"], outbox.SENDING)
     state = runner.send_reply(tenant_id, site, item, msg["body"])
-    # A busy runner means another run owns the browser; put it back and retry later.
+    # A busy runner means another run owns the browser; put it back and retry
+    # later. Nothing was dispatched, so the claim's attempt is refunded — see
+    # `release_unattempted`.
     if state.get("status") == "busy":
-        outbox.set_status(msg["id"], outbox.QUEUED)
+        outbox.release_unattempted(msg["id"])
         return None
 
     # send_reply dispatches to a background thread and returns immediately, so

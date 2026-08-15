@@ -31,6 +31,14 @@ CANCELED = "canceled"
 OPEN_STATUSES = (PENDING, QUEUED, SENDING, FAILED)
 # States the UI reports back on a card after the user hits send.
 IN_FLIGHT = (QUEUED, SENDING)
+# The only states a message may be *released to send* from: still waiting for a
+# human, or a failure the human is retrying. Anything else has already reached
+# the guest, is on its way to them, or was deliberately called off, and
+# approving it again starts a second delivery. Enforced in `approve()` rather
+# than in the route, because there are two approve buttons and only one of them
+# had a guard — hiding a button is not a guard when a double-click, a stale tab
+# or a back-button replay all re-POST the same approval.
+APPROVABLE = (PENDING, FAILED)
 
 # Human-readable status for the card line under a deal.
 STATUS_LABELS = {
@@ -312,9 +320,40 @@ def approve(msg_id: int, body: str | None = None) -> dict | None:
 
     `set_status` pulls a future `scheduled_at` forward, so approving a message
     the agent had scheduled for tomorrow morning sends it now.
+
+    A message outside `APPROVABLE` is returned unchanged rather than released:
+    re-approving a `sent` row put a second copy of a message the guest had
+    already read back on the queue, and `next_queued` duly served it again.
+    Callers tell the two apart by the status of the row that comes back.
     """
+    msg = get(msg_id)
+    if not msg or msg["status"] not in APPROVABLE:
+        return msg
     set_status(msg_id, QUEUED, body=body)
     return get(msg_id)
+
+
+def release_unattempted(msg_id: int) -> None:
+    """Return a claimed message to the queue without charging it an attempt.
+
+    A `busy` runner means another run owns the browser, so this message was
+    never dispatched: nothing reached the guest and nothing was risked. The
+    claim still has to increment `attempts` — that counter is what bounds a
+    *crashed* send — so the busy path gives it back.
+
+    Without this, `_drain_loop`'s six retries against a scrape holding the
+    browser for ~30s burned through MAX_SEND_ATTEMPTS with zero deliveries, and
+    the message was then abandoned on its first genuine stall with an
+    operator-facing error saying it "may already have reached the guest" — which
+    was false; it had been sent zero times.
+    """
+    with _conn() as c:
+        c.execute(
+            "UPDATE outbox SET status=?, sending_at=NULL, "
+            "attempts=CASE WHEN COALESCE(attempts,0)>0 THEN attempts-1 ELSE 0 END "
+            "WHERE id=?",
+            (QUEUED, msg_id),
+        )
 
 
 def cancel(msg_id: int) -> None:

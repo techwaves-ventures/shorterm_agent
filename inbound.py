@@ -210,6 +210,26 @@ def extract_subject(payload: dict) -> str:
     return ""
 
 
+def extract_date(payload: dict) -> str:
+    """When the provider says this mail was sent, for the message id fallback.
+
+    Only used when the notification itself carries no date. Two messages whose
+    guest wrote the identical text — "Any update?" sent twice — are otherwise
+    indistinguishable, and the second was discarded as already-seen while the
+    lifecycle marked the guest lost for not replying.
+    """
+    for key in ("date", "Date", "timestamp", "Timestamp"):
+        value = payload.get(key)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return str(value).strip()
+    headers = payload.get("headers")
+    if isinstance(headers, dict):
+        for key in ("Date", "date"):
+            if headers.get(key):
+                return str(headers[key]).strip()
+    return ""
+
+
 class Rejected(Exception):
     """Inbound message failed a check. The reason is for logs, never the caller."""
 
@@ -237,7 +257,8 @@ def accept(payload: dict, webhook_secret: str, raw_size: int = 0) -> tuple[str, 
 
     from sites import ff_email
 
-    item = ff_email.parse(extract_subject(payload), extract_body(payload))
+    item = ff_email.parse(extract_subject(payload), extract_body(payload),
+                          received_at=extract_date(payload))
     if not item:
         raise Rejected("could not parse a lead from the message")
     return tenant_id, item
