@@ -415,12 +415,28 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
 def send_reply(tenant_id: str, site: str, item: dict, text: str) -> dict:
     """Send an approved draft in a background thread. `item` is the stored
     payload (must include id + kind; traveler/received for leads or
-    sender/date for messages, used to locate the thread/row)."""
+    sender/date for messages, used to locate the thread/row).
+
+    A collision is reported as busy even when the run holding the lock belongs
+    to this same tenant — unlike `start_scrape`, which echoes its own run's
+    progress back to the UI and marks nothing as delivered either way.
+    """
     tenant_id = str(tenant_id)
     with _lock:
         if _state["running"]:
-            if _state.get("tenant_id") == tenant_id:
-                return dict(_state)
+            # Nothing below this branch starts a thread, so *nothing was
+            # dispatched* whichever run owns the lock — and that, not whose run
+            # it is, is what the caller has to know.
+            #
+            # Returning the running job's state to a same-tenant caller reported
+            # this message's failure to send as that job's success.
+            # `automation.send_next` tests `status == "busy"`, which a scrape's
+            # "checking" never matched, so it fell through to the wait loop,
+            # watched the *scrape* finish cleanly, and recorded the message
+            # `sent` with `after_contact` fired — while the guest was never
+            # written to and the follow-up cadence advanced past them.
+            # /responder/send and the scheduler both call start_drainer while
+            # /scrape/start can be running for the same tenant, so the two meet.
             return _busy_state(tenant_id)
         _state.update(
             status="launching", message="Starting…", running=True,

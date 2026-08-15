@@ -326,10 +326,15 @@ def _name_line_re(labels: tuple) -> re.Pattern:
     them. Requiring "colon, same line" silently dropped those layouts, and a
     dropped notification is a lost lead: the webhook answers 202 either way and
     the provider never retries.
+
+    The separator is captured so callers can tell a *field* from a section
+    header — see `_is_field`. It is the only structural signal that survives the
+    table layouts, and unlike the value it is written by the template rather
+    than by the guest.
     """
     return re.compile(
         rf"^[ \t>*|·-]*(?:{'|'.join(labels)})(?![^\W\d_])"
-        rf"[ \t]*:?[ \t]*(?:\r?\n[ \t]*){{0,2}}(.+)$",
+        rf"(?P<sep>[ \t]*:?[ \t]*(?:\r?\n[ \t]*){{0,2}})(?P<value>.+)$",
         re.I | re.M,
     )
 
@@ -444,7 +449,11 @@ def _wrapper_name(body: str) -> str:
     text = _strip_forwarded(body or "")
     for pattern in (_GUEST_NAME_LINE, _SENDER_NAME_LINE):
         for match in pattern.finditer(text):
-            value = (match.group(1) or "").strip()
+            value = (match.group("value") or "").strip()
+            # A section header is not a field, so it is not an answer — skip it
+            # and keep reading. See `_is_field`.
+            if not _is_field(match):
+                continue
             # An empty field says nothing about the guest, and neither does one
             # whose "value" is really the *next* field, picked up because this
             # label's own line was blank. Skip those and keep looking.
@@ -464,7 +473,55 @@ def _wrapper_name(body: str) -> str:
 
 def _spans_lines(match: re.Match) -> bool:
     """Whether the value sits on a later line than its label."""
-    return "\n" in match.group(0)[:match.start(1) - match.start(0)]
+    return "\n" in match.group("sep")
+
+
+def _is_field(match: re.Match) -> bool:
+    """Whether a matched label line is a *field* rather than a section header.
+
+    `_name_line_re` makes the colon optional, which is what supports the table
+    layouts — and it also makes the section header "Traveler Information" match
+    as the label "Traveler" with the value "Information". Because the wrapper's
+    first answer is final, that header became the guest's name and the real
+    "Traveler: Emma M." two lines below was never read: two unrelated guests
+    both landed on `information|sunny1br`, one deal, each reading the other's
+    messages. A header whose remainder is prose was refused instead, and a
+    refusal is equally final, so the same shape also lost the lead outright.
+
+    The discriminator is the *separator*, not the colon. Requiring a colon
+    closes both defects and passes the whole suite while silently breaking the
+    one-line table layouts, where the cell is separated by a tab or a run of
+    spaces and there is no colon at all:
+
+        "Traveler:\tEmma M."   ":"     field
+        "Traveler\tEmma M."    "\t"    field   (colon rule loses this lead)
+        "Traveler   Emma M."   "   "   field   (colon rule loses this lead)
+        "Traveler Information" " "     header
+
+    So: a colon, a tab, or two or more spaces means a field; a single space
+    means a header. A value on a later line is always a field — the line break
+    is itself the separator.
+
+    Skipping is safe here in a way that skipping on the *value* was not. The
+    hole this parser keeps reopening is the guest choosing their own thread, and
+    that works by getting the wrapper's line refused so the search walks on to a
+    forged label in their message. They cannot do that here: FurnishedFinder
+    writes the separator, the guest only supplies the profile name after it.
+
+    Residual, accepted deliberately: "Traveler Emma M." — single space, no colon
+    — is structurally identical to "Traveler Information" and is skipped. It is
+    not a layout this template produces (text-converted cells give a tab, a
+    space run, or a line break), and the subject-line fallback still covers it.
+    Recovering it would need a blocklist of header words, which is the rule that
+    already deleted "Will Smith" once.
+    """
+    sep = match.group("sep") or ""
+    return (
+        _spans_lines(match)
+        or ":" in sep
+        or "\t" in sep
+        or len(sep) >= 2
+    )
 
 
 def _is_template_field(value: str) -> bool:

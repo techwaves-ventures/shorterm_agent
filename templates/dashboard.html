@@ -572,7 +572,15 @@
       }
       async function cancelMsg(mid) {
         const res = await postForm(`/outbox/${mid}/cancel`, {});
-        if (res.ok) location.reload();
+        if (res.ok) { location.reload(); return; }
+        // The server refuses to call off a message that has already been sent —
+        // cancelling one drops it out of the sent history and re-arms a second
+        // delivery. Same stale-tab and back-button replays as approve, so say
+        // so rather than leaving the button looking broken.
+        setMsg("ob-" + mid, res.already
+          ? `Not cancelled — already "${res.error}". Refreshing…`
+          : (res.error || "Could not cancel this message."), "err");
+        if (res.already) setTimeout(() => location.reload(), 2000);
       }
 
       async function runAgent(btn) {

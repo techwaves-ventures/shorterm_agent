@@ -40,6 +40,15 @@ IN_FLIGHT = (QUEUED, SENDING)
 # or a back-button replay all re-POST the same approval.
 APPROVABLE = (PENDING, FAILED)
 
+# The states a message may be *called off* from — everything except `sent`.
+# Calling off a sent message is not a no-op: `sent_bodies()` selects exactly the
+# `sent` rows, and it is the only duplicate-send guard on /responder/send. So
+# cancelling one the guest has already read empties that history and re-arms the
+# very second delivery the approve guard exists to stop. The cancel button sits
+# on the same card as approve, so the stale-tab and back-button replays that
+# guard was written for reach this one too.
+CANCELABLE = (PENDING, QUEUED, SENDING, FAILED, CANCELED)
+
 # Human-readable status for the card line under a deal.
 STATUS_LABELS = {
     PENDING: "Waiting for your approval",
@@ -356,8 +365,19 @@ def release_unattempted(msg_id: int) -> None:
         )
 
 
-def cancel(msg_id: int) -> None:
+def cancel(msg_id: int) -> dict | None:
+    """Human called the message off before it went out.
+
+    A message outside `CANCELABLE` — meaning one already `sent` — is returned
+    unchanged rather than cancelled, the same way `approve` refuses to release a
+    row that has already reached the guest. Callers tell the two apart by the
+    status of the row that comes back.
+    """
+    msg = get(msg_id)
+    if not msg or msg["status"] not in CANCELABLE:
+        return msg
     set_status(msg_id, CANCELED)
+    return get(msg_id)
 
 
 def counts(tenant_id: str, site: str) -> dict:

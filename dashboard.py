@@ -856,7 +856,15 @@ def outbox_approve(msg_id):
 @login_required
 def outbox_cancel(msg_id):
     tenant_id = current_user.tenant_id
-    _own_message_or_404(tenant_id, msg_id)
+    msg = _own_message_or_404(tenant_id, msg_id)
+    # Same 409 as approve, and for a sharper reason: cancelling an already-sent
+    # row drops it out of `sent_bodies()`, which is the only thing stopping
+    # /responder/send from queueing a second copy of text the guest has read.
+    if msg["status"] not in outbox.CANCELABLE:
+        return jsonify({
+            "ok": False, "already": True,
+            "error": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
+        }), 409
     outbox.cancel(msg_id)
     return jsonify({"ok": True, "counts": outbox.counts(tenant_id, SITE)})
 
