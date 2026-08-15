@@ -170,21 +170,35 @@ def _ensure_pg_schema(key: str, ddl) -> None:
         if (dsn, key) in _SCHEMA_DONE:
             return
         lock_id = _advisory_key(key)
-        with connect() as c:
+        # Not a `with` block: the lock has to be released *after* the commit,
+        # and Conn.__exit__ commits last. Releasing it while the CREATE TABLE is
+        # still uncommitted lets the next process take the lock, not see the
+        # table, and issue its own CREATE — which is precisely the catalog race
+        # (duplicate key in pg_type_typname_nsp_index) this lock exists to stop.
+        c = connect()
+        try:
             # Session-level, NOT pg_advisory_xact_lock: an xact lock is a silent
             # no-op under autocommit, and this connection may become an
-            # autocommit/pooled one. Serialises first creation across processes,
-            # which is what stops concurrent CREATE TABLE IF NOT EXISTS from
-            # racing into Postgres' own catalog (duplicate pg_type/pg_class).
+            # autocommit/pooled one.
             c.execute("SELECT pg_advisory_lock(?)", (lock_id,))
             try:
                 ddl(c)
+                c.raw.commit()
+            except Exception:
+                # Rollback first: the unlock below is itself a statement, and a
+                # failed DDL leaves the transaction aborted so it would be
+                # rejected — masking the real error with InFailedSqlTransaction.
+                c.raw.rollback()
+                raise
             finally:
-                # Must be explicit. A session lock outlives the transaction, so
-                # if this connection is ever pool-backed rather than closed, a
-                # missed unlock would block first-creation for every other
-                # process for the life of that session.
                 c.execute("SELECT pg_advisory_unlock(?)", (lock_id,))
+                c.raw.commit()
+        finally:
+            # Closed, never returned to a pool. A session-level lock outlives
+            # its transaction, so a pooled connection that skipped the unlock
+            # would block first-creation for every other process for the life of
+            # that session.
+            c.raw.close()
         _SCHEMA_DONE.add((dsn, key))
 
 
