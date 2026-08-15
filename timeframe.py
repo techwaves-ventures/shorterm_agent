@@ -30,6 +30,13 @@ Deliberately narrow. `_now()` in `outbox`/`pipeline` stays naive-local for
 `approved_at`/`sent_at`/`created_at`/`last_contact_at` — those record when
 something happened for a human to read, are never compared across hosts, and the
 quiet-hours clamp is computed in local terms on purpose.
+
+Two limits worth stating plainly rather than discovering later. The frame is
+host-independent for schedules derived from *now*; a schedule derived from a
+stored anchor inherits that anchor's undeclared zone (see `stamp`). And which
+zone the quiet-hours clamp itself should compute in is a separate open question
+(VEN-141) — this module fixes the frame a schedule is *stored and compared* in,
+not the zone it is *decided* in.
 """
 from datetime import datetime, timezone
 
@@ -46,6 +53,19 @@ def stamp(dt: datetime) -> str:
     host's local zone. `astimezone()` resolves that against the zone's real
     history rather than a cached offset, so a time on the far side of a DST
     boundary gets that day's offset, not today's.
+
+    Know the limit of that. "Read it as this host's zone" is exactly right for a
+    `now()`-derived time — the writer really was this host, at that instant. It
+    is an *assumption* for a schedule derived from a stored anchor:
+    `sequences.due_at` offsets from `check_in`/`last_contact_at`/`inquiry_at`,
+    which are still naive host-local strings, so the same deal and step stamped
+    on hosts in four zones lands on four different absolute instants. That is
+    still strictly better than before — any two hosts previously disagreed,
+    whereas now they agree whenever the host that wrote the anchor is the one
+    rescheduling, which is the common case — but it means this module's
+    "one frame, host-independent" guarantee is complete only for `now()`-derived
+    schedules. Closing it fully means moving the anchor columns into a declared
+    frame as well, deliberately not in scope here.
     """
     if dt.tzinfo is None:
         dt = dt.astimezone()
