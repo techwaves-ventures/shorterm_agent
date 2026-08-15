@@ -16,7 +16,7 @@ Each test names the customer-visible failure it prevents.
 """
 import os
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -168,7 +168,10 @@ def test_a_genuinely_crashed_send_is_still_recovered(tenant):
     """The reclaim must keep doing its job — this is not a disable."""
     msg = _queued(tenant)
     outbox.set_status(msg["id"], outbox.SENDING)
-    stale = (datetime.now() - timedelta(hours=2)).isoformat(timespec="seconds")
+    # Aware, because that is the format a claim now carries. A naive stamp is
+    # no longer judged on sight — it cannot be attributed to a host, so it is
+    # restamped and measured a pass later (see `test_review_fixes_5`).
+    stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
     with outbox._conn() as c:
         c.execute("UPDATE outbox SET sending_at=? WHERE id=?", (stale, msg["id"]))
 
@@ -179,7 +182,10 @@ def test_a_genuinely_crashed_send_is_still_recovered(tenant):
 def test_a_send_that_keeps_stalling_gives_up_instead_of_repeating(tenant):
     """Each reclaim is a message we cannot prove didn't arrive. Bound the loop."""
     msg = _queued(tenant)
-    stale = (datetime.now() - timedelta(hours=2)).isoformat(timespec="seconds")
+    # Aware, because that is the format a claim now carries. A naive stamp is
+    # no longer judged on sight — it cannot be attributed to a host, so it is
+    # restamped and measured a pass later (see `test_review_fixes_5`).
+    stale = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(timespec="seconds")
     for _ in range(outbox.MAX_SEND_ATTEMPTS):
         outbox.set_status(msg["id"], outbox.SENDING)
         with outbox._conn() as c:

@@ -22,7 +22,7 @@ Every one of these was verified to fail against `32dee81` before being counted.
 import os
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -633,7 +633,10 @@ def test_a_genuinely_stuck_send_still_uses_one_up(tenant, monkeypatch):
     outbox.set_status(msg["id"], outbox.SENDING)
     assert outbox.get(msg["id"])["attempts"] == 1
 
-    long_ago = (datetime.now() - timedelta(hours=10)).isoformat(timespec="seconds")
+    # Aware: a naive claim stamp is no longer judged on sight, it is restamped
+    # and measured a pass later (see `test_review_fixes_5`).
+    long_ago = (datetime.now(timezone.utc)
+                - timedelta(hours=10)).isoformat(timespec="seconds")
     with outbox._conn() as c:
         c.execute("UPDATE outbox SET sending_at=? WHERE id=?", (long_ago, msg["id"]))
     assert outbox.reclaim_stuck_sending() == 1

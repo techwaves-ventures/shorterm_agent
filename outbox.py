@@ -280,7 +280,9 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
     The comparison is absolute, not wall-clock: the claiming process and the
     reclaiming one are different hosts on the worker-queue topology, and a naive
     stamp read across that boundary is off by the offset — westward it makes a
-    live send look stale and delivers it twice. See `_now_utc`.
+    live send look stale and delivers it twice. See `_now_utc`. A stamp that
+    predates that column carrying its offset is therefore not judged at all,
+    only replaced; ages are measured on the pass after.
     """
     now = datetime.now(timezone.utc)
     cutoff = now.timestamp() - max_age_seconds
@@ -301,17 +303,24 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
                           (_now_utc(), msg["id"], SENDING))
                 continue
             if stamp.tzinfo is None:
-                # Written before `sending_at` carried its offset (see `_now_utc`).
-                # Read it as local, which is what the writer meant on a
-                # single-host install. A stamp that lands in the *future* is the
-                # tell-tale of a cross-host read, and would otherwise strand the
-                # row forever, so restamp it and measure from now instead.
-                stamp = stamp.astimezone()
-                if stamp > now:
-                    c.execute(
-                        "UPDATE outbox SET sending_at=? WHERE id=? AND status=?",
-                        (_now_utc(), msg["id"], SENDING))
-                    continue
+                # Written before `sending_at` carried its offset (see
+                # `_now_utc`), so it names a wall-clock reading on an unknown
+                # host. There is no sound way to place it on the timeline: read
+                # as the reader's local zone, a writer to the west resolves
+                # hours into the past, and a one-second-old live claim is
+                # requeued into a second drainer while the first is still
+                # driving the browser. Guarding only the future-dated case
+                # catches the eastward half of that and leaves the westward
+                # half — the half that duplicates the message — wide open.
+                #
+                # So decline to judge it at all: treat it exactly like an
+                # unparseable stamp above. Restamp absolute and let the next
+                # pass measure a real age. The cost is that a row already
+                # wedged at deploy time takes two passes to recover instead of
+                # one; the alternative is sending a live message twice.
+                c.execute("UPDATE outbox SET sending_at=? WHERE id=? AND status=?",
+                          (_now_utc(), msg["id"], SENDING))
+                continue
             if stamp.timestamp() >= cutoff:
                 continue
             # Every write below is guarded on the row still being `sending`. The

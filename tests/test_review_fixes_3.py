@@ -348,10 +348,13 @@ def test_a_host_that_cannot_deliver_still_reclaims_its_own_stranded_sends(
     monkeypatch.setattr(dashboard, "_can_deliver_in_process", lambda: False)
     msg = _queued(tenant)
     outbox.set_status(msg["id"], outbox.SENDING)
-    # Stamp the claim old enough for the (unchanged, conservative) age gate.
+    # Stamp the claim old enough for the (unchanged, conservative) age gate,
+    # and *aware*, which is the format a claim now carries. A naive stamp is no
+    # longer judged on sight — it cannot be attributed to a host, so it is
+    # restamped and measured a pass later (see `test_review_fixes_5`).
     with outbox._conn() as c:
         c.execute("UPDATE outbox SET sending_at=? WHERE id=?",
-                  ("2020-01-01T00:00:00", msg["id"]))
+                  ("2020-01-01T00:00:00+00:00", msg["id"]))
 
     with dashboard.app.test_request_context():
         dashboard._board(tenant)
