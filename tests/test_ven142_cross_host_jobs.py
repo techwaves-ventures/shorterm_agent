@@ -275,6 +275,83 @@ def test_login_email_cooldown_is_sane_from_any_writer_offset(hosts, worker_tz):
     )
 
 
+@pytest.mark.parametrize("skew_hours", [12, 1, 26])
+def test_a_writer_whose_clock_is_ahead_cannot_produce_an_absurd_cooldown(hosts, skew_hours):
+    """A future-dated `updated_at` must not turn a 120s guard into a half-day ban.
+
+    Stamping absolutely removes the *timezone* cause of a negative age; it does
+    not remove NTP skew between two machines, and the harm the ticket filed is
+    produced by the mechanism, not the cause: `int(120 - age)` on an unclamped
+    negative. With a worker 12h fast the tenant is told "Please wait 43309s".
+    The fix's own docstring names that string as what it exists to remove, so
+    without this the ticket is not discharged.
+
+    Asserted through `public_state`, which is where the user-facing sentence is
+    actually composed — `enqueue` returns the job dict without it, so asserting
+    there reads the wrong layer and reports a false all-clear.
+
+    Pinned to the exact cap rather than a range: the direction is a deliberate
+    choice (see `_cooldown_remaining`) and clamping to 0 instead would defeat the
+    FF login-email burst guard for as long as the skew lasts, which is the other
+    harm this ticket lists. A range assertion would accept both.
+    """
+    _reset()
+    tenant = f"t-skew-{skew_hours}"
+    hosts(WEB)
+    job = jobs.enqueue(tenant)
+    jobs.set_status(job["id"], jobs.ERROR, "Couldn't verify your FF login.")
+
+    # An absolute, offset-aware stamp written 10 real seconds ago by a host whose
+    # clock runs `skew_hours` fast. This is clock skew, not timezone: the VEN-142
+    # stamp change is already applied and does not touch it.
+    stamp = (datetime.now(timezone.utc) - timedelta(seconds=10)
+             + timedelta(hours=skew_hours)).isoformat(timespec="seconds")
+    with jobs._conn() as c:
+        c.execute("UPDATE ff_jobs SET updated_at=? WHERE id=?", (stamp, job["id"]))
+
+    assert jobs._age_seconds(jobs.latest(tenant)["updated_at"]) < 0, (
+        "the stamp is not actually future-dated, so this test proves nothing"
+    )
+
+    remaining = jobs._cooldown_remaining(jobs.latest(tenant))
+    assert remaining == jobs.ERROR_RETRY_COOLDOWN_SECONDS, (
+        f"a writer {skew_hours}h fast yields a {remaining}s cooldown; expected it "
+        f"clamped to {jobs.ERROR_RETRY_COOLDOWN_SECONDS}s. Above the cap is the "
+        "filed lockout harm; 0 would silently disable the FF login-email guard"
+    )
+
+    message = jobs.public_state(tenant)["message"]
+    assert f"wait {jobs.ERROR_RETRY_COOLDOWN_SECONDS}s" in message, (
+        f"the tenant is shown {message!r}, which is not the bounded wait"
+    )
+
+
+def test_a_normal_cooldown_is_untouched_by_the_skew_clamp(hosts):
+    """The control for the clamp: an ordinary recent error still counts down.
+
+    Clamping is only safe if it is unreachable in the normal case. A mutation
+    that returns the cap unconditionally would satisfy the skew test above and
+    freeze every tenant's cooldown at 120s; this is what notices.
+    """
+    _reset()
+    tenant = "t-normal-cooldown"
+    hosts(WEB)
+    job = jobs.enqueue(tenant)
+    jobs.set_status(job["id"], jobs.ERROR, "Couldn't verify your FF login.")
+
+    stamp = (datetime.now(timezone.utc)
+             - timedelta(seconds=60)).isoformat(timespec="seconds")
+    with jobs._conn() as c:
+        c.execute("UPDATE ff_jobs SET updated_at=? WHERE id=?", (stamp, job["id"]))
+
+    remaining = jobs._cooldown_remaining(jobs.latest(tenant))
+    expected = jobs.ERROR_RETRY_COOLDOWN_SECONDS - 60
+    assert abs(remaining - expected) <= 2, (
+        f"a 60s-old error reads {remaining}s remaining, expected ~{expected}s: the "
+        "negative-age clamp is firing on an ordinary countdown"
+    )
+
+
 @pytest.mark.parametrize("single_host_tz", [WEST, EAST, HALF])
 def test_legacy_naive_stamps_are_unchanged_on_a_single_host_deploy(hosts, single_host_tz):
     """The "no worse than base" contract, on the topology that actually has legacy rows.
@@ -470,22 +547,165 @@ def test_every_cross_host_column_is_written_absolute(hosts):
     one pins the actual contract: every stamp this module writes carries an
     offset. `_age_seconds` deliberately still accepts naive input (legacy rows),
     so nothing else would notice a regressed writer.
+
+    Each site is driven in *isolation*: the column is first forced back to a naive
+    sentinel, then one function is called, then the column is re-read. Without
+    that reset the assertion passes on a stamp some earlier call left behind — an
+    earlier version of this test drove three of the seven writers and claimed all
+    seven, and reverting `claim_next` to a naive stamp left it 40/40 green.
+
+    Worth being strict about here specifically: this ticket exists because
+    VEN-127's `_now_utc` docstring asserted a coverage it did not have, which sent
+    the next reader looking in the wrong module. A test that overstates its own
+    reach is the same defect in a different file.
     """
     _reset()
     hosts(WEST)
-    jobs.heartbeat("w6")
-    job = jobs.enqueue("t-mech")
-    jobs.set_status(job["id"], jobs.ERROR, "nope")
+    tenant = "t-mech"
 
-    with jobs._conn() as c:
-        last_seen = c.execute("SELECT last_seen FROM ff_worker WHERE id=1").fetchone()[0]
-        created, updated = c.execute(
-            "SELECT created_at, updated_at FROM ff_jobs WHERE id=?", (job["id"],)
-        ).fetchone()
+    def naive_now():
+        """What the pre-VEN-142 writer would have put there."""
+        return datetime.now().isoformat(timespec="seconds")
 
-    for column, value in (("ff_worker.last_seen", last_seen),
-                          ("ff_jobs.created_at", created),
-                          ("ff_jobs.updated_at", updated)):
+    def force_naive(table, column, where=""):
+        with jobs._conn() as c:
+            c.execute(f"UPDATE {table} SET {column}=? {where}", (naive_now(),))
+
+    def read(table, column, where=""):
+        with jobs._conn() as c:
+            return c.execute(f"SELECT {column} FROM {table} {where}").fetchone()[0]
+
+    def assert_absolute(site, table, column, where=""):
+        value = read(table, column, where)
         assert datetime.fromisoformat(str(value)).tzinfo is not None, (
-            f"{column} was written naive ({value!r}); it is read on another host"
+            f"{table}.{column} was written naive ({value!r}) by {site}(); it is "
+            "read on the other host, so a naive value there is the VEN-142 defect"
         )
+
+    JOB = "WHERE id=(SELECT MAX(id) FROM ff_jobs)"
+    WORKER = "WHERE id=1"
+
+    # 1. heartbeat -> ff_worker.last_seen. Also keeps the worker online for the
+    #    rest of this test: get_active() reaps first, and an offline worker would
+    #    kill the running job the later sites need.
+    jobs.heartbeat("w6")
+    assert_absolute("heartbeat", "ff_worker", "last_seen", WORKER)
+    force_naive("ff_worker", "last_seen", WORKER)
+    jobs.heartbeat("w6")
+    assert_absolute("heartbeat", "ff_worker", "last_seen", WORKER)
+
+    # 2. enqueue -> ff_jobs.created_at (written once, never re-stamped) and
+    #    updated_at. A fresh INSERT, so there is no stale value to inherit.
+    job = jobs.enqueue(tenant)
+    assert_absolute("enqueue", "ff_jobs", "created_at", JOB)
+    assert_absolute("enqueue", "ff_jobs", "updated_at", JOB)
+
+    # 3. claim_next -> updated_at (queued -> running, on the worker).
+    force_naive("ff_jobs", "updated_at", JOB)
+    assert jobs.claim_next("w6"), "claim_next found no queued job to claim"
+    assert_absolute("claim_next", "ff_jobs", "updated_at", JOB)
+
+    # 4. submit_otp -> updated_at (web host attaches the tenant's code).
+    force_naive("ff_jobs", "updated_at", JOB)
+    assert jobs.submit_otp(tenant, "123456"), "submit_otp found no active job"
+    assert_absolute("submit_otp", "ff_jobs", "updated_at", JOB)
+
+    # 5. consume_otp -> updated_at (worker reads and clears the code).
+    force_naive("ff_jobs", "updated_at", JOB)
+    assert jobs.consume_otp(job["id"]) == "123456", "consume_otp returned no code"
+    assert_absolute("consume_otp", "ff_jobs", "updated_at", JOB)
+
+    # 6. set_status -> updated_at. Kept in an ACTIVE state so cancel_active below
+    #    still has something to cancel.
+    force_naive("ff_jobs", "updated_at", JOB)
+    jobs.set_status(job["id"], jobs.RUNNING, "still going")
+    assert_absolute("set_status", "ff_jobs", "updated_at", JOB)
+
+    # 7. cancel_active -> updated_at (web host, e.g. on disconnect).
+    force_naive("ff_jobs", "updated_at", JOB)
+    jobs.cancel_active(tenant)
+    assert read("ff_jobs", "status", JOB) == jobs.CANCELED, (
+        "cancel_active did not cancel the job, so its stamp proves nothing"
+    )
+    assert_absolute("cancel_active", "ff_jobs", "updated_at", JOB)
+
+
+def test_the_connect_flow_suite_can_actually_fail_and_tests_the_shipped_path():
+    """Pin the two ways `test_ff_connect_flow.py` was blind to this module.
+
+    That file is the only integration coverage of `worker_online` -> `reap_stale`
+    through the real dashboard routes, and both of its blind spots were silent —
+    it reported success either way, which is why they survived on main:
+
+      1. `_expire_worker()` stamped **naive**. The worker still expired, so every
+         assertion passed, but they all ran the legacy-naive compatibility branch
+         of `_age_seconds`; the offset-aware path this change ships had no
+         integration coverage at all.
+      2. `check()` only appended to a list read inside `main()`, which pytest
+         never calls — so none of that file's ~66 assertions could fail a test.
+         Together these mean a regression in the shipped read path would have
+         been reported as green twice over.
+
+    Asserted against the source text rather than by importing the module: it sets
+    `SQLITE_PATH` and builds a temp database at import time, which would fight
+    this file's own fixture.
+    """
+    from pathlib import Path
+
+    src = Path(__file__).with_name("test_ff_connect_flow.py").read_text()
+
+    start = src.index("def _expire_worker(")
+    expire_body = src[start:src.index("\ndef ", start + 1)]
+    assert "timezone.utc" in expire_body, (
+        "test_ff_connect_flow._expire_worker() no longer writes an offset-aware "
+        "last_seen, so that file's reap/offline assertions have silently moved "
+        "back onto the legacy-naive branch and stopped covering the shipped path"
+    )
+
+    start = src.index("def check(")
+    check_body = src[start:src.index("\n# ---", start)]
+    assert "raise AssertionError" in check_body and "pytest" in check_body, (
+        "test_ff_connect_flow.check() no longer raises under pytest, so that "
+        "file's assertions cannot fail a test run — it reports green regardless "
+        "of what it found"
+    )
+
+
+def test_no_unstamped_writer_is_added_to_this_module():
+    """Count the writers, so an eighth one cannot be added without a decision.
+
+    The test above pins the seven sites that exist today by driving each. That
+    catches a *regression* in a known writer but not an *addition*: a new
+    `UPDATE ff_jobs SET ... updated_at=?` stamped with `datetime.now()` would be
+    a fresh instance of the same cross-host defect and nothing above would look
+    at it. Comparing the counts makes adding one a deliberate act.
+    """
+    import re
+    from pathlib import Path
+
+    src = Path(jobs.__file__).read_text()
+    # Every write of one of the three cross-host columns goes through the SQL
+    # text; every correct one passes `_now_utc()` in the same statement.
+    stamped = src.count("_now_utc()") - 1          # minus the `def _now_utc()`
+
+    assert stamped == 7, (
+        f"jobs.py has {stamped} `_now_utc()` write sites, expected 7. If you added "
+        "a writer, drive it in test_every_cross_host_column_is_written_absolute "
+        "and bump this count; if you removed one, confirm its column is no longer "
+        "written at all rather than written naive."
+    )
+
+    # Nothing in this module may take a naive "now". `_now_utc` stamps aware, and
+    # `_age_seconds` reads a legacy naive row as the reader's wall clock by
+    # converting an aware now (`now.astimezone().replace(tzinfo=None)`) rather
+    # than by calling `datetime.now()` — deliberately, because converting the
+    # *stamp* instead resolves its offset at the stamp's wall clock and gains an
+    # hour across a DST boundary.
+    naive_calls = [c for c in re.findall(r"datetime\.now\(([^)]*)\)", src)
+                   if c.strip() != "timezone.utc"]
+    assert naive_calls == [], (
+        f"jobs.py calls `datetime.now({', '.join(naive_calls)})` without "
+        "`timezone.utc`. Every timestamp in this module crosses the web/worker "
+        "host boundary, so a naive local now is the VEN-142 defect: stamp with "
+        "`_now_utc()`, and derive a local wall clock from an aware now."
+    )
