@@ -216,6 +216,43 @@ def test_the_poll_is_armed_on_load_with_no_user_action(client, tenant):
         not in scripts, "the one-shot fallback still short-circuits the poll"
 
 
+def test_the_client_tests_in_flight_before_status(client, tenant):
+    """The shared helper does not close the defect on its own.
+
+    `renderSendState` branched on `status` first: `sent`, then `failed`, then
+    `in_flight`. A faithful feed of `status:"failed", in_flight:true` — an
+    effective state this fix can now produce — therefore lands in the `failed`
+    branch, which runs `btn.disabled = false; btn.textContent = "Retry send"`
+    and re-enables the button over a queued send.
+
+    Asserted structurally because this branch is JS and the suite is Python;
+    the behaviour itself is exercised in the browser (see the PR evidence).
+    Without this, reverting the reordering leaves the whole suite green.
+    """
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING)
+    scripts = "\n".join(SCRIPT_RE.findall(_dashboard_html(client)))
+
+    body = re.search(r"function renderSendState\(id, s\) \{(.*?)\n      \}",
+                     scripts, re.S)
+    assert body, "renderSendState is not in the rendered page"
+    body = body.group(1)
+
+    at_in_flight = body.find("s.in_flight")
+    at_failed = body.find('s.status === "failed"')
+    at_sent = body.find('s.status === "sent"')
+    assert at_in_flight != -1 and at_failed != -1 and at_sent != -1
+    assert at_in_flight < at_failed and at_in_flight < at_sent, (
+        "renderSendState decides on `status` before `in_flight`, so an "
+        "effective status of failed/sent re-enables the button over a send "
+        "that is still in flight"
+    )
+    # The in-flight branch must not fall through into the ones that re-enable.
+    assert "return;" in body[at_in_flight:at_failed], (
+        "the in-flight branch falls through to a branch that re-enables"
+    )
+
+
 # --------------------------------------------------------------------------
 # 4: the divergence — what separates the correct fix from the cheap one
 # --------------------------------------------------------------------------
