@@ -20,6 +20,7 @@ for the *filed* reason, not merely to fail.
 """
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -361,6 +362,119 @@ def test_a_host_that_cannot_deliver_still_reclaims_its_own_stranded_sends(
     assert outbox.get(msg["id"])["status"] == outbox.CANCELED
     assert not outbox.has_open_step(tenant, SITE, "s1", "intro"), (
         "and the step must be free for the agent to draft again")
+
+
+# --- `sending_at` is compared across hosts, so it must be absolute ----------
+
+def test_the_send_claim_is_stamped_with_an_offset(tenant):
+    """Making every render reclaim also made a *second host* read this column
+    for the first time. Every other timestamp here is naive local wall-clock,
+    which is fine while one host writes and reads it; `sending_at` is written by
+    whichever process claims the send and read by whoever reclaims, and on the
+    worker-queue topology those are different hosts sharing one DATABASE_URL.
+
+    A naive stamp compared across that boundary is off by the offset. Westward
+    it made a one-second-old live send look hours stale, so it was requeued and
+    handed to a second drainer — the guest gets the message twice, and since
+    `queued` is cancelable the operator also gets a green cancel toast for a
+    message physically going out. Eastward the genuinely stranded row was never
+    reclaimed at all.
+    """
+    msg = _queued(tenant)
+    outbox.set_status(msg["id"], outbox.SENDING)
+
+    stamp = datetime.fromisoformat(outbox.get(msg["id"])["sending_at"])
+    assert stamp.tzinfo is not None, (
+        "sending_at is read by other hosts; a naive stamp is off by the offset")
+
+
+@pytest.mark.parametrize("offset_hours", [-7, 0, 5.5, 11])
+def test_a_live_send_claimed_in_another_timezone_is_not_reclaimed(
+        offset_hours, tenant):
+    """The same instant, expressed in the claiming host's zone. Whatever that
+    zone is, the send started *now* and must be left alone."""
+    msg = _queued(tenant)
+    outbox.set_status(msg["id"], outbox.SENDING)
+    zone = timezone(timedelta(hours=offset_hours))
+    with outbox._conn() as c:
+        c.execute("UPDATE outbox SET sending_at=? WHERE id=?",
+                  (datetime.now(zone).isoformat(timespec="seconds"), msg["id"]))
+
+    assert outbox.reclaim_stuck_sending() == 0
+    assert outbox.get(msg["id"])["status"] == outbox.SENDING, (
+        "a send that started a second ago must not be handed to a 2nd drainer")
+
+
+def test_a_legacy_naive_stamp_from_the_future_is_restamped_not_stranded(tenant):
+    """Rows written before `sending_at` carried an offset are read as local. One
+    that lands in the future is the tell-tale of a cross-host read; without the
+    restamp it is never old enough to reclaim and the row strands forever — and
+    `sending` is no longer cancelable, so there is no operator route out."""
+    msg = _queued(tenant)
+    outbox.set_status(msg["id"], outbox.SENDING)
+    naive_future = (datetime.now() + timedelta(hours=9)).replace(
+        tzinfo=None).isoformat(timespec="seconds")
+    with outbox._conn() as c:
+        c.execute("UPDATE outbox SET sending_at=? WHERE id=?",
+                  (naive_future, msg["id"]))
+
+    outbox.reclaim_stuck_sending()
+
+    restamped = datetime.fromisoformat(outbox.get(msg["id"])["sending_at"])
+    assert restamped.tzinfo is not None and restamped <= datetime.now(timezone.utc), (
+        "the row must be given a measurable start instead of stranding")
+
+
+def test_a_send_that_completes_mid_reclaim_is_not_clobbered_back_to_queued(
+        tenant, monkeypatch):
+    """`reclaim_stuck_sending` UPDATEs rows from a snapshot taken earlier in the
+    same pass. Without a status guard on the write, a send that reached a
+    terminal state in that window was reset to `queued` — leaving the row
+    `queued` with `sent_at` stamped, dropping it out of `sent_bodies()` (the
+    only duplicate-send guard on /responder/send) and serving it to a drainer
+    again."""
+    msg = _queued(tenant, body="Yes! It is available from Sept 1.")
+    outbox.set_status(msg["id"], outbox.SENDING)
+    with outbox._conn() as c:
+        c.execute("UPDATE outbox SET sending_at=? WHERE id=?",
+                  ("2020-01-01T00:00:00+00:00", msg["id"]))
+
+    # The send finishes between the SELECT and the UPDATE. Interleave on the
+    # *same* connection — a second one would just block on the open write txn.
+    real_conn = outbox._conn
+    held = real_conn()
+
+    class _Shared:
+        """The live connection, minus the close-on-exit."""
+        def __getattr__(self, name):
+            return getattr(held, name)
+        def __enter__(self):
+            return held
+        def __exit__(self, *exc):
+            return False
+
+    real_row = outbox._row
+    def _row_then_complete(row):
+        out = real_row(row)
+        if out and out.get("status") == outbox.SENDING:
+            held.execute("UPDATE outbox SET status=?, sent_at=? WHERE id=?",
+                         (outbox.SENT, "2026-01-01T00:00:00", out["id"]))
+        return out
+
+    # Restored by hand rather than via monkeypatch.undo(), which would also
+    # revert the `tenant` fixture's DB_PATH and point `get` at another database.
+    outbox._conn, outbox._row = _Shared, _row_then_complete
+    try:
+        outbox.reclaim_stuck_sending()
+    finally:
+        outbox._conn, outbox._row = real_conn, real_row
+        held.raw.commit()
+        held.raw.close()
+
+    assert outbox.get(msg["id"])["status"] == outbox.SENT, (
+        "a completed send must not be reset to queued by a stale snapshot")
+    assert outbox.sent_bodies(tenant, SITE, "s1") == [
+        "Yes! It is available from Sept 1."], "the duplicate-send guard stays armed"
 
 
 # --- send_reply: a collision must not be recorded as a delivery -------------

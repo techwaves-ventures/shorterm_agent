@@ -17,7 +17,7 @@ Statuses:
                      \\-> canceled          (human declined)
                         queued -> failed    (send error; retryable)
 """
-from datetime import datetime
+from datetime import datetime, timezone
 
 import db
 
@@ -132,6 +132,25 @@ def _conn() -> db.Conn:
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _now_utc() -> str:
+    """An *absolute* stamp, for the one column compared across processes.
+
+    Every other timestamp here is naive local wall-clock, which is fine while a
+    single host both writes and reads it. `sending_at` is not that column: it is
+    written by whichever process claims the send and read by whoever reclaims,
+    and on the worker-queue topology those are different hosts sharing one
+    `DATABASE_URL` — the worker may sit in any timezone while the web dyno runs
+    UTC. Comparing a naive stamp across that boundary is off by the offset, and
+    in the dangerous direction it makes a one-second-old live send look hours
+    stale and hands it to a second drainer, delivering the message twice.
+
+    So this column carries its offset. Deliberately narrow: `_now()` is shared
+    with `approved_at`/`sent_at`/`scheduled_at`, whose local semantics the
+    quiet-hours clamp depends on, and none of those are compared across hosts.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _row(row) -> dict | None:
@@ -257,8 +276,14 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
     started* rather than infinitely old, so an unreadable stamp cannot trigger a
     duplicate. And `MAX_SEND_ATTEMPTS` bounds the loop: past the cap the message
     fails visibly instead of being re-sent without limit.
+
+    The comparison is absolute, not wall-clock: the claiming process and the
+    reclaiming one are different hosts on the worker-queue topology, and a naive
+    stamp read across that boundary is off by the offset — westward it makes a
+    live send look stale and delivers it twice. See `_now_utc`.
     """
-    cutoff = datetime.now().timestamp() - max_age_seconds
+    now = datetime.now(timezone.utc)
+    cutoff = now.timestamp() - max_age_seconds
     requeued = 0
     with _conn() as c:
         rows = c.execute(
@@ -269,26 +294,44 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
             if not msg:
                 continue
             try:
-                started = datetime.fromisoformat(
-                    str(msg.get("sending_at") or "")).timestamp()
+                stamp = datetime.fromisoformat(str(msg.get("sending_at") or ""))
             except ValueError:
                 # Unknown start time: assume it began now and revisit next pass.
-                c.execute("UPDATE outbox SET sending_at=? WHERE id=?",
-                          (_now(), msg["id"]))
+                c.execute("UPDATE outbox SET sending_at=? WHERE id=? AND status=?",
+                          (_now_utc(), msg["id"], SENDING))
                 continue
-            if started >= cutoff:
+            if stamp.tzinfo is None:
+                # Written before `sending_at` carried its offset (see `_now_utc`).
+                # Read it as local, which is what the writer meant on a
+                # single-host install. A stamp that lands in the *future* is the
+                # tell-tale of a cross-host read, and would otherwise strand the
+                # row forever, so restamp it and measure from now instead.
+                stamp = stamp.astimezone()
+                if stamp > now:
+                    c.execute(
+                        "UPDATE outbox SET sending_at=? WHERE id=? AND status=?",
+                        (_now_utc(), msg["id"], SENDING))
+                    continue
+            if stamp.timestamp() >= cutoff:
                 continue
+            # Every write below is guarded on the row still being `sending`. The
+            # snapshot above was read before these run, so a send that reaches a
+            # terminal state in the window between would otherwise be clobbered
+            # back to `queued` — leaving `status='queued'` with `sent_at` set,
+            # which also drops it out of `sent_bodies()` and disarms the
+            # duplicate-send guard on /responder/send.
             if int(msg.get("attempts") or 0) >= MAX_SEND_ATTEMPTS:
                 c.execute(
-                    "UPDATE outbox SET status=?, error=? WHERE id=?",
+                    "UPDATE outbox SET status=?, error=? WHERE id=? AND status=?",
                     (FAILED,
                      f"Abandoned after {MAX_SEND_ATTEMPTS} send attempts — "
                      "may already have reached the guest; check before retrying.",
-                     msg["id"]),
+                     msg["id"], SENDING),
                 )
                 continue
-            c.execute("UPDATE outbox SET status=? WHERE id=?", (QUEUED, msg["id"]))
-            requeued += 1
+            cur = c.execute("UPDATE outbox SET status=? WHERE id=? AND status=?",
+                            (QUEUED, msg["id"], SENDING))
+            requeued += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
     return requeued
 
 
@@ -333,7 +376,7 @@ def set_status(msg_id: int, status: str, *, error: str | None = None,
         # against. `approved_at` cannot answer that: a message approved into
         # quiet hours sits queued for hours before anyone picks it up.
         sets.append("sending_at=?")
-        vals.append(_now())
+        vals.append(_now_utc())  # absolute: read by other hosts, see `_now_utc`
         sets.append("attempts=COALESCE(attempts,0)+1")
     if status == SENT:
         sets.append("sent_at=?")
