@@ -100,15 +100,22 @@ def _rows_everywhere() -> int:
 
 
 def _post(client, tid, body=DIGEST, subject="Your weekly digest",
-          sender="no-reply@furnishedfinder.com", headers=None, recipient=None):
+          sender="no-reply@furnishedfinder.com", headers=None, recipient=None,
+          date=None):
+    payload = {
+        "recipient": recipient or inbound.address_for(tid),
+        "from": sender,
+        "subject": subject,
+        "text": body,
+    }
+    # The provider's `Date`. Real forwards carry one; it is what tells two sends
+    # of the same words apart, so tests that care about message identity must
+    # send it rather than let it default to empty.
+    if date is not None:
+        payload["date"] = date
     return client.post(
         "/inbound/email",
-        json={
-            "recipient": recipient or inbound.address_for(tid),
-            "from": sender,
-            "subject": subject,
-            "text": body,
-        },
+        json=payload,
         headers=SECRET if headers is None else headers,
     )
 
@@ -391,7 +398,9 @@ def test_each_row_shows_what_the_operator_needs_to_act(client):
     assert "An enquiry" in page, "subject"
     assert "no-reply@furnishedfinder.com" in page, "sender"
     assert "UTC" in page, "received time"
-    assert "Couldn't find a guest name" in page, "reason in plain language"
+    # Matched without the apostrophe: the reason is now the row's stored text
+    # rather than markup in the template, so Jinja escapes it to `Couldn&#39;t`.
+    assert "find a guest name" in page, "reason in plain language"
     assert "A guest asked about the loft." in page, "body excerpt"
     assert f"/inbound/rejected/{rid}/retry" in page, "retry action"
     assert f"/inbound/rejected/{rid}/dismiss" in page, "dismiss action"
@@ -421,7 +430,7 @@ def test_retry_recovers_the_lead_and_cannot_create_two_deals(client, monkeypatch
 
     from sites import ff_email
 
-    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: {
         "kind": "lead", "id": "recovered-1", "title": "Recovered | Emma",
         "url": "https://example.test/lead", "source": "email", "raw": body,
         "traveler": "Emma", "property_name": "Recovered",
@@ -457,7 +466,7 @@ def test_the_double_retry_guard_holds_without_help_from_storage_dedup(client, mo
 
     from sites import ff_email
 
-    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: {
         "kind": "lead", "id": "dedup-off-1", "title": "Twice | Emma", "url": "u",
         "source": "email", "raw": body, "traveler": "Emma", "property_name": "Twice",
     })
@@ -482,7 +491,7 @@ def test_a_retry_whose_store_fails_hands_the_row_back(client, monkeypatch):
 
     from sites import ff_email
 
-    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: {
         "kind": "lead", "id": "boom-1", "title": "Boom | Emma", "url": "u",
         "source": "email", "raw": body, "traveler": "Emma", "property_name": "Boom",
     })
@@ -541,7 +550,7 @@ def test_recovering_a_reply_threads_it_instead_of_opening_a_second_deal(client, 
         "property_name": parent.get("property_name") or "Quiet Spacious Home in NW DC - Unit 1",
         "url": "u", "source": "email", "raw": "Is it still available?",
     }
-    monkeypatch.setattr(ff_email, "parse", lambda subject, body: dict(reply))
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: dict(reply))
     assert pipeline.find_thread(
         tid, SITE, pipeline.thread_key(reply), exclude_item_id=reply["id"]
     ), "precondition: the reply really does belong to Emma's thread"
@@ -571,7 +580,7 @@ def test_a_store_failure_alone_still_gets_the_guest_onto_the_board(client, monke
 
     from sites import ff_email
 
-    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: {
         "kind": "lead", "id": "half-1", "title": "Half | Emma", "url": "u",
         "source": "email", "raw": body, "traveler": "Emma", "property_name": "Half",
     })
@@ -601,7 +610,7 @@ def test_a_retry_whose_deal_never_opens_hands_the_row_back(client, monkeypatch):
 
     from sites import ff_email
 
-    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: {
         "kind": "lead", "id": "gap-1", "title": "Gap | Emma", "url": "u",
         "source": "email", "raw": body, "traveler": "Emma", "property_name": "Gap",
     })
@@ -638,7 +647,7 @@ def test_a_retry_after_a_failed_one_still_recovers_the_lead(client, monkeypatch)
 
     from sites import ff_email
 
-    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: {
         "kind": "lead", "id": "stuck-1", "title": "Stuck | Emma", "url": "u",
         "source": "email", "raw": body, "traveler": "Emma", "property_name": "Stuck",
     })
@@ -693,7 +702,7 @@ def test_a_lead_recovered_on_a_later_retry_is_still_drafted(client, monkeypatch)
 
     from sites import ff_email
 
-    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: {
         "kind": "lead", "id": "draft-1", "title": "Draft | Emma", "url": "u",
         "source": "email", "raw": body, "traveler": "Emma", "property_name": "Draft",
     })
@@ -737,7 +746,7 @@ def test_retrying_a_lead_already_on_the_board_does_not_duplicate_it(client, monk
     from sites import ff_email
 
     # A fixed parser now reads it as the lead that is already on the board.
-    monkeypatch.setattr(ff_email, "parse", lambda subject, body: {
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: {
         "kind": "lead", "id": existing, "title": "Dup | Emma", "url": "u",
         "source": "email", "raw": body, "traveler": "Emma M.", "property_name": "Dup",
     })
@@ -758,7 +767,7 @@ def test_retry_that_still_fails_leaves_the_row_open(client):
 
     row = inbound_rejects.get(tid, SITE, rid)
     assert row["status"] == "open", "an unrecoverable message must not disappear"
-    assert "still could not parse" in row["reason"]
+    assert "still couldn't read" in row["reason"]
     assert len(pipeline.all_deals(tid, SITE)) == 0
 
 
@@ -901,3 +910,130 @@ def test_sql_is_portable_to_postgres():
     )
     assert "?" not in translated
     assert translated.count("%s") == 1
+
+
+# --- Regressions from the round-3 review (D1, D2, D3) -----------------------
+
+
+def test_a_recovered_reply_whose_thread_write_fails_hands_the_row_back(client, monkeypatch):
+    """D1: "on the board" is constant-True for a reply, so it cannot confirm one.
+
+    The conversation a reply answers is on the board *before* the retry runs. A
+    presence check therefore says "recovered" no matter what happened — the row
+    leaves the queue, the guest's words were never written anywhere, and the
+    operator is told the lead is safe. That is the silent loss this whole page
+    exists to end, re-created inside the feature built to end it.
+    """
+    tid = _tenant_with_login(client)
+    _post(client, tid, body=GOOD_LEAD, subject="New lead from Emma M.")
+    deals = pipeline.all_deals(tid, SITE)
+    assert len(deals) == 1, "precondition: one deal for Emma"
+    parent = deals[0]
+
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    reply = {
+        "kind": "message", "id": "reply-emma-d1", "title": "Emma M.",
+        "traveler": "Emma M.",
+        "property_name": parent.get("property_name") or "Quiet Spacious Home in NW DC - Unit 1",
+        "url": "u", "source": "email", "raw": "Any update?",
+    }
+    monkeypatch.setattr(ff_email, "parse",
+                        lambda subject, body, received_at=None: dict(reply))
+
+    # Both preconditions asserted before the act, so a pass cannot come from the
+    # reply having been a non-thread, or from comparing two empty stamps.
+    assert pipeline.find_thread(
+        tid, SITE, pipeline.thread_key(reply), exclude_item_id=reply["id"]
+    ), "precondition: the reply really does belong to Emma's thread"
+    assert not pipeline.get(tid, SITE, parent["item_id"]).get("last_guest_reply_at"), (
+        "precondition: the parent has recorded no guest reply yet"
+    )
+
+    import pipeline as pipeline_mod
+
+    def explode(*a, **kw):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(pipeline_mod, "record_guest_reply", explode)
+
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    # The reply genuinely did not land — the positive control for the assertions
+    # below, so this cannot pass by the write having quietly succeeded.
+    assert not pipeline.get(tid, SITE, parent["item_id"]).get("last_guest_reply_at"), (
+        "control: the guest's reply really was never recorded"
+    )
+    assert len(pipeline.all_deals(tid, SITE)) == 1, "control: no deal was opened either"
+
+    row = inbound_rejects.get(tid, SITE, rid)
+    assert row["status"] == "open", (
+        "a reply that never reached its thread must not read as recovered"
+    )
+    assert row["resolved_item_id"] in (None, ""), "must not claim a deal that was never opened"
+    assert inbound_rejects.count_open(tid, SITE) == 1, "the lead must stay visible"
+
+
+def test_two_sends_of_the_same_words_recover_onto_two_deals(client, monkeypatch):
+    """D2: retry dropped the mail `Date`, so a re-send collapsed onto the first.
+
+    A message id hashes a stamp that falls back to the mail date, and the body
+    fingerprint strips quoted history — so a guest re-sending "Any update?" with
+    the earlier exchange quoted underneath is separated from the original by the
+    date alone. The webhook passes it; retry did not, so both rows resolved to
+    one deal id and the second message was silently absorbed while the operator
+    was told it had been recovered.
+
+    Driven through the real parser (not a stub) because the id derivation is the
+    thing under test, and through the real ingress for both capture and retry.
+    """
+    tid = _tenant_with_login(client)
+
+    from sites import ff_email
+
+    real_parse = ff_email.parse
+
+    subject = "New message from Emma Rodriguez"
+    words = ("Traveler: Emma Rodriguez\n"
+             "Property: Quiet Spacious Home in NW DC - Unit 1\n\n"
+             "Any update?\n")
+    resend = words + "\n> On Aug 3 you wrote:\n> Thanks for reaching out, I will check.\n"
+
+    # Before the parser fix: neither can be read, so both land on the review list.
+    monkeypatch.setattr(ff_email, "parse", lambda *a, **kw: None)
+    _post(client, tid, subject=subject, body=words,
+          date="Mon, 3 Aug 2026 09:00:00 +0000")
+    _post(client, tid, subject=subject, body=resend,
+          date="Tue, 11 Aug 2026 09:00:00 +0000")
+
+    rows = inbound_rejects.open_for_tenant(tid, SITE)
+    assert len(rows) == 2, "precondition: two distinct rows, not one deduped row"
+
+    # The parser fix ships and the operator retries both.
+    monkeypatch.setattr(ff_email, "parse", real_parse)
+    for r in rows:
+        client.post(f"/inbound/rejected/{r['id']}/retry")
+
+    resolved = [inbound_rejects.get(tid, SITE, r["id"]) for r in rows]
+    assert all(x["status"] == "recovered" for x in resolved), (
+        "control: both rows must actually have been recovered, or the ids below "
+        "differ only because one retry failed"
+    )
+    ids = {x["resolved_item_id"] for x in resolved}
+    assert len(ids) == 2, (
+        "two different messages must not recover onto one deal id — the second "
+        f"is silently absorbed. got {ids}"
+    )
+    # Same guest, same property, so the re-send correctly threads onto the first
+    # message's conversation rather than opening a rival deal — but it has to
+    # actually *land* there. Under the collision the second row resolved to the
+    # first message's own id, `filter_new` called it already-seen, and nothing
+    # was written anywhere while the row still read as recovered.
+    deals = pipeline.all_deals(tid, SITE)
+    assert len(deals) == 1, "one guest, one property: one conversation"
+    assert deals[0].get("last_guest_reply_at"), (
+        "the re-send must be recorded on the thread, not absorbed by the first"
+    )

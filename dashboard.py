@@ -376,7 +376,11 @@ def inbound_email():
         # screen and disk. `inbound.Rejected` carries the distinction.
         if e.tenant_id and e.code in inbound.RECORDABLE_CODES:
             try:
-                inbound_rejects.record(e.tenant_id, SITE, e.code, str(e), payload)
+                # No reason text: the row carries operator-facing copy keyed on
+                # the code. `str(e)` is the audit string and it is already in
+                # the log line above — for `sender_not_allowed` it also embeds
+                # the raw sender, which does not belong on the review page.
+                inbound_rejects.record(e.tenant_id, SITE, e.code, "", payload)
             except Exception:
                 # Never let bookkeeping change the reply: the flat 202 is what
                 # keeps this endpoint from telling a prober which addresses exist.
@@ -441,10 +445,22 @@ def inbound_rejected_retry(rid):
 
     from sites import ff_email
 
-    item = ff_email.parse(row["subject"] or "", row["body"] or "")
+    # Pass the mail `Date` the way the webhook does. Without it two sends of the
+    # same words are indistinguishable: a message id hashes a stamp that falls
+    # back to this argument, and the body fingerprint strips quoted history — so
+    # a guest's ordinary re-send ("Any update?" again, with the earlier exchange
+    # quoted underneath) recovered onto the *first* message's deal and was
+    # silently absorbed while the operator was told it had been recovered.
+    #
+    # `received_at` is our own write time rather than the mail date, so it is
+    # only the fallback for rows captured before `mail_date` was stored. It is
+    # not equivalent — but two such rows still get two different stamps, and
+    # separating them wrongly beats collapsing them silently.
+    item = ff_email.parse(row["subject"] or "", row["body"] or "",
+                          received_at=row.get("mail_date") or row["received_at"])
     if not item:
         inbound_rejects.update_reason(
-            tenant_id, SITE, rid, "still could not parse a lead from the message"
+            tenant_id, SITE, rid, "Tried again — still couldn't read this email."
         )
         flash("Still couldn't read that email — it stays on this list.")
         return redirect(url_for("inbound_rejected"))
@@ -456,9 +472,10 @@ def inbound_rejected_retry(rid):
         flash("That message was already handled.")
         return redirect(url_for("inbound_rejected"))
 
-    # Whether the guest is already on the board decides two things below, and it
-    # has to be read *before* storing to mean anything.
-    was_on_board = inbound.on_board(tenant_id, item, SITE)
+    # Read the board *before* storing. For a reply the conversation it answers is
+    # already there, so only a before/after comparison can tell "landed" apart
+    # from "did nothing at all" — see `inbound.board_mark`.
+    before = inbound.board_mark(tenant_id, item, SITE)
 
     try:
         inbound.store(tenant_id, item, SITE)
@@ -476,7 +493,7 @@ def inbound_rejected_retry(rid):
     # Via `inbound.open_deal`, not `pipeline.ensure`: half of what that does is
     # threading a reply onto the conversation it answers, and reimplementing only
     # the other half opened a second deal beside it.
-    if not inbound.on_board(tenant_id, item, SITE):
+    if not inbound.landed(before, inbound.board_mark(tenant_id, item, SITE)):
         try:
             inbound.open_deal(tenant_id, item, SITE)
         except Exception:
@@ -486,9 +503,11 @@ def inbound_rejected_retry(rid):
     # the above returned. Hand the row back if they didn't — a message marked
     # recovered with nothing to show for it is the silent loss this page exists
     # to end.
-    if not inbound.on_board(tenant_id, item, SITE):
+    after = inbound.board_mark(tenant_id, item, SITE)
+    if not inbound.landed(before, after):
         inbound_rejects.reopen(
-            tenant_id, SITE, rid, "parsed, but the lead could not be opened"
+            tenant_id, SITE, rid,
+            "Read this email, but couldn't open the lead — try again.",
         )
         flash("Read that email, but couldn't open the lead — it stays on this list.")
         return redirect(url_for("inbound_rejected"))
@@ -496,11 +515,16 @@ def inbound_rejected_retry(rid):
     # Same follow-through the webhook gives a lead that parsed first time. A
     # recovered lead is a *late* lead, so it needs the draft more, not less —
     # and an email-only tenant has no scheduled pass that would pick it up.
-    # Gated on the deal being new to *the board*: `store`'s "was it new" answer
-    # is False on any retry after a half-completed store, which would leave a
-    # recovered guest sitting there undrafted. Note this is the full ingest
-    # follow-through, so with the scheduler on it can send, not just draft.
-    if not was_on_board and os.getenv("ANTHROPIC_API_KEY"):
+    #
+    # Gated on this attempt having actually advanced the board, which is the
+    # recovery-path equivalent of the webhook's `is_new`: it drafts a threaded
+    # reply (an existing conversation, so nothing "new" is on screen, but the
+    # guest is waiting on an answer) and stays quiet when the retry found the
+    # item already fully ingested. A presence test got this backwards and left
+    # every recovered reply undrafted while the identical webhook reply was
+    # drafted. Note this is the full ingest follow-through, so with the
+    # scheduler on it can send, not just draft.
+    if inbound.advanced(before, after) and os.getenv("ANTHROPIC_API_KEY"):
         try:
             runner.draft_ingested(tenant_id, SITE, item)
         except Exception:

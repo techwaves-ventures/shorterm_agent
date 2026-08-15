@@ -76,8 +76,15 @@
           </span>
         </div>
         <div class="rej__body">
+          {# The stored reason, not a guess from the code: after a retry that
+             parsed but couldn't reach the board, the code still says "unparsed"
+             while the row's reason says what actually went wrong. Rendering the
+             code told the operator we couldn't read an email we had just read
+             fine. Falls back for rows written before the reason was copy. #}
           <div class="rej__reason">
-            {% if r.reason_code == 'sender_not_allowed' %}
+            {% if r.reason %}
+              {{ r.reason }}
+            {% elif r.reason_code == 'sender_not_allowed' %}
               Sent from an address we don't recognise as FurnishedFinder.
             {% else %}
               Couldn't find a guest name and a property or date in this email.

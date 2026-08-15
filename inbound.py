@@ -347,16 +347,47 @@ def open_deal(tenant_id: str, item: dict, site: str = "furnishedfinder") -> None
                         units=config.get_units(tenant_id))
 
 
-def on_board(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
-    """Whether this item actually reached the board.
+def board_mark(tenant_id: str, item: dict, site: str = "furnishedfinder"):
+    """What the board holds for this item right now — a before/after comparison point.
 
-    A threaded reply never gets a deal of its own, so looking only for a deal
-    keyed on its item id reports failure for a message that arrived perfectly
-    well — and telling the operator a lead was lost when it wasn't is the same
-    lie as the reverse, pointed the other way.
+    Asking "is it on the board?" cannot answer "did this message land?" for a
+    threaded reply. The conversation it answers is on the board *before* the
+    attempt runs, so presence is constant-True and a write that failed outright
+    still reads as success — the operator is told a lead is safe when it isn't,
+    which is precisely the silent loss this table exists to end, re-created
+    inside the feature built to end it.
+
+    What actually moves when a reply lands is the parent's `last_guest_reply_at`.
+    So a caller takes a mark before the work and asks `landed`/`advanced` whether
+    it moved, rather than asking whether something is merely there.
     """
     import pipeline
 
-    if pipeline.get(tenant_id, site, item.get("id", "")):
-        return True
-    return bool(_thread_parent(tenant_id, item, site))
+    deal = pipeline.get(tenant_id, site, item.get("id", ""))
+    if deal:
+        return ("deal", deal.get("item_id"))
+    parent = _thread_parent(tenant_id, item, site)
+    if parent:
+        return ("thread", parent.get("item_id"), parent.get("last_guest_reply_at"))
+    return None
+
+
+def advanced(before, after) -> bool:
+    """Whether this attempt put something new on the board.
+
+    The webhook decides whether to draft on `store`'s "was it new" answer; this
+    is the recovery path's equivalent. It has to be a *change* rather than a
+    state: a reply threading onto an existing conversation adds no deal, so any
+    state-based reading of it cannot be told apart from having done nothing.
+    """
+    return after is not None and after != before
+
+
+def landed(before, after) -> bool:
+    """Whether the item is on the board *and* we can prove how it got there.
+
+    Either this attempt moved something (`advanced`), or a deal keyed on the
+    item's own id exists — the one case where bare presence is proof, because
+    that deal can only have been opened for this item.
+    """
+    return advanced(before, after) or bool(after and after[0] == "deal")

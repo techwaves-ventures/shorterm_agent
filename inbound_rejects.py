@@ -53,10 +53,23 @@ _MAX_SUBJECT = 500
 _MAX_SENDER = 320          # RFC 5321 maximum path length
 _MAX_REASON = 500
 
+_MAX_MAIL_DATE = 120       # a Date header; anything longer is not one
+
+# What the review page shows for a freshly captured row. `reason` is the only
+# per-row explanation the operator ever sees, and after a failed retry it is
+# overwritten with what that attempt actually hit — so it has to read as a
+# sentence a host can act on the whole time. `str(Rejected)` is an internal
+# audit string (and for `sender_not_allowed` it embeds the raw sender), which
+# belongs in the log line at the call site, not on their screen.
+_CAPTURE_REASON = {
+    "unparsed": "Couldn't find a guest name and a property or date in this email.",
+    "sender_not_allowed": "Sent from an address we don't recognise as FurnishedFinder.",
+}
+
 _COLS = (
     "id", "tenant_id", "site", "reason_code", "reason", "subject", "sender",
-    "body", "fingerprint", "seen_count", "received_at", "status", "resolved_at",
-    "resolved_item_id",
+    "body", "fingerprint", "seen_count", "received_at", "mail_date", "status",
+    "resolved_at", "resolved_item_id",
 )
 
 _SELECT = f"SELECT {', '.join(_COLS)} FROM inbound_rejects"
@@ -89,11 +102,18 @@ def _conn() -> db.Conn:
             fingerprint TEXT NOT NULL,
             seen_count INTEGER NOT NULL DEFAULT 1,
             received_at TEXT NOT NULL,
+            mail_date TEXT,
             status TEXT NOT NULL DEFAULT 'open',
             resolved_at TEXT,
             resolved_item_id TEXT
         )"""
     )
+    # Added after the table shipped, so existing deployments need the migration.
+    # Nullable on purpose: rows captured before this can never learn their mail
+    # `Date`, and retry falls back to `received_at` for them (see the retry
+    # route). A NOT NULL default would invent a stamp that looks authoritative.
+    if "mail_date" not in db.table_columns(c, "inbound_rejects"):
+        c.execute("ALTER TABLE inbound_rejects ADD COLUMN mail_date TEXT")
     # Carries the dedup: an identical replay lands on the same row. Also the
     # conflict target of the upsert in `record`, so it must exist first.
     c.execute(
@@ -192,8 +212,13 @@ def record(tenant_id: str, site: str, reason_code: str, reason: str,
     subject = inbound.extract_subject(payload)[:_MAX_SUBJECT]
     sender = inbound.extract_sender(payload)[:_MAX_SENDER]
     body = inbound.extract_body(payload)[:MAX_STORED_BODY]
+    # The mail `Date`, kept because retry has to hand the parser the same stamp
+    # the webhook did. A *message* id hashes it, so dropping it collapsed two
+    # sends of the same words onto one deal — see the retry route.
+    mail_date = inbound.extract_date(payload)[:_MAX_MAIL_DATE]
     fp = _fingerprint(subject, sender, body)
     now = _now()
+    reason = (reason or _CAPTURE_REASON.get(reason_code) or "")[:_MAX_REASON]
 
     with _conn() as c:
         # An exact replay bumps the counter instead of adding a row. `status` is
@@ -203,15 +228,17 @@ def record(tenant_id: str, site: str, reason_code: str, reason: str,
         c.execute(
             """INSERT INTO inbound_rejects
                    (tenant_id, site, reason_code, reason, subject, sender, body,
-                    fingerprint, seen_count, received_at, status)
-               VALUES (?,?,?,?,?,?,?,?,1,?,?)
+                    fingerprint, seen_count, received_at, mail_date, status)
+               VALUES (?,?,?,?,?,?,?,?,1,?,?,?)
                ON CONFLICT (tenant_id, site, fingerprint) DO UPDATE SET
                    seen_count = inbound_rejects.seen_count + 1,
                    received_at = excluded.received_at,
                    reason_code = excluded.reason_code,
-                   reason = excluded.reason""",
-            (tenant_id, site, reason_code, (reason or "")[:_MAX_REASON], subject,
-             sender, body, fp, now, OPEN),
+                   reason = excluded.reason,
+                   mail_date = COALESCE(NULLIF(excluded.mail_date, ''),
+                                        inbound_rejects.mail_date)""",
+            (tenant_id, site, reason_code, reason, subject,
+             sender, body, fp, now, mail_date, OPEN),
         )
         # Read the id back rather than using lastrowid/RETURNING: on SQLite
         # lastrowid is not updated when an upsert takes the DO UPDATE path, so
