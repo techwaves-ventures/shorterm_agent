@@ -17,7 +17,15 @@ import config
 
 log = logging.getLogger(__name__)
 
-_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+# Same pattern, same O(n^2), and the same fix as `sites/ff_email._EMAIL_RE` —
+# see the reasoning there for why the lookbehind cannot change what `search`
+# finds. This copy is reachable from `/inbound/email` too, just further along:
+# `_find_email` scans `item["title"]`, which `ff_email.parse` builds from a
+# whole unbounded `_label` line, so a body that is legal under the payload cap
+# still produced a ~400 KB title. Unfixed that cost 604 s here with the GIL
+# held — long past the 120 s arbiter timeout — while the three regexes the
+# ticket named had already been made linear and parsed the same body in 0.19 s.
+_EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+\.[\w.-]+")
 
 
 def _find_email(item: dict) -> str | None:

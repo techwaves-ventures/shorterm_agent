@@ -196,11 +196,156 @@ def extract_body(payload: dict) -> str:
     for key in ("html", "HtmlBody", "body-html"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
-            text = re.sub(r"(?is)<(script|style).*?</\1>", " ", value)
-            text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", text)
-            text = re.sub(r"<[^>]+>", " ", text)
-            return re.sub(r"[ \t]+", " ", text)
+            return _strip_html(value)
     return ""
+
+
+# Start of an element whose *content* is markup we don't want as text. This is
+# deliberately just the literal opener with no word boundary and no closing
+# `>`, because that is exactly what `<(script|style).*?</\1>` required: on
+# `<scripty>SECRET=1;</script>` the old pattern matched `<script`, let `.*?`
+# absorb `y>SECRET=1;` and stripped the lot. Demanding a well-formed tag here
+# would leak that content into the stored body.
+_SCRIPT_OPEN_RE = re.compile(r"(?i)<(script|style)")
+
+# The whole element, byte-for-byte the pattern this file used before the
+# linearity work, and the *only* thing that decides where an element ends.
+#
+# It is kept as a backreference on purpose. `re` compares a backreference under
+# IGNORECASE with **simple** (1:1) case mapping but compares a **literal** with
+# **extended** folding, and the two disagree:
+#
+#     re.search(r"(?i)(s)\1", "sſ")  -> None   (backreference: ſ is not s)
+#     re.search(r"(?i)s",     "ſ")   -> match  (literal:       ſ is s)
+#
+# So `</script>` as a literal, or `group(1).lower()` as a dict key, both admit
+# openers and closers this file historically did not — `<ſcript>`, `<scrİpt>`,
+# `<ſtyle>`. Earlier attempts here re-derived the fold by hand (first a
+# lowercased copy indexed back into the original, then a case-insensitive
+# literal) and each was wrong in a new way. Letting the engine do the
+# comparison is what makes equivalence structural instead of argued.
+_SCRIPT_ELEMENT_RE = re.compile(r"(?is)<(script|style).*?</\1>")
+
+
+def _script_spans(value: str) -> list[tuple[int, int]]:
+    """Extent of each <script>/<style> element that is actually closed.
+
+    An unclosed one yields nothing, which is what a bare
+    `re.sub(<(script|style).*?</\\1>)` did too: it also required the closing tag
+    before it would strip anything.
+
+    Matches that sub() span for span, because it runs the very same pattern —
+    the only difference is *where* it is allowed to start. `sub()` re-tries the
+    pattern at every offset, which is what made `"<script" * n` quadratic; here
+    the openers are located first and the pattern is anchored at each one, with
+    a failed match remembered so it is not retried for the same spelling.
+    """
+    spans: list[tuple[int, int]] = []
+    # Opener spellings already searched for and found to have no closer in the
+    # rest of the input. Matching only ever runs at non-decreasing offsets, so
+    # once an element with this opener fails to close it fails for every later
+    # opener spelled the same way. Without this, `"<script" * n` re-scanned to
+    # end-of-input from each of the n openers and stayed O(n^2) — the shape
+    # being fixed.
+    #
+    # Keyed by `str.lower()`, which is safe *as a cache key* even though it is
+    # not the engine's fold: two spellings can only share a key if they lower
+    # to the same string, and equal `lower()` implies equal simple-fold, so a
+    # key never merges two genuinely different closer requirements. It can
+    # split one (`İ` lowers to two chars), which only costs an extra search.
+    # The opener alternation admits a fixed, finite set of spellings, so the
+    # number of distinct keys is bounded by a constant and this stays linear.
+    exhausted: set[str] = set()
+    pos = 0
+    while True:
+        m = _SCRIPT_OPEN_RE.search(value, pos)
+        if not m:
+            return spans
+        if m.group(1).lower() in exhausted:
+            pos = m.end()
+            continue
+        # Anchored at the opener, so the engine tries this one position and
+        # lazily expands to the nearest closer *it* considers a backreference
+        # match. Same pattern, same starting offset, same result as the sub().
+        element = _SCRIPT_ELEMENT_RE.match(value, m.start())
+        if element is None:
+            # No closer for this opener, so the old regex reported no match
+            # here either. Resume past it: an opener cannot begin inside
+            # another opener, so nothing is skipped by not backing up.
+            exhausted.add(m.group(1).lower())
+            pos = m.end()
+            continue
+        spans.append((element.start(), element.end()))
+        pos = element.end()
+
+
+def _strip_tags(text: str) -> str:
+    """Replace each `<...>` tag with a space, in one forward pass.
+
+    Matches `<[^>]+>` span for span — including the awkward parts. A `<` before
+    the next `>` is absorbed rather than ending the tag (`<<a>` is one match,
+    as the old pattern's `[^>]` allowed), and `<>` is not a tag at all because
+    `[^>]+` needs at least one character.
+    """
+    out: list[str] = []
+    pos = 0
+    while True:
+        start = text.find("<", pos)
+        if start < 0:
+            break
+        end = text.find(">", start + 1)
+        if end < 0:
+            # Nothing after this `<` can close, so no later `<` matches either.
+            break
+        if end == start + 1:            # "<>" — not a tag; keep it verbatim
+            out.append(text[pos:end])
+            pos = end
+            continue
+        out.append(text[pos:start])
+        out.append(" ")
+        pos = end + 1
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def _strip_html(value: str) -> str:
+    """HTML to rough text, in time linear in the length of the input.
+
+    Both of the patterns this replaces were O(n^2), and this runs on a body
+    that has not yet been established as a real notification:
+
+      * `<(script|style).*?</\\1>` — with no closing tag anywhere, the lazy
+        `.*?` scanned to end-of-input from *every* `<script` occurrence, so
+        `"<script" * n` cost ~176 ms at 16 KB and quadruples per doubling.
+        Finding element extents with one `finditer` pass removes the rescan.
+      * `<[^>]+>` — a `<` with no `>` after it scanned to end-of-input, again
+        from every `<`. Note the trigger is the *gap to the next `>`*, not
+        token length: `"< " * n` (whitespace every other character) was just as
+        quadratic, which is why bounding unbroken runs in the input would not
+        have fixed this one.
+
+    Both replacements are span-for-span equivalent to what they replace; see
+    `_script_spans` and `_strip_tags`. Narrowing the alphabet instead — the
+    obvious `<[^<>]+>` — is *not* equivalent and was reverted: it ends a tag at
+    the next `<`, so a guest writing "my budget is < $2000" in an HTML mail
+    extracted different text, which for a message changes `_body_fingerprint`
+    and therefore the item id. That silently re-ingests already-seen messages
+    as new ones on deploy. Bound the *scan*, not the alphabet.
+    """
+    spans = _script_spans(value)
+    if spans:
+        kept, pos = [], 0
+        for start, end in spans:
+            kept.append(value[pos:start])
+            kept.append(" ")
+            pos = end
+        kept.append(value[pos:])
+        text = "".join(kept)
+    else:
+        text = value
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", text)
+    text = _strip_tags(text)
+    return re.sub(r"[ \t]+", " ", text)
 
 
 def extract_subject(payload: dict) -> str:
@@ -242,7 +387,14 @@ def accept(payload: dict, webhook_secret: str, raw_size: int = 0) -> tuple[str, 
     """
     if not configured():
         raise Rejected("inbound email is not configured")
-    if raw_size and raw_size > MAX_PAYLOAD_BYTES:
+    # Dropping the `raw_size and` guard is a readability change, not a fix:
+    # `raw_size` is always an int here, and `x and x > K` is equivalent to
+    # `x > K` for one — a mutation reverting it leaves the suite green. It is
+    # written plainly because the old form *read* as "0 means unknown, skip the
+    # check", which is the mistake that produced the fail-open one line up in
+    # the caller. What actually stops an under-declared body is the check
+    # against the extracted body below.
+    if raw_size > MAX_PAYLOAD_BYTES:
         raise Rejected("payload too large")
     if not verify_webhook(webhook_secret):
         raise Rejected("bad webhook secret")
@@ -257,7 +409,17 @@ def accept(payload: dict, webhook_secret: str, raw_size: int = 0) -> tuple[str, 
 
     from sites import ff_email
 
-    item = ff_email.parse(extract_subject(payload), extract_body(payload),
+    body = extract_body(payload)
+    # The `raw_size` check above measures the *request* and can only be as good
+    # as what the caller could measure; this one measures the text that actually
+    # reaches the parser, so the documented cap holds however the body was
+    # transferred and whatever the sender claimed its length was. It is the
+    # check that closes the form-encoded chunked case, where the caller sees a
+    # size of 0 because form parsing has already drained the stream.
+    if len(body) > MAX_PAYLOAD_BYTES:
+        raise Rejected("payload too large")
+
+    item = ff_email.parse(extract_subject(payload), body,
                           received_at=extract_date(payload))
     if not item:
         raise Rejected("could not parse a lead from the message")

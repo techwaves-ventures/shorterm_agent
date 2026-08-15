@@ -38,7 +38,31 @@ MESSAGES_URL = "https://www.furnishedfinder.com/members/tenant-message"
 _MESSAGE_HINTS = ("message", "replied", "reply from", "new message")
 _LEAD_HINTS = ("lead", "inquiry", "enquiry", "interested", "booking request")
 
-_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+# The leading lookbehind is what keeps this linear, and it costs no matches.
+# `[\w.+-]+@` re-scanned the whole of an unbroken run from every offset inside
+# it before concluding there was no `@`, which is O(n^2): 16 KB of `aaaa…`,
+# `7777…`, `----`, `....` or base64 cost ~1 s, with the GIL held throughout.
+# Requiring the local part to start at a token boundary leaves one viable
+# starting offset per run instead of one per character.
+#
+# It cannot change what `search` finds — which is all this pattern is used for,
+# here and in `responder.py`. `search` returns the leftmost match, and a match
+# beginning mid-token implies a match beginning at that token's start — the
+# greedy `[\w.+-]+` simply absorbs the extra prefix — so every offset this
+# prunes was one that could never have produced the leftmost match.
+#
+# That argument is specific to `search`. It does *not* extend to `findall` or
+# `finditer`, which resume scanning at the end of the previous match: a second
+# match starting immediately after the first is preceded by a class character
+# and so is now suppressed. `'a@b.c+d@e.f'` is the shape. If you ever want all
+# matches out of this pattern, re-derive the equivalence before trusting it.
+#
+# Bounding
+# the quantifiers instead (`{1,64}`) was tried and is *not* equivalent: it
+# matched a truncated tail of an over-long local part, which would store the
+# wrong address on the lead, and dropped addresses whose domain label ran past
+# the bound.
+_EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+\.[\w.-]+")
 _PHONE_RE = re.compile(r"(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}")
 _MONEY_RE = re.compile(r"\$\s?[\d,]{3,}")
 
@@ -498,8 +522,36 @@ def _dates(text: str) -> tuple[str, str]:
     two leads that differ only there are still two leads. Use `_only_if_a_date`
     on the way to storage, where a non-date is worse than nothing.
     """
+    # The `(?<![A-Za-z])` lookbehinds keep this linear. Unbounded, `[a-z]*`
+    # walked to the end of an unbroken letter run from every offset inside it
+    # looking for a following digit, which is O(n^2) -- 16 KB of `aaaa…` cost
+    # ~4.6 s, with the GIL held throughout. Requiring a month to begin at a
+    # letter boundary leaves one viable starting offset per word.
+    #
+    # This cannot change what is found: `[A-Za-z]{3}` matches any letters, so a
+    # match beginning mid-word implies one beginning at that word's start, and
+    # `search` returns the leftmost match — so the pruned offsets were never
+    # the ones reported. Two near misses are worth keeping in mind if this is
+    # ever touched again:
+    #
+    #   * The lookbehind belongs *inside* the alternation, on the month branch
+    #     only. In front of the whole group it also guards `\d{1,2}/\d{1,2}/…`,
+    #     whose leading digit has no such absorb-the-prefix property: it turned
+    #     "abc12/1/26 - 3/4/27" into "2/1/26" and dropped "x9/1/26 to 12/31/26"
+    #     entirely.
+    #   * Capping the quantifier instead (`[a-z]{0,7}`) is not equivalent
+    #     either — on "Septemberish 3, 2026" it reports the tail "ish 3, 2026".
+    #   * Only the *first* group takes a lookbehind. The second is not scanned
+    #     for — it is matched at a fixed point after the separator — so the
+    #     absorb-the-prefix argument does not licence pruning there, and a word
+    #     separator abutting the month made the lookbehind see the separator's
+    #     own last letter and veto the whole range: "Jan 5, 2026 toJun 9, 2026"
+    #     returned nothing at all. It bought no speed either; the first group
+    #     alone is what bounds the scan.
+    #
+    # All three silently change the *stated* dates, which feed the item id.
     rng = re.search(
-        r"([A-Za-z]{3}[a-z]*\.?\s+\d{1,2},?\s*\d{4}|\d{1,2}/\d{1,2}/\d{2,4})"
+        r"((?<![A-Za-z])[A-Za-z]{3}[a-z]*\.?\s+\d{1,2},?\s*\d{4}|\d{1,2}/\d{1,2}/\d{2,4})"
         r"\s*(?:-|–|—|to|through|until)\s*"
         r"([A-Za-z]{3}[a-z]*\.?\s+\d{1,2},?\s*\d{4}|\d{1,2}/\d{1,2}/\d{2,4})",
         text, re.I,
