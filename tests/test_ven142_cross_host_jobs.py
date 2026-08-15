@@ -263,6 +263,68 @@ def test_login_email_cooldown_is_sane_from_any_writer_offset(hosts, worker_tz):
     )
 
 
+@pytest.mark.parametrize("single_host_tz", [WEST, EAST, HALF])
+def test_legacy_naive_stamps_are_unchanged_on_a_single_host_deploy(hosts, single_host_tz):
+    """The "no worse than base" contract, on the topology that actually has legacy rows.
+
+    A naive stamp must be read as the *reader's* wall clock, not as UTC. On the
+    ordinary single-host deploy — one box, one zone, writer and reader identical —
+    naive stamps are already correct, and reading them as UTC would shift every
+    legacy row by that host's offset. For a box in Los Angeles that turns a
+    60-second-old failed login into a 7-hour-old one, silently switching off the
+    FurnishedFinder login-email burst guard on the *ordinary* deploy as the price
+    of fixing the split one.
+
+    Parameterized over a non-UTC host on purpose: at UTC the two readings
+    coincide, so a UTC-only test cannot see this and a mutation to
+    `replace(tzinfo=utc)` survives it.
+    """
+    _reset()
+    tenant = f"t-single-{single_host_tz.replace('/', '-')}"
+    hosts(single_host_tz)             # ONE host: it both writes and reads
+    job = jobs.enqueue(tenant)
+    jobs.set_status(job["id"], jobs.ERROR, "Couldn't verify your FF login.")
+
+    # Rewrite as the PREVIOUS release did: naive local wall clock, 60s ago.
+    legacy = (datetime.now() - timedelta(seconds=60)).isoformat(timespec="seconds")
+    with jobs._conn() as c:
+        c.execute("UPDATE ff_jobs SET updated_at=? WHERE id=?", (legacy, job["id"]))
+
+    remaining = jobs._cooldown_remaining(jobs.latest(tenant))
+    expected = jobs.ERROR_RETRY_COOLDOWN_SECONDS - 60
+    assert abs(remaining - expected) <= 2, (
+        f"a legacy naive stamp 60s old on a single {single_host_tz} host reads as "
+        f"{remaining}s remaining, expected ~{expected}s: naive stamps are no longer "
+        "read as the reader's own wall clock, so the burst guard breaks on the "
+        "ordinary single-host deploy"
+    )
+
+
+def test_future_dated_stamp_still_reads_online_as_before(hosts):
+    """A clock-skewed future stamp must behave exactly as it did on `6f62a57`.
+
+    Base computed `datetime.now() - last <= TTL`, which is True for a negative
+    age, so a future-dated `last_seen` read *online*. This change keeps that
+    (`age <= TTL`) rather than quietly clamping with `abs()`, which would flip a
+    skewed worker to offline and start reaping its live jobs.
+
+    Future-dated stamps from host clock skew are a separate filed defect
+    (VEN-133); this test only pins that VEN-142 does not change the behaviour
+    while passing through.
+    """
+    _reset()
+    hosts(WEB)
+    jobs.heartbeat("w7")
+    ahead = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(timespec="seconds")
+    with jobs._conn() as c:
+        c.execute("UPDATE ff_worker SET last_seen=? WHERE id=1", (ahead,))
+
+    assert jobs.worker_online() is True, (
+        "a future-dated last_seen changed meaning; base read it as online and "
+        "reaping a skewed worker's live jobs is a regression, not a fix"
+    )
+
+
 # --- the mechanism, not just the symptom -----------------------------------
 
 
