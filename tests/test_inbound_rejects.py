@@ -508,6 +508,55 @@ def test_a_retry_whose_store_fails_hands_the_row_back(client, monkeypatch):
     assert inbound_rejects.count_open(tid, SITE) == 1, "the lead must stay visible"
 
 
+def test_recovering_a_reply_threads_it_instead_of_opening_a_second_deal(client, monkeypatch):
+    """Recovery must go onto the board the same way ingest does — threading included.
+
+    A message that continues a conversation joins that deal and never gets one of
+    its own. Recovery that reaches for `pipeline.ensure` directly implements only
+    half of that and opens a duplicate beside the thread: the owner sees the same
+    guest twice and the reply carries none of the original's booking facts.
+
+    The other half of the same mistake is the check: looking only for a deal keyed
+    on the reply's own item id says "not on the board" for a reply that threaded
+    perfectly, so the row is handed back and the operator is told it failed.
+    """
+    tid = _tenant_with_login(client)
+
+    # A real lead opens the conversation.
+    _post(client, tid, body=GOOD_LEAD, subject="New lead from Emma M.")
+    deals = pipeline.all_deals(tid, SITE)
+    assert len(deals) == 1, "precondition: one deal for Emma"
+    parent = deals[0]
+
+    # An unreadable forward lands on the list.
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    # On retry it reads as Emma's reply to that same conversation.
+    from sites import ff_email
+
+    reply = {
+        "kind": "message", "id": "reply-emma-1", "title": "Emma M.",
+        "traveler": "Emma M.",
+        "property_name": parent.get("property_name") or "Quiet Spacious Home in NW DC - Unit 1",
+        "url": "u", "source": "email", "raw": "Is it still available?",
+    }
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body: dict(reply))
+    assert pipeline.find_thread(
+        tid, SITE, pipeline.thread_key(reply), exclude_item_id=reply["id"]
+    ), "precondition: the reply really does belong to Emma's thread"
+
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    after = pipeline.all_deals(tid, SITE)
+    assert len(after) == 1, "a recovered reply must join its thread, not duplicate it"
+    assert after[0]["item_id"] == parent["item_id"]
+    assert inbound_rejects.get(tid, SITE, rid)["status"] == "recovered", (
+        "a reply that threaded correctly must not be reported as still lost"
+    )
+    assert inbound_rejects.count_open(tid, SITE) == 0
+
+
 def test_a_store_failure_alone_still_gets_the_guest_onto_the_board(client, monkeypatch):
     """`store` is a convenience, not the only way onto the board.
 

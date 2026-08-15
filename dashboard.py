@@ -458,7 +458,7 @@ def inbound_rejected_retry(rid):
 
     # Whether the guest is already on the board decides two things below, and it
     # has to be read *before* storing to mean anything.
-    was_on_board = bool(pipeline.get(tenant_id, SITE, item.get("id", "")))
+    was_on_board = inbound.on_board(tenant_id, item, SITE)
 
     try:
         inbound.store(tenant_id, item, SITE)
@@ -466,17 +466,19 @@ def inbound_rejected_retry(rid):
         app.logger.exception("Could not store recovered inbound item")
 
     # `store` is deliberately the scrape's own path, but it commits its dedup row
-    # before opening the deal and swallows a `pipeline.ensure` failure while
-    # still reporting success. That leaves the lead marked seen with nothing on
-    # the board, and every later retry then short-circuits at the dedup and never
-    # reaches `ensure` again — the row reopens forever and the guest can never be
-    # recovered from this page at all. So open the deal directly when it is
-    # missing, rather than trusting either the return value or the dedup.
-    if not pipeline.get(tenant_id, SITE, item.get("id", "")):
+    # before opening the deal and swallows the failure while still reporting
+    # success. That leaves the lead marked seen with nothing on the board, and
+    # every later retry then short-circuits at the dedup and never tries to open
+    # the deal again — the row reopens forever and the guest can never be
+    # recovered from this page at all. So go to the board directly when they
+    # aren't there, rather than trusting the return value or the dedup.
+    #
+    # Via `inbound.open_deal`, not `pipeline.ensure`: half of what that does is
+    # threading a reply onto the conversation it answers, and reimplementing only
+    # the other half opened a second deal beside it.
+    if not inbound.on_board(tenant_id, item, SITE):
         try:
-            pipeline.ensure(
-                tenant_id, SITE, item, None, units=config.get_units(tenant_id)
-            )
+            inbound.open_deal(tenant_id, item, SITE)
         except Exception:
             app.logger.exception("Could not open a deal for recovered inbound item")
 
@@ -484,7 +486,7 @@ def inbound_rejected_retry(rid):
     # the above returned. Hand the row back if they didn't — a message marked
     # recovered with nothing to show for it is the silent loss this page exists
     # to end.
-    if not pipeline.get(tenant_id, SITE, item.get("id", "")):
+    if not inbound.on_board(tenant_id, item, SITE):
         inbound_rejects.reopen(
             tenant_id, SITE, rid, "parsed, but the lead could not be opened"
         )

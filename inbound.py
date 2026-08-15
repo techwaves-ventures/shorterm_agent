@@ -303,8 +303,6 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
     none of the original's booking facts, and the nurture sequence on the
     original kept chasing someone who had just written back.
     """
-    import config
-    import pipeline
     import storage
 
     kind = item.get("kind", "lead")
@@ -312,16 +310,53 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
     if not new_items:
         return False
     try:
-        parent = None
-        if kind == "message":
-            parent = pipeline.find_thread(
-                tenant_id, site, pipeline.thread_key(item),
-                exclude_item_id=item.get("id"))
-        if parent:
-            pipeline.record_guest_reply(tenant_id, site, parent["item_id"])
-        else:
-            pipeline.ensure(tenant_id, site, item, None,
-                            units=config.get_units(tenant_id))
+        open_deal(tenant_id, item, site)
     except Exception:
         log.exception("Could not open a deal for ingested item %s", item.get("id"))
     return True
+
+
+def _thread_parent(tenant_id: str, item: dict, site: str):
+    """The open deal this item continues, or None if it starts its own."""
+    import pipeline
+
+    if item.get("kind", "lead") != "message":
+        return None
+    return pipeline.find_thread(
+        tenant_id, site, pipeline.thread_key(item),
+        exclude_item_id=item.get("id"))
+
+
+def open_deal(tenant_id: str, item: dict, site: str = "furnishedfinder") -> None:
+    """Put an already-deduped item on the board, threading a reply if it is one.
+
+    Split out of `store` so recovery can reach the board without going through
+    the dedup that `store` does first. Recovery cannot simply call
+    `pipeline.ensure`: half of what this does is the *threading*, and a reply
+    that skips it opens a second deal beside the conversation it answers — the
+    duplicate this branching exists to prevent.
+    """
+    import config
+    import pipeline
+
+    parent = _thread_parent(tenant_id, item, site)
+    if parent:
+        pipeline.record_guest_reply(tenant_id, site, parent["item_id"])
+    else:
+        pipeline.ensure(tenant_id, site, item, None,
+                        units=config.get_units(tenant_id))
+
+
+def on_board(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
+    """Whether this item actually reached the board.
+
+    A threaded reply never gets a deal of its own, so looking only for a deal
+    keyed on its item id reports failure for a message that arrived perfectly
+    well — and telling the operator a lead was lost when it wasn't is the same
+    lie as the reverse, pointed the other way.
+    """
+    import pipeline
+
+    if pipeline.get(tenant_id, site, item.get("id", "")):
+        return True
+    return bool(_thread_parent(tenant_id, item, site))
