@@ -302,6 +302,15 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
     became a new deal: the owner saw the same person twice, the reply carried
     none of the original's booking facts, and the nurture sequence on the
     original kept chasing someone who had just written back.
+
+    The dedup row is recorded first — one atomic claim, so two concurrent
+    deliveries of the same message can't both go on to apply it — but it is
+    taken back if the board then refuses the item. Without that, `seen` says
+    "handled" for something that reached nothing: the item is not on the board,
+    no later delivery can put it there because they all short-circuit at the
+    dedup, and the retry page reads that same flag and tells the operator the
+    lead is safe. Whether the board took it is `open_deal`'s to report, not
+    something a caller should infer afterwards from what happens to be there.
     """
     import storage
 
@@ -310,9 +319,20 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
     if not new_items:
         return False
     try:
-        open_deal(tenant_id, item, site)
+        on_board = open_deal(tenant_id, item, site)
     except Exception:
         log.exception("Could not open a deal for ingested item %s", item.get("id"))
+        on_board = False
+    if not on_board:
+        # Nothing landed, so leave no trace claiming otherwise. The item is
+        # then exactly as ingestible as it was a moment ago — a re-delivery or
+        # an operator retry can still put it on the board.
+        storage.forget(tenant_id, site, kind, str(item.get("id", "")))
+        log.warning(
+            "Ingested item %s did not reach the board; released its dedup row "
+            "so it can be ingested again", item.get("id"),
+        )
+        return False
     return True
 
 
@@ -356,31 +376,6 @@ def open_deal(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool
     return bool(pipeline.get(tenant_id, site, item.get("id", "")))
 
 
-def board_mark(tenant_id: str, item: dict, site: str = "furnishedfinder"):
-    """What the board holds for this item right now — a before/after comparison point.
-
-    Asking "is it on the board?" cannot answer "did this message land?" for a
-    threaded reply. The conversation it answers is on the board *before* the
-    attempt runs, so presence is constant-True and a write that failed outright
-    still reads as success — the operator is told a lead is safe when it isn't,
-    which is precisely the silent loss this table exists to end, re-created
-    inside the feature built to end it.
-
-    What actually moves when a reply lands is the parent's `last_guest_reply_at`.
-    So a caller takes a mark before the work and asks `landed`/`advanced` whether
-    it moved, rather than asking whether something is merely there.
-    """
-    import pipeline
-
-    deal = pipeline.get(tenant_id, site, item.get("id", ""))
-    if deal:
-        return ("deal", deal.get("item_id"))
-    parent = _thread_parent(tenant_id, item, site)
-    if parent:
-        return ("thread", parent.get("item_id"), parent.get("last_guest_reply_at"))
-    return None
-
-
 def recover(tenant_id: str, item: dict, site: str = "furnishedfinder") -> tuple[bool, bool]:
     """Put a recovered item on the board. Returns `(already_had_it, on_board)`.
 
@@ -404,10 +399,23 @@ def recover(tenant_id: str, item: dict, site: str = "furnishedfinder") -> tuple[
 
     kind = item.get("kind", "lead")
     if storage.already_seen(tenant_id, site, kind, item.get("id", "")):
-        # Already ingested, so do not write again — only confirm it is really
-        # there. For a lead that is definitive; for a reply the best available
-        # answer is that the conversation it belongs to is on the board.
-        return (True, bool(board_mark(tenant_id, item, site)))
+        # Ingested by an earlier delivery, so do not apply it a second time.
+        #
+        # Nothing further is checked, and that is the point. There is no board
+        # state that answers "did *this message* land?" after the fact: a reply
+        # leaves no deal of its own, so the only thing to look at is the parent
+        # conversation, which was already there before the message arrived and
+        # is gone once the deal closes. Reading it says "safe" for a reply that
+        # never landed, and "lost" for one that landed and was since completed —
+        # wrong in both directions, and the second leaves a row no click can
+        # ever clear.
+        #
+        # The flag itself is the honest answer, because every writer of it now
+        # keeps it honest: `store` releases its dedup row when the board refuses
+        # the item, and the path below marks nothing until the board has taken
+        # it. So `seen` means landed, and this reports it rather than re-deriving
+        # it from something that was never equivalent.
+        return (True, True)
 
     try:
         on_board = open_deal(tenant_id, item, site)
@@ -416,5 +424,18 @@ def recover(tenant_id: str, item: dict, site: str = "furnishedfinder") -> tuple[
         return (False, False)
 
     if on_board:
-        storage.filter_new(tenant_id, site, kind, [item])
+        try:
+            storage.filter_new(tenant_id, site, kind, [item])
+        except Exception:
+            # The lead is on the board. Failing to write the dedup row afterwards
+            # is a bookkeeping loss, not a lead loss, and reporting it as failure
+            # would hand back a row that is actually resolved, tell the operator
+            # the lead was lost, and invite the click that applies the guest's
+            # reply a second time — cancelling a queued follow-up and drafting
+            # again for someone who wrote once. The cost of the other choice is
+            # only that a later re-delivery of this item may be ingested twice.
+            log.exception(
+                "Recovered item %s reached the board but its dedup row could "
+                "not be written; reporting success", item.get("id"),
+            )
     return (False, on_board)

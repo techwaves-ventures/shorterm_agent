@@ -66,6 +66,26 @@ _CAPTURE_REASON = {
     "sender_not_allowed": "Sent from an address we don't recognise as FurnishedFinder.",
 }
 
+# What a failed retry leaves on the row. Every retry ends at the parser, but the
+# parser is not every row's problem: on a `sender_not_allowed` row the host's one
+# actionable fact is the allowlist, and replacing it with parse-flavoured text
+# takes the only thing they could have acted on off their screen while telling
+# them something they can't fix. So the copy stays keyed on why the row was
+# captured, and says what the attempt did without discarding the diagnosis.
+_RETRY_FAILED_REASON = {
+    "unparsed": "Tried again — still couldn't read this email.",
+    "sender_not_allowed": (
+        "Sent from an address we don't recognise as FurnishedFinder. Tried "
+        "reading it anyway, without success — add the sender to keep these."
+    ),
+}
+
+
+def retry_failed_reason(reason_code: str) -> str:
+    """Operator-facing copy for a retry that still could not parse the email."""
+    return _RETRY_FAILED_REASON.get(reason_code or "") or _RETRY_FAILED_REASON["unparsed"]
+
+
 _COLS = (
     "id", "tenant_id", "site", "reason_code", "reason", "subject", "sender",
     "body", "fingerprint", "seen_count", "received_at", "mail_date", "status",
@@ -112,8 +132,26 @@ def _conn() -> db.Conn:
     # Nullable on purpose: rows captured before this can never learn their mail
     # `Date`, and retry falls back to `received_at` for them (see the retry
     # route). A NOT NULL default would invent a stamp that looks authoritative.
+    #
+    # The read above is not a guard on its own: two workers taking their first
+    # post-deploy request both see the column missing and both ALTER. On
+    # Postgres the loser gets `DuplicateColumn`, which aborts the *whole*
+    # transaction — including the `record` upsert about to run on this same
+    # connection — so a lead this table exists to preserve is dropped while the
+    # endpoint still answers 202. Losing that race has to be success, because
+    # the only thing it proves is that the column is there.
     if "mail_date" not in db.table_columns(c, "inbound_rejects"):
-        c.execute("ALTER TABLE inbound_rejects ADD COLUMN mail_date TEXT")
+        if c.pg:
+            c.execute("ALTER TABLE inbound_rejects ADD COLUMN IF NOT EXISTS mail_date TEXT")
+        else:
+            # SQLite has no IF NOT EXISTS for ADD COLUMN, but it also serialises
+            # writers and does not poison the transaction, so the duplicate can
+            # simply be caught and re-checked.
+            try:
+                c.execute("ALTER TABLE inbound_rejects ADD COLUMN mail_date TEXT")
+            except Exception:
+                if "mail_date" not in db.table_columns(c, "inbound_rejects"):
+                    raise
     # Carries the dedup: an identical replay lands on the same row. Also the
     # conflict target of the upsert in `record`, so it must exist first.
     c.execute(

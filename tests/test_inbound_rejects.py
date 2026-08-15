@@ -1231,3 +1231,358 @@ def test_replies_recovered_in_the_same_second_all_land(client, monkeypatch):
     out = [inbound_rejects.get(tid, SITE, r["id"]) for r in rows]
     stuck = [(o["id"], o["reason"]) for o in out if o["status"] != "recovered"]
     assert not stuck, f"every message reached the board, so none may be handed back: {stuck}"
+
+
+# --- Round 7: the review found the `open_deal` refactor left three callers
+# --- still inferring success from presence. These pin each one. --------------
+
+
+def test_a_dedup_write_that_fails_after_the_board_took_the_lead_is_not_a_loss(
+        client, monkeypatch):
+    """F1: the lead is on the board, so the operator must not be told it is lost.
+
+    `recover` marks the item seen *after* the board write, which is the right
+    order — but that write sat outside the `try`, so anything it raised was
+    caught by the route and turned into "couldn't open the lead — try again."
+    `worker.py` shares the SQLite file, so `database is locked` is the ordinary
+    way for it to raise.
+
+    That is the exact inverse of the lie the boolean was introduced to remove:
+    the lead is on the board, the row is handed back saying it isn't, and the
+    draft never runs. It is also what produces F2 — the operator does what the
+    message says, clicks again, and the guest's single reply is applied twice.
+    """
+    import storage
+
+    tid = _tenant_with_login(client)
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: {
+        "kind": "lead", "id": "post-board-fail", "title": "Locked | Emma",
+        "url": "u", "source": "email", "raw": body, "traveler": "Emma",
+        "property_name": "Locked",
+    })
+
+    real_filter_new = storage.filter_new
+
+    def locked(tenant_id, site, kind, items):
+        raise Exception("database is locked")
+
+    monkeypatch.setattr(storage, "filter_new", locked)
+
+    import runner as runner_mod
+
+    drafted = []
+    monkeypatch.setattr(runner_mod, "draft_ingested",
+                        lambda t, s, it: drafted.append(it.get("id")))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    deals = pipeline.all_deals(tid, SITE)
+    assert len(deals) == 1 and deals[0]["item_id"] == "post-board-fail", (
+        "control: the board write itself succeeded, so this test is about what "
+        "we *say* about it"
+    )
+    row = inbound_rejects.get(tid, SITE, rid)
+    assert row["status"] == "recovered", (
+        "the lead reached the board; a failed dedup write afterwards is "
+        f"bookkeeping, not a lost lead. got status={row['status']!r} "
+        f"reason={row['reason']!r}"
+    )
+    assert drafted == ["post-board-fail"], (
+        "a recovered lead still needs its draft — the whole point of recovering it"
+    )
+
+    # F2: with the row correctly resolved there is no instruction to click
+    # again, and the claim stops a stale tab from applying it a second time.
+    monkeypatch.setattr(storage, "filter_new", real_filter_new)
+    client.post(f"/inbound/rejected/{rid}/retry")
+    assert len(pipeline.all_deals(tid, SITE)) == 1, "a second click must not re-apply"
+
+
+def test_an_ingest_that_never_reached_the_board_leaves_no_seen_row(client, monkeypatch):
+    """F3: `store` marked the item seen and swallowed the board failure.
+
+    That flag is what the retry path reads. Leaving it set for something that
+    reached nothing means the message is unreachable forever — every later
+    delivery short-circuits at the dedup — and the review page reports the lead
+    as safe on the strength of the same flag.
+
+    The scenario is this feature's own advertised one: an unreadable forward is
+    captured, the parser fix ships, the email is re-delivered, that delivery hits
+    one transient board failure, and the operator clicks Try again.
+    """
+    import storage
+
+    tid = _tenant_with_login(client)
+
+    # The conversation the reply belongs to.
+    _post(client, tid, body=GOOD_LEAD, subject="New lead from Emma M.")
+    parent = pipeline.all_deals(tid, SITE)[0]
+
+    # Captured while the parser still failed.
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    reply = {
+        "kind": "message", "id": "reply-lost-in-store", "title": "Emma M.",
+        "traveler": "Emma M.",
+        "property_name": parent.get("property_name") or "Quiet Spacious Home in NW DC - Unit 1",
+        "url": "u", "source": "email", "raw": "Any update?",
+    }
+    monkeypatch.setattr(ff_email, "parse",
+                        lambda subject, body, received_at=None: dict(reply))
+
+    # The parser fix ships and the email is re-delivered — but the board write
+    # declines this once. `record_guest_reply` returning None is its ordinary
+    # way of declining (the deal wasn't found), and it does not raise.
+    calls = {"n": 0}
+    real_rgr = pipeline.record_guest_reply
+
+    def flaky(tenant_id, site, item_id, at=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_rgr(tenant_id, site, item_id, at)
+
+    monkeypatch.setattr(pipeline, "record_guest_reply", flaky)
+    _post(client, tid, body="the same email, now parseable")
+
+    assert calls["n"] == 1, "control: the re-delivery really did attempt the board write"
+    assert not storage.already_seen(tid, SITE, "message", "reply-lost-in-store"), (
+        "nothing reached the board, so nothing may claim this message was handled "
+        "— that flag is what every later delivery and the retry page both read"
+    )
+
+    # Try again. The board write works this time, so the reply must actually land.
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    after = pipeline.get(tid, SITE, parent["item_id"])
+    assert after["last_guest_reply_at"], (
+        "the guest's reply must be recorded on the thread — without this the "
+        "row still reads 'recovered' while the nurture sequence keeps chasing "
+        "someone who already wrote back"
+    )
+    assert inbound_rejects.get(tid, SITE, rid)["status"] == "recovered"
+
+
+def test_a_row_whose_thread_has_since_closed_can_still_be_cleared(client, monkeypatch):
+    """F5: 'is the parent still open?' is not 'did this message land?'.
+
+    Same presence test as F3, failing the other way. The message *was* ingested;
+    the deal it joined has since completed, so `find_thread` no longer returns
+    it, and the row is handed back forever asserting a failure that never
+    happened. No injected fault anywhere in this test.
+    """
+    tid = _tenant_with_login(client)
+
+    _post(client, tid, body=GOOD_LEAD, subject="New lead from Emma M.")
+    parent = pipeline.all_deals(tid, SITE)[0]
+
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    reply = {
+        "kind": "message", "id": "reply-then-completed", "title": "Emma M.",
+        "traveler": "Emma M.",
+        "property_name": parent.get("property_name") or "Quiet Spacious Home in NW DC - Unit 1",
+        "url": "u", "source": "email", "raw": "Any update?",
+    }
+    monkeypatch.setattr(ff_email, "parse",
+                        lambda subject, body, received_at=None: dict(reply))
+
+    # Re-delivered and ingested cleanly.
+    _post(client, tid, body="the same email, now parseable")
+    import storage
+    assert storage.already_seen(tid, SITE, "message", "reply-then-completed"), (
+        "precondition: this message really was ingested"
+    )
+
+    # The stay happens and the deal completes.
+    pipeline.update(tid, SITE, parent["item_id"], stage=pipeline.COMPLETED)
+    assert pipeline.find_thread(tid, SITE, pipeline.thread_key(reply)) is None, (
+        "precondition: the thread is no longer open, so presence can't answer"
+    )
+
+    # The operator clears the stale row.
+    for _ in range(3):
+        client.post(f"/inbound/rejected/{rid}/retry")
+
+    row = inbound_rejects.get(tid, SITE, rid)
+    assert row["status"] == "recovered", (
+        "this message was ingested and the operator has no way to change that; "
+        "a row no click can ever clear is the page telling them to keep trying "
+        f"at nothing. got status={row['status']!r} reason={row['reason']!r}"
+    )
+
+
+def test_retry_derives_the_same_message_id_the_webhook_did_without_a_date(
+        client, monkeypatch):
+    """F4: falling back to our own write clock broke parity with the webhook.
+
+    `extract_date` returns `""` when the payload carries no usable `Date`, so
+    that is exactly what the webhook hands the parser. Substituting
+    `received_at` — a clock the webhook never sees — derives a *different* id
+    for the same email, so a later re-delivery of it is no longer recognised as
+    a duplicate: the guest's single reply is applied to the thread twice and a
+    second autopilot answer is queued to someone who wrote once.
+
+    A *message* id is what hashes the stamp; a lead's does not, so this has to
+    be driven with a guest reply or it tests nothing.
+    """
+    import storage
+
+    tid = _tenant_with_login(client)
+
+    from sites import ff_email
+
+    real_parse = ff_email.parse
+
+    # The conversation the reply belongs to.
+    _post(client, tid, body=GOOD_LEAD, subject="New lead from Emma M.")
+    parent = pipeline.all_deals(tid, SITE)[0]
+
+    subject = "New message from Emma M."
+    body = ("Traveler: Emma M.\n"
+            "Property: Quiet Spacious Home in NW DC - Unit 1\n\n"
+            "Any update?\n")
+
+    # Captured with no `Date` at all — the shape that makes the two paths differ.
+    monkeypatch.setattr(ff_email, "parse", lambda *a, **kw: None)
+    _post(client, tid, subject=subject, body=body)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+    assert not inbound_rejects.get(tid, SITE, rid)["mail_date"], (
+        "precondition: no stored mail date, so the fallback is what is under test"
+    )
+
+    # The parser fix ships and the same email is re-forwarded, ingesting normally.
+    monkeypatch.setattr(ff_email, "parse", real_parse)
+    _post(client, tid, subject=subject, body=body)
+    msgs = storage.get_recent(tid, SITE, "message", 10)
+    assert len(msgs) == 1, "precondition: the re-forward ingested exactly one message"
+    webhook_id = msgs[0]["id"]
+
+    stamped = pipeline.get(tid, SITE, parent["item_id"])["last_guest_reply_at"]
+    assert stamped, "precondition: the reply reached the thread"
+
+    import runner as runner_mod
+
+    drafted = []
+    monkeypatch.setattr(runner_mod, "draft_ingested",
+                        lambda t, s, it: drafted.append(it.get("id")))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+
+    # Now the operator retries the stale row for that same email.
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    assert inbound_rejects.get(tid, SITE, rid)["resolved_item_id"] == webhook_id, (
+        "retry must derive the id the webhook derived for the same email, or the "
+        "two paths stop deduplicating each other"
+    )
+    assert len(storage.get_recent(tid, SITE, "message", 10)) == 1, (
+        "one email must not become two ingested messages"
+    )
+    assert drafted == [], (
+        "the guest wrote once; a second autopilot reply must not be queued"
+    )
+
+
+def test_a_lead_the_board_did_not_take_is_reported_as_not_taken(client, monkeypatch):
+    """F9: nothing exercised `open_deal`'s read-back on the *lead* path.
+
+    Round 6 set out to guard exactly this and guarded only the reply half —
+    replacing the read-back with `return True` kept the whole suite green. It is
+    defensive (`pipeline.ensure` raises on failure), but a defence no test
+    touches is a defence that quietly stops working.
+    """
+    import storage
+
+    tid = _tenant_with_login(client)
+    _post(client, tid)
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+
+    from sites import ff_email
+
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: {
+        "kind": "lead", "id": "never-written", "title": "Ghost | Emma", "url": "u",
+        "source": "email", "raw": body, "traveler": "Emma", "property_name": "Ghost",
+    })
+    # `ensure` returns without writing anything — the one thing the read-back
+    # exists to notice.
+    monkeypatch.setattr(pipeline, "ensure", lambda *a, **kw: None)
+
+    assert not inbound.open_deal(tid, {"kind": "lead", "id": "never-written",
+                                       "traveler": "Emma"}, SITE), (
+        "the board has no such deal, so `open_deal` must not claim it took one"
+    )
+
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    row = inbound_rejects.get(tid, SITE, rid)
+    assert row["status"] == "open", (
+        "nothing reached the board, so the row must stay on the operator's list"
+    )
+    assert not storage.already_seen(tid, SITE, "lead", "never-written"), (
+        "a failed attempt must leave nothing behind, or no later retry can work"
+    )
+
+
+def test_a_failed_retry_keeps_the_diagnosis_the_operator_can_act_on(client, monkeypatch):
+    """F8: a `sender_not_allowed` row's real problem is the allowlist.
+
+    Every retry ends at the parser, so writing parse-flavoured copy
+    unconditionally took the one actionable fact off the host's screen and
+    replaced it with one they cannot do anything about.
+    """
+    tid = _tenant_with_login(client)
+    _post(client, tid, body=GOOD_LEAD, sender="alerts@new-ff-domain.com")
+    row = inbound_rejects.open_for_tenant(tid, SITE)[0]
+    assert row["reason_code"] == "sender_not_allowed"
+
+    from sites import ff_email
+
+    monkeypatch.setattr(ff_email, "parse", lambda *a, **kw: None)
+    client.post(f"/inbound/rejected/{row['id']}/retry")
+
+    reason = inbound_rejects.get(tid, SITE, row["id"])["reason"]
+    assert "don't recognise" in reason, (
+        f"the allowlist is what the host can fix; got {reason!r}"
+    )
+
+
+def test_the_mail_date_migration_survives_losing_the_race(monkeypatch):
+    """F6: two workers can both try the `ALTER`, and the loser must not raise.
+
+    On Postgres the loser's `DuplicateColumn` aborts the whole transaction —
+    including the `record` upsert about to run on the same connection — so the
+    endpoint answers 202 with the lead dropped. Simulated here by making the
+    column check miss what is already there, which is precisely what the racing
+    worker saw when it read.
+    """
+    import db
+
+    real_table_columns = db.table_columns
+    seen = {"n": 0}
+
+    def blind_once(conn, table):
+        cols = real_table_columns(conn, table)
+        if table == "inbound_rejects" and seen["n"] == 0:
+            seen["n"] += 1
+            return {c for c in cols if c != "mail_date"}
+        return cols
+
+    monkeypatch.setattr(db, "table_columns", blind_once)
+
+    # Must not raise, and must leave a usable connection behind it.
+    with inbound_rejects._conn() as c:
+        assert "mail_date" in real_table_columns(c, "inbound_rejects")
+        c.execute("SELECT COUNT(*) FROM inbound_rejects").fetchone()
+    assert seen["n"] == 1, "control: the ALTER really was attempted"

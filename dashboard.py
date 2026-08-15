@@ -452,24 +452,36 @@ def inbound_rejected_retry(rid):
     # quoted underneath) recovered onto the *first* message's deal and was
     # silently absorbed while the operator was told it had been recovered.
     #
-    # `received_at` is our own write time rather than the mail date, so it is
-    # only the fallback for rows captured before `mail_date` was stored, and it
-    # is a weak one: it is written to second precision, so two rows captured in
-    # the same second — an ordinary bulk forward — still collapse onto one id.
-    # There is no way to recover a mail Date that was never kept, so the residual
-    # case is logged rather than left silent. It is bounded to rows predating the
-    # column, and this table ships in the same change, so no deployed row has it.
+    # When there is no stored mail date, pass what the webhook passes: nothing.
+    # `extract_date` returns "" when the payload carries no usable `Date`, so an
+    # empty string is the webhook's own input and matching it is what keeps the
+    # two paths deriving the *same* id. Substituting `received_at` here — our own
+    # write clock, which the webhook never sees — derives a different id for the
+    # same email, so a later re-delivery is no longer recognised as a duplicate
+    # and queues a second autopilot reply to a guest who wrote once.
+    #
+    # It is not a useful fallback anyway: it is second-precision, so the bulk
+    # forward it was meant to separate still collapses onto one id. Rows
+    # predating the column are not the narrow case they were described as
+    # either — a brand-new row stores `mail_date=''` whenever the payload has no
+    # date at all, so this is simply the ordinary no-date shape and it is logged
+    # rather than left silent.
     if not row.get("mail_date"):
-        app.logger.warning(
-            "Retrying rejected inbound row %s captured before mail_date existed; "
-            "its message id falls back to our write time and may collide with "
-            "another row captured in the same second", rid,
+        app.logger.info(
+            "Retrying rejected inbound row %s with no stored mail date; its "
+            "message id is derived the same way the webhook derived it, so a "
+            "same-subject re-send may share that id", rid,
         )
     item = ff_email.parse(row["subject"] or "", row["body"] or "",
-                          received_at=row.get("mail_date") or row["received_at"])
+                          received_at=row.get("mail_date") or "")
     if not item:
+        # Keyed on why the row was captured, not on where this attempt stopped:
+        # a row rejected for its sender is an allowlist problem, and saying only
+        # "still couldn't read this email" would replace the fact the host can
+        # act on with one they can't.
         inbound_rejects.update_reason(
-            tenant_id, SITE, rid, "Tried again — still couldn't read this email."
+            tenant_id, SITE, rid,
+            inbound_rejects.retry_failed_reason(row.get("reason_code", "")),
         )
         flash("Still couldn't read that email — it stays on this list.")
         return redirect(url_for("inbound_rejected"))
