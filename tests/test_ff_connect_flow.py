@@ -38,11 +38,25 @@ _FAILURES: list[str] = []
 
 
 def check(cond, msg):
+    """Assert `cond`, in both of this file's run modes.
+
+    This file predates the suite being run under pytest and was written for the
+    standalone `python tests/test_ff_connect_flow.py` mode at the top: collect
+    every failure, print them all, exit non-zero from `main()`. Under pytest,
+    though, `main()` never runs, so recording a failure in `_FAILURES` and
+    returning meant **none of this file's ~66 assertions could fail a test** —
+    the `test_*` functions passed whatever the checks found.
+
+    So: still collect under the standalone runner (a full report beats stopping
+    at the first failure), but raise under pytest, which is the mode CI uses.
+    """
     if cond:
         print(f"  ok  {msg}")
-    else:
-        print(f" FAIL {msg}")
-        _FAILURES.append(msg)
+        return
+    print(f" FAIL {msg}")
+    _FAILURES.append(msg)
+    if "pytest" in sys.modules:
+        raise AssertionError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -323,8 +337,14 @@ def test_ff_login_dialog_invalidates_session_probe():
 
 
 def _expire_worker():
-    from datetime import datetime, timedelta
-    old = (datetime.now() - timedelta(seconds=jobs.WORKER_TTL_SECONDS + 60)).isoformat(timespec="seconds")
+    # Offset-aware, matching what `jobs.heartbeat()` actually writes (VEN-142).
+    # A naive stamp expires the worker just as well, so this looks inert — but it
+    # routes every reap/offline assertion in this file down the legacy-naive
+    # compatibility branch of `_age_seconds`, leaving the shipped path with no
+    # coverage here at all.
+    from datetime import datetime, timedelta, timezone
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=jobs.WORKER_TTL_SECONDS + 60)).isoformat(timespec="seconds")
     with jobs._conn() as c:
         c.execute("UPDATE ff_worker SET last_seen=? WHERE id=1", (old,))
 
