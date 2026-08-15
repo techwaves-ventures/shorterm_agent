@@ -15,7 +15,7 @@ PII), and worker errors are stored as short friendly strings, not raw traces.
 Timestamps are stored as ISO strings we control so worker-liveness math is done
 in Python (portable across SQLite and Postgres, no SQL date arithmetic).
 """
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import crypto
 import db
@@ -62,6 +62,28 @@ STALE_JOB_MESSAGE = (
 
 def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _now_utc() -> str:
+    """An *absolute* stamp, for the one column here compared across processes.
+
+    Every other timestamp in this module is naive local wall-clock, which is
+    fine while a single host both writes and reads it. `last_seen` is not that
+    column: it is written by the *worker* host (`heartbeat`) and read by the
+    *web* host (`worker_online`), and the documented production topology runs
+    those as separate processes over one shared database with nothing pinning
+    `TZ` on either. Comparing a naive stamp across that boundary is off by the
+    offset between the hosts, which always exceeds WORKER_TTL_SECONDS, so the
+    beacon does not degrade -- it inverts. A worker to the east stamps the
+    future, the subtraction goes negative, and a crashed worker reads online
+    forever, which is precisely when the liveness signal is load-bearing:
+    `reap_stale` then never frees its stranded jobs.
+
+    So this column carries its offset. Deliberately narrow, mirroring
+    `outbox._now_utc`: `_now()` is shared with `created_at`/`updated_at`, whose
+    local semantics the UI projection and cooldown depend on.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _age_seconds(value: str | None) -> float | None:
@@ -332,7 +354,7 @@ def consume_otp(job_id: int) -> str | None:
 
 def heartbeat(worker_id: str) -> None:
     """Record that a worker is alive (single-row liveness beacon)."""
-    now = _now()
+    now = _now_utc()
     with _conn() as c:
         c.execute(
             """INSERT INTO ff_worker (id, worker_id, last_seen) VALUES (1, ?, ?)
@@ -352,7 +374,24 @@ def worker_online() -> bool:
         last = datetime.fromisoformat(row[0])
     except ValueError:
         return False
-    return datetime.now() - last <= timedelta(seconds=WORKER_TTL_SECONDS)
+    if last.tzinfo is None:
+        # A stamp written before `last_seen` carried its offset (see
+        # `_now_utc`). It names a wall-clock reading on an unknown host, and
+        # there is no sound way to place it on the timeline. `outbox.py` meets
+        # the same case by declining to judge and restamping absolute, but that
+        # remedy is not available here: the reader is the *web* host, and
+        # restamping a liveness beacon it does not own would forge liveness for
+        # a worker that may already be dead. Declining the other way --
+        # reporting offline -- is just as wrong: `reap_stale` would destroy the
+        # live in-flight jobs of every single-host deploy for the whole rollout
+        # window.
+        #
+        # So fall back to the pre-fix comparison verbatim: wrong across hosts
+        # exactly as it was before, and never newly wrong. This branch is not a
+        # brief crash-guard -- a naive row persists until a NEW-CODE WORKER
+        # heartbeats, so the fix is inert until the worker itself is redeployed.
+        return datetime.now() - last <= timedelta(seconds=WORKER_TTL_SECONDS)
+    return datetime.now(timezone.utc) - last <= timedelta(seconds=WORKER_TTL_SECONDS)
 
 
 # ---------------------------------------------------------------------------
