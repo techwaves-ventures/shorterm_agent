@@ -392,9 +392,13 @@ def inbound_email():
 
     try:
         is_new = inbound.store(tenant_id, item, SITE)
+        # Not "duplicate": `store` also returns False when the item was new and
+        # the board write failed, and calling that a duplicate is how a lead
+        # awaiting backfill reads as routine noise in the log. `store` warns
+        # with the item id on that path, so the distinction is one line above.
         app.logger.info(
             "Inbound %s for tenant %s (%s)",
-            item.get("kind"), tenant_id, "new" if is_new else "duplicate",
+            item.get("kind"), tenant_id, "new" if is_new else "not newly ingested",
         )
         if is_new and os.getenv("ANTHROPIC_API_KEY"):
             # Draft immediately — answering fast is the entire point of taking
@@ -513,10 +517,15 @@ def inbound_rejected_retry(rid):
     # Hand the row back when the guest didn't reach the board — a message marked
     # recovered with nothing to show for it is the silent loss this page exists
     # to end.
+    #
+    # Keyed on why the row was captured, exactly as the parse-failure branch
+    # above is. This attempt stopped somewhere else, but a `sender_not_allowed`
+    # row's actionable fact is still the allowlist, and a hardcoded "try again"
+    # here replaced the one thing the host could do with one they cannot.
     if not on_board:
         inbound_rejects.reopen(
             tenant_id, SITE, rid,
-            "Read this email, but couldn't open the lead — try again.",
+            inbound_rejects.board_failed_reason(row.get("reason_code", "")),
         )
         flash("Read that email, but couldn't open the lead — it stays on this list.")
         return redirect(url_for("inbound_rejected"))

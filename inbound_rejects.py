@@ -37,6 +37,7 @@ this table does not keep.
 """
 import hashlib
 import logging
+import threading
 from datetime import datetime, timezone
 
 import db
@@ -86,6 +87,25 @@ def retry_failed_reason(reason_code: str) -> str:
     return _RETRY_FAILED_REASON.get(reason_code or "") or _RETRY_FAILED_REASON["unparsed"]
 
 
+# What a retry leaves on the row when the email *read* fine and the board write
+# is what failed. Same rule as `_RETRY_FAILED_REASON`, one branch over: the
+# outcome of the attempt is news worth showing, but it is not a reason to delete
+# the diagnosis the row was captured with. A `sender_not_allowed` row still has
+# exactly one thing its host can do about it, and "try again" is not that thing.
+_BOARD_FAILED_REASON = {
+    "unparsed": "Read this email, but couldn't open the lead — try again.",
+    "sender_not_allowed": (
+        "Sent from an address we don't recognise as FurnishedFinder. Read it, but "
+        "couldn't open the lead — try again, and add the sender to keep these."
+    ),
+}
+
+
+def board_failed_reason(reason_code: str) -> str:
+    """Operator-facing copy for a retry that parsed but never reached the board."""
+    return _BOARD_FAILED_REASON.get(reason_code or "") or _BOARD_FAILED_REASON["unparsed"]
+
+
 _COLS = (
     "id", "tenant_id", "site", "reason_code", "reason", "subject", "sender",
     "body", "fingerprint", "seen_count", "received_at", "mail_date", "status",
@@ -107,10 +127,108 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _conn() -> db.Conn:
-    c = db.connect()
-    c.execute(
-        """CREATE TABLE IF NOT EXISTS inbound_rejects (
+# Which database the schema below was verified against, so a process that is
+# repointed at another one (tests do this) re-checks rather than trusting a
+# memo about a different file.
+_schema_ready: str | None = None
+_schema_lock = threading.Lock()
+
+
+def _db_identity() -> str:
+    return f"{db.backend()}\x00{db.database_url()}\x00{db.DB_PATH}"
+
+
+def _table_exists(c: db.Conn) -> bool:
+    return bool(db.table_columns(c, "inbound_rejects"))
+
+
+def _has_mail_date(c: db.Conn) -> bool:
+    return "mail_date" in db.table_columns(c, "inbound_rejects")
+
+
+def _index_exists(c: db.Conn, name: str) -> bool:
+    if c.pg:
+        row = c.execute(
+            "SELECT 1 FROM pg_class WHERE relname=? AND relkind='i'", (name,)
+        ).fetchone()
+    else:
+        row = c.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?", (name,)
+        ).fetchone()
+    return bool(row)
+
+
+def _add_mail_date(c: db.Conn) -> None:
+    # Added after the table shipped, so existing deployments need the migration.
+    # Nullable on purpose: rows captured before this can never learn their mail
+    # `Date`, and retry falls back to `received_at` for them (see the retry
+    # route). A NOT NULL default would invent a stamp that looks authoritative.
+    if c.pg:
+        c.execute("ALTER TABLE inbound_rejects ADD COLUMN IF NOT EXISTS mail_date TEXT")
+    else:
+        # SQLite has no IF NOT EXISTS for ADD COLUMN; the caller re-checks.
+        c.execute("ALTER TABLE inbound_rejects ADD COLUMN mail_date TEXT")
+
+
+def _ensure_object(exists, apply) -> None:
+    """Create one schema object on a connection of its own.
+
+    Each attempt is its own short transaction that carries *no* DML, which is
+    the entire point — see `_ensure_schema`. Losing a create race is success,
+    because the only thing it proves is that the object is there; but that is
+    checked rather than assumed, so a genuinely broken migration still raises
+    instead of leaving `record` to fail on every later write.
+    """
+    last = None
+    for _ in range(3):
+        with db.connect() as c:
+            if exists(c):
+                return
+        try:
+            with db.connect() as c:
+                apply(c)
+            return
+        except Exception as exc:
+            # Another process got there first (or is mid-commit): re-check on a
+            # fresh transaction, which blocks until the winner is done.
+            last = exc
+    with db.connect() as c:
+        if exists(c):
+            return
+    raise last
+
+
+def _ensure_schema() -> None:
+    """Put the table, column and indexes in place — once per process, never in a write.
+
+    This deliberately does *not* run per connection, the pattern the rest of the
+    app uses. `record` runs its upsert and `_prune` inside one transaction, and
+    DDL sharing that transaction is a live lead-loss window on Postgres: a
+    concurrent `CREATE INDEX IF NOT EXISTS` takes a ShareLock on the table *even
+    when the index already exists*, which conflicts with the RowExclusiveLock
+    another request's upsert holds. Four concurrent processes measured 12/32
+    `record()` calls raising `DeadlockDetected` in the steady state where every
+    object already exists — a permanent condition, not a deploy-window one — and
+    the ingress swallows that, answers 202, and the lead this table exists to
+    preserve is dropped. Hoisting the DDL out and changing nothing else: 0/32.
+
+    So the request path gets a plain connection, and in the steady state the
+    cost of this is a memo lookup: after the first call, no DDL statement is
+    issued at all — not even an idempotent one.
+    """
+    global _schema_ready
+
+    want = _db_identity()
+    if _schema_ready == want:
+        return
+    with _schema_lock:
+        if _schema_ready == want:
+            return
+        # Every statement stays a literal at its `.execute()` call: the
+        # portability lint reads them out of the AST, and SQL routed through a
+        # variable is SQL it cannot check.
+        _ensure_object(_table_exists, lambda c: c.execute(
+            """CREATE TABLE IF NOT EXISTS inbound_rejects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             tenant_id TEXT NOT NULL,
             site TEXT NOT NULL,
@@ -126,45 +244,30 @@ def _conn() -> db.Conn:
             status TEXT NOT NULL DEFAULT 'open',
             resolved_at TEXT,
             resolved_item_id TEXT
-        )"""
-    )
-    # Added after the table shipped, so existing deployments need the migration.
-    # Nullable on purpose: rows captured before this can never learn their mail
-    # `Date`, and retry falls back to `received_at` for them (see the retry
-    # route). A NOT NULL default would invent a stamp that looks authoritative.
-    #
-    # The read above is not a guard on its own: two workers taking their first
-    # post-deploy request both see the column missing and both ALTER. On
-    # Postgres the loser gets `DuplicateColumn`, which aborts the *whole*
-    # transaction — including the `record` upsert about to run on this same
-    # connection — so a lead this table exists to preserve is dropped while the
-    # endpoint still answers 202. Losing that race has to be success, because
-    # the only thing it proves is that the column is there.
-    if "mail_date" not in db.table_columns(c, "inbound_rejects"):
-        if c.pg:
-            c.execute("ALTER TABLE inbound_rejects ADD COLUMN IF NOT EXISTS mail_date TEXT")
-        else:
-            # SQLite has no IF NOT EXISTS for ADD COLUMN, but it also serialises
-            # writers and does not poison the transaction, so the duplicate can
-            # simply be caught and re-checked.
-            try:
-                c.execute("ALTER TABLE inbound_rejects ADD COLUMN mail_date TEXT")
-            except Exception:
-                if "mail_date" not in db.table_columns(c, "inbound_rejects"):
-                    raise
-    # Carries the dedup: an identical replay lands on the same row. Also the
-    # conflict target of the upsert in `record`, so it must exist first.
-    c.execute(
-        """CREATE UNIQUE INDEX IF NOT EXISTS ix_inbound_rejects_fp
-           ON inbound_rejects (tenant_id, site, fingerprint)"""
-    )
-    # Every read here is tenant-scoped, and the dashboard counts open rows on
-    # each load, so the scoping columns carry their own index.
-    c.execute(
-        """CREATE INDEX IF NOT EXISTS ix_inbound_rejects_tenant
-           ON inbound_rejects (tenant_id, site, status)"""
-    )
-    return c
+        )"""))
+        _ensure_object(_has_mail_date, _add_mail_date)
+        # Carries the dedup: an identical replay lands on the same row. Also the
+        # conflict target of `record`'s upsert, so it must exist before any write.
+        _ensure_object(
+            lambda c: _index_exists(c, "ix_inbound_rejects_fp"),
+            lambda c: c.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS ix_inbound_rejects_fp
+                   ON inbound_rejects (tenant_id, site, fingerprint)"""),
+        )
+        # Every read here is tenant-scoped and the dashboard counts open rows on
+        # each load, so the scoping columns carry their own index.
+        _ensure_object(
+            lambda c: _index_exists(c, "ix_inbound_rejects_tenant"),
+            lambda c: c.execute(
+                """CREATE INDEX IF NOT EXISTS ix_inbound_rejects_tenant
+                   ON inbound_rejects (tenant_id, site, status)"""),
+        )
+        _schema_ready = want
+
+
+def _conn() -> db.Conn:
+    _ensure_schema()
+    return db.connect()
 
 
 def _row(r) -> dict:

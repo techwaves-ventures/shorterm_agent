@@ -1304,13 +1304,17 @@ def test_a_dedup_write_that_fails_after_the_board_took_the_lead_is_not_a_loss(
     assert len(pipeline.all_deals(tid, SITE)) == 1, "a second click must not re-apply"
 
 
-def test_an_ingest_that_never_reached_the_board_leaves_no_seen_row(client, monkeypatch):
-    """F3: `store` marked the item seen and swallowed the board failure.
+def test_an_ingest_that_never_reached_the_board_stays_recoverable(client, monkeypatch):
+    """F3, corrected by review #3: report the board failure, keep the item.
 
-    That flag is what the retry path reads. Leaving it set for something that
-    reached nothing means the message is unreachable forever — every later
-    delivery short-circuits at the dedup — and the review page reports the lead
-    as safe on the strength of the same flag.
+    `store` swallowing the failure and reporting success was the original defect
+    and the return value below still fixes it. Releasing the dedup row on the way
+    out is a *second* defect wearing the first one's clothes: the provider has
+    already been answered 202 and never redelivers, and the email parsed so it
+    never reaches this table either — so the stored item is the last route back.
+    `storage.all_items` feeds `pipeline.backfill`, which the dashboard runs on
+    every load and which threads a reply to its parent exactly as ingest does.
+    Deleting it converts a transient outage into permanent silent lead loss.
 
     The scenario is this feature's own advertised one: an unreadable forward is
     captured, the parser fix ships, the email is re-delivered, that delivery hits
@@ -1355,20 +1359,29 @@ def test_an_ingest_that_never_reached_the_board_leaves_no_seen_row(client, monke
     _post(client, tid, body="the same email, now parseable")
 
     assert calls["n"] == 1, "control: the re-delivery really did attempt the board write"
-    assert not storage.already_seen(tid, SITE, "message", "reply-lost-in-store"), (
-        "nothing reached the board, so nothing may claim this message was handled "
-        "— that flag is what every later delivery and the retry page both read"
+    assert not pipeline.get(tid, SITE, parent["item_id"])["last_guest_reply_at"], (
+        "precondition: the board really did decline the reply"
+    )
+    assert storage.all_items(tid, SITE).get("reply-lost-in-store"), (
+        "the stored item is the only route back onto the board once the provider "
+        "has been answered 202 — deleting it loses the guest permanently"
     )
 
-    # Try again. The board write works this time, so the reply must actually land.
-    client.post(f"/inbound/rejected/{rid}/retry")
+    # The outage clears and the operator simply looks at their board.
+    assert client.get("/dashboard").status_code == 200
 
     after = pipeline.get(tid, SITE, parent["item_id"])
     assert after["last_guest_reply_at"], (
         "the guest's reply must be recorded on the thread — without this the "
-        "row still reads 'recovered' while the nurture sequence keeps chasing "
-        "someone who already wrote back"
+        "nurture sequence keeps chasing someone who already wrote back"
     )
+
+    # Try again. The reply is already on the thread, so this must clear the row
+    # without applying it a second time — a re-apply cancels the queued
+    # follow-up and drafts a second answer to a guest who wrote once.
+    client.post(f"/inbound/rejected/{rid}/retry")
+
+    assert calls["n"] == 2, "the reply must not be applied to the thread twice"
     assert inbound_rejects.get(tid, SITE, rid)["status"] == "recovered"
 
 
@@ -1561,28 +1574,163 @@ def test_a_failed_retry_keeps_the_diagnosis_the_operator_can_act_on(client, monk
 def test_the_mail_date_migration_survives_losing_the_race(monkeypatch):
     """F6: two workers can both try the `ALTER`, and the loser must not raise.
 
-    On Postgres the loser's `DuplicateColumn` aborts the whole transaction —
-    including the `record` upsert about to run on the same connection — so the
-    endpoint answers 202 with the lead dropped. Simulated here by making the
-    column check miss what is already there, which is precisely what the racing
-    worker saw when it read.
+    Simulated by making the column check miss what is already there, which is
+    precisely what the racing worker saw when it read. The migration now runs
+    from `_ensure_schema` on a connection of its own rather than per `_conn()`,
+    so losing the race can no longer abort anything but itself — but it still
+    has to end with the column present rather than propagating.
     """
     import db
 
     real_table_columns = db.table_columns
-    seen = {"n": 0}
+    attempted = {"n": 0}
 
-    def blind_once(conn, table):
+    def blind_until_altered(conn, table):
         cols = real_table_columns(conn, table)
-        if table == "inbound_rejects" and seen["n"] == 0:
-            seen["n"] += 1
+        if table == "inbound_rejects" and attempted["n"] == 0:
             return {c for c in cols if c != "mail_date"}
         return cols
 
-    monkeypatch.setattr(db, "table_columns", blind_once)
+    real_add = inbound_rejects._add_mail_date
 
-    # Must not raise, and must leave a usable connection behind it.
+    def counting_add(c):
+        attempted["n"] += 1
+        return real_add(c)  # the column is really there, so this really loses
+
+    monkeypatch.setattr(db, "table_columns", blind_until_altered)
+    monkeypatch.setattr(inbound_rejects, "_add_mail_date", counting_add)
+    # Re-run the once-per-process schema check rather than trust its memo.
+    monkeypatch.setattr(inbound_rejects, "_schema_ready", None)
+
+    # Must not raise, and must leave a usable database behind it.
     with inbound_rejects._conn() as c:
         assert "mail_date" in real_table_columns(c, "inbound_rejects")
         c.execute("SELECT COUNT(*) FROM inbound_rejects").fetchone()
-    assert seen["n"] == 1, "control: the ALTER really was attempted"
+    assert attempted["n"] == 1, "control: the ALTER really was attempted and lost"
+
+
+def test_a_lead_whose_board_write_fails_is_healed_by_the_next_dashboard_load(
+        client, monkeypatch):
+    """A lead that parsed must never be destroyed by a transient board failure.
+
+    `store` records its dedup row first, then opens the deal. Releasing that row
+    when the board write fails looks tidy and is permanent lead loss: the
+    provider was already answered 202 and never redelivers, the email *parsed*
+    so it never reaches `inbound_rejects` either, and deleting the stored item
+    removes the last route back — `storage.all_items` feeds `pipeline.backfill`,
+    which the dashboard runs on every load and opens a deal for any stored item
+    that has none.
+
+    The injected fault is the ordinary one: `worker.py` writes the same SQLite
+    file, so "database is locked" out of `pipeline.ensure` is what this really
+    looks like in production.
+    """
+    import pipeline as pipeline_mod
+    import storage
+
+    tid = _tenant_with_login(client)
+
+    down = {"yes": True}
+    real_ensure = pipeline_mod.ensure
+
+    def flaky(*a, **kw):
+        if down["yes"]:
+            raise RuntimeError("database is locked")
+        return real_ensure(*a, **kw)
+
+    monkeypatch.setattr(pipeline_mod, "ensure", flaky)
+
+    assert _post(client, tid, body=GOOD_LEAD).status_code == 202
+
+    # Precondition: the board really did refuse it, so what follows is about
+    # recovery and not about a write that quietly succeeded.
+    assert len(pipeline.all_deals(tid, SITE)) == 0, "precondition: no deal was opened"
+    assert inbound_rejects.count_open(tid, SITE) == 0, (
+        "precondition: it parsed, so no reject row can catch this one"
+    )
+
+    items = storage.all_items(tid, SITE)
+    assert items, "the stored item is the only thing backfill can heal from"
+
+    # The outage clears; the operator simply looks at their board.
+    down["yes"] = False
+    assert client.get("/dashboard").status_code == 200
+
+    assert len(pipeline.all_deals(tid, SITE)) == 1, (
+        "the lead was parseable and is now unreachable by any path"
+    )
+
+
+def test_a_failed_board_write_keeps_the_allowlist_fact_on_the_row(client, monkeypatch):
+    """The same rule the parse-failure branch follows, one branch over.
+
+    A row captured for its *sender* has exactly one thing its host can act on.
+    Overwriting `reason` with a generic "couldn't open the lead — try again"
+    when the board write fails takes that off their screen and replaces it with
+    something they cannot fix.
+    """
+    import pipeline as pipeline_mod
+
+    tid = _tenant_with_login(client)
+    _post(client, tid, body=GOOD_LEAD, sender="alerts@new-ff-domain.com")
+    row = inbound_rejects.open_for_tenant(tid, SITE)[0]
+    assert row["reason_code"] == "sender_not_allowed", "precondition"
+
+    from sites import ff_email
+
+    monkeypatch.setattr(ff_email, "parse", lambda subject, body, received_at=None: {
+        "kind": "lead", "id": "allow-1", "title": "Allow | Emma", "url": "u",
+        "source": "email", "raw": body, "traveler": "Emma", "property_name": "Allow",
+    })
+    monkeypatch.setattr(pipeline_mod, "ensure", lambda *a, **kw: (_ for _ in ()).throw(
+        RuntimeError("database is locked")
+    ))
+
+    client.post(f"/inbound/rejected/{row['id']}/retry")
+
+    after = inbound_rejects.get(tid, SITE, row["id"])
+    assert after["status"] == "open", "precondition: the row was handed back"
+    assert "don't recognise" in after["reason"], (
+        f"the allowlist is the only actionable fact here; got {after['reason']!r}"
+    )
+
+
+def test_recording_a_reject_issues_no_ddl_on_the_write_connection(client, monkeypatch):
+    """The steady-state Postgres deadlock, in the form SQLite can still see.
+
+    `record` runs its upsert and `_prune` inside one transaction. When `_conn`
+    also issues `CREATE TABLE/INDEX IF NOT EXISTS` on that same connection, two
+    concurrent requests deadlock on Postgres *even though every object already
+    exists*: `CREATE INDEX IF NOT EXISTS` takes a ShareLock on the table, which
+    conflicts with the RowExclusiveLock the other transaction's upsert holds.
+    Measured on a real PG 16 cluster with 4 concurrent processes: 12 of 32
+    `record()` calls raised `DeadlockDetected`, the ingress swallowed it, and 12
+    leads were dropped behind a 202. With the DDL hoisted out: 0 of 32.
+
+    This suite is SQLite-only, so it cannot reproduce that deadlock — it pins
+    the property that removes it instead: after the schema is in place, the
+    request path issues no DDL at all.
+    """
+    import db
+
+    tid = _tenant()
+    # Warm the schema the way the first request of a process does. Everything
+    # below is therefore the steady state, which is the permanent condition and
+    # the whole point — a deploy-window race would be a far weaker finding.
+    _post(client, tid, body=DIGEST, subject="warm-up")
+
+    seen = []
+    real_execute = db.Conn.execute
+
+    def spy(self, sql, params=()):
+        seen.append(" ".join(str(sql).split())[:60])
+        return real_execute(self, sql, params)
+
+    monkeypatch.setattr(db.Conn, "execute", spy)
+
+    assert _post(client, tid, body=DIGEST + " second", subject="lost lead").status_code == 202
+
+    assert inbound_rejects.count_open(tid, SITE) == 2, "precondition: the row was written"
+    ddl = [s for s in seen
+           if s.upper().startswith(("CREATE ", "ALTER ", "DROP "))]
+    assert ddl == [], f"DDL in the request path is what deadlocks Postgres: {ddl}"

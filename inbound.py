@@ -304,13 +304,23 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
     original kept chasing someone who had just written back.
 
     The dedup row is recorded first — one atomic claim, so two concurrent
-    deliveries of the same message can't both go on to apply it — but it is
-    taken back if the board then refuses the item. Without that, `seen` says
-    "handled" for something that reached nothing: the item is not on the board,
-    no later delivery can put it there because they all short-circuit at the
-    dedup, and the retry page reads that same flag and tells the operator the
-    lead is safe. Whether the board took it is `open_deal`'s to report, not
-    something a caller should infer afterwards from what happens to be there.
+    deliveries of the same message can't both go on to apply it — and it is
+    *kept* even when the board then refuses the item. That row is not only a
+    dedup marker: `storage.all_items` reads its payload and the dashboard runs
+    `pipeline.backfill` over that on every load and every board poll, opening a
+    deal for any stored item that has none. A transient board failure — a
+    locked SQLite file while the worker writes, say — therefore heals itself the
+    next time anyone looks at the board, and threading survives with it, because
+    `backfill` joins a reply to its parent exactly as this path does.
+
+    Releasing the claim instead is what would make the loss permanent. The
+    provider is answered 202 and never redelivers, so deleting the row leaves a
+    lead that parsed perfectly with no deal, no stored item and no route back
+    onto the board — and no `inbound_rejects` row either, since that table is
+    only reached from the `except Rejected` branch and this email did not fail
+    to parse. Whether the board took it is still `open_deal`'s to report and the
+    return value below says so honestly; what state to keep is a separate
+    question from what to tell the caller.
     """
     import storage
 
@@ -324,13 +334,14 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
         log.exception("Could not open a deal for ingested item %s", item.get("id"))
         on_board = False
     if not on_board:
-        # Nothing landed, so leave no trace claiming otherwise. The item is
-        # then exactly as ingestible as it was a moment ago — a re-delivery or
-        # an operator retry can still put it on the board.
-        storage.forget(tenant_id, site, kind, str(item.get("id", "")))
+        # Report the failure, keep the payload. The stored item is what
+        # `pipeline.backfill` heals from on the next dashboard load or board
+        # poll; dropping the dedup row here would delete the only remaining
+        # route back onto the board, because the 202 already told the provider
+        # not to redeliver.
         log.warning(
-            "Ingested item %s did not reach the board; released its dedup row "
-            "so it can be ingested again", item.get("id"),
+            "Ingested item %s did not reach the board; kept its stored item so "
+            "the next dashboard load can backfill a deal for it", item.get("id"),
         )
         return False
     return True
@@ -425,11 +436,14 @@ def recover(tenant_id: str, item: dict, site: str = "furnishedfinder") -> tuple[
         # wrong in both directions, and the second leaves a row no click can
         # ever clear.
         #
-        # The flag itself is the honest answer, because every writer of it now
-        # keeps it honest: `store` releases its dedup row when the board refuses
-        # the item, and the path below marks nothing until the board has taken
-        # it. So `seen` means landed, and this reports it rather than re-deriving
-        # it from something that was never equivalent.
+        # `seen` does not mean "landed" — `store` keeps its row even when the
+        # board refuses the item — and this still reports on_board, because the
+        # stored payload is precisely what `pipeline.backfill` opens a deal from
+        # on every dashboard load and board poll. So a seen item is either on
+        # the board already or is one page load away from it, without anyone
+        # clicking anything; what it is not is lost, which is the only question
+        # this review row exists to answer. The path below marks nothing until
+        # the board has taken it, so the flag is never set by a failed attempt.
         return (True, True)
 
     try:
