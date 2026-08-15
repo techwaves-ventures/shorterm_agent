@@ -1,0 +1,192 @@
+{# The list the operator manages from. One row per conversation, one state per
+   row, every filter in the URL so a view can be bookmarked and shared. #}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inbox — Shorterm</title>
+  {% include "_theme.html" %}
+  <style>
+    .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px;
+      border-bottom: 1px solid var(--border); padding-bottom: 12px; }
+    .tab { display: inline-flex; align-items: center; gap: 7px; padding: 7px 13px;
+      border-radius: var(--radius-pill); border: 1px solid var(--border);
+      background: var(--surface); color: var(--muted); font-size: .87rem;
+      font-weight: 550; white-space: nowrap; }
+    .tab:hover { text-decoration: none; background: var(--surface-2); color: var(--text); }
+    .tab.is-active { background: var(--brand-soft); border-color: var(--brand-line);
+      color: var(--brand-2); }
+    .tab__n { font-variant-numeric: tabular-nums; font-size: .78rem; padding: 1px 7px;
+      border-radius: var(--radius-pill); background: var(--surface-3); color: var(--muted); }
+    .tab.is-active .tab__n { background: #fff; color: var(--brand-2); }
+
+    .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end;
+      margin-bottom: 18px; }
+    .filters .f { display: flex; flex-direction: column; gap: 5px; }
+    .filters label { font-size: .76rem; color: var(--faint); font-weight: 600;
+      text-transform: uppercase; letter-spacing: .04em; }
+    .filters select, .filters input { margin: 0; }
+    .filters .f--q { flex: 1 1 220px; }
+
+    .row { display: flex; gap: 14px; align-items: flex-start; padding: 15px 18px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); margin-bottom: 9px; }
+    .row:hover { border-color: var(--border-2); box-shadow: var(--shadow-sm); }
+    .row__main { flex: 1; min-width: 0; }
+    .row__top { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+    .row__who { font-weight: 650; font-size: .97rem; }
+    .row__who a { color: var(--text); }
+    .row__title { color: var(--muted); font-size: .86rem; margin-top: 4px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .row__meta { color: var(--faint); font-size: .78rem; margin-top: 6px;
+      display: flex; gap: 12px; flex-wrap: wrap; }
+    .row__side { flex: 0 0 auto; text-align: right; display: flex;
+      flex-direction: column; gap: 7px; align-items: flex-end; }
+
+    .pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px;
+      border-radius: var(--radius-pill); font-size: .74rem; font-weight: 650;
+      border: 1px solid var(--border); background: var(--surface-2); color: var(--muted); }
+    .pill--needs_you     { background: var(--warn-soft);  color: var(--warn);
+                           border-color: rgba(180,120,10,.35); }
+    .pill--guest_replied { background: var(--brand-soft); color: var(--brand-2);
+                           border-color: var(--brand-line); }
+    .pill--awaiting_guest{ background: var(--surface-3); color: var(--muted); }
+    .pill--scheduled     { background: var(--surface-3); color: var(--muted); }
+    .pill--closed        { background: var(--ok-soft);   color: var(--ok);
+                           border-color: rgba(23,122,69,.30); }
+    .pill--kind { text-transform: capitalize; }
+
+    .pager { display: flex; gap: 10px; align-items: center; justify-content: center;
+      margin-top: 22px; color: var(--muted); font-size: .87rem; }
+    .empty { text-align: center; padding: 56px 24px; color: var(--muted);
+      background: var(--surface); border: 1px dashed var(--border-2);
+      border-radius: var(--radius-lg); }
+    .empty h3 { font-size: 1.02rem; color: var(--text); margin-bottom: 6px; }
+
+    @media (max-width: 640px) {
+      .row { flex-direction: column; }
+      .row__side { flex-direction: row; align-items: center; text-align: left; }
+      .filters .f, .filters .f--q { flex: 1 1 100%; }
+    }
+  </style>
+</head>
+<body>
+  {% include "_appnav.html" %}
+  <main class="app-main">
+
+    <div class="page-head">
+      <h1>Inbox</h1>
+      <p>Every lead and message in one place. {{ total }} conversation{{ '' if total == 1 else 's' }} {{ 'matches' if total == 1 else 'match' }} this view.</p>
+    </div>
+
+    {# Tabs carry the current kind/unit/search so switching state doesn't reset
+       the rest of the filter — the counts are for the filtered set, not the page. #}
+    {% set base = {'kind': filters.kind, 'unit': filters.unit, 'q': filters.q} %}
+    <nav class="tabs" aria-label="Filter by state">
+      <a class="tab {{ 'is-active' if not filters.state }}"
+         href="{{ url_for('inbox', **base) }}">
+        All <span class="tab__n">{{ counts['all'] }}</span>
+      </a>
+      {% for value, label in states %}
+        <a class="tab {{ 'is-active' if filters.state == value }}"
+           href="{{ url_for('inbox', state=value, **base) }}">
+          {{ label }} <span class="tab__n">{{ counts[value] }}</span>
+        </a>
+      {% endfor %}
+    </nav>
+
+    <form class="filters" method="get" action="{{ url_for('inbox') }}">
+      <input type="hidden" name="state" value="{{ filters.state }}">
+      <div class="f">
+        <label for="f-kind">Type</label>
+        <select id="f-kind" name="kind">
+          <option value="all" {{ 'selected' if filters.kind == 'all' }}>Leads &amp; messages</option>
+          <option value="lead" {{ 'selected' if filters.kind == 'lead' }}>Leads only</option>
+          <option value="message" {{ 'selected' if filters.kind == 'message' }}>Messages only</option>
+        </select>
+      </div>
+      <div class="f">
+        <label for="f-unit">Property</label>
+        <select id="f-unit" name="unit">
+          <option value="">All properties</option>
+          {% for u in units %}
+            <option value="{{ u.id }}" {{ 'selected' if filters.unit == u.id|string }}>
+              {{ u.name or u.id }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="f f--q">
+        <label for="f-q">Guest</label>
+        <input id="f-q" name="q" value="{{ filters.q }}" placeholder="Search by guest name…">
+      </div>
+      <div class="f">
+        <button type="submit" class="btn btn--primary">Apply</button>
+      </div>
+      {% if filters.kind != 'all' or filters.unit or filters.q %}
+        <div class="f">
+          <a class="btn btn--ghost" href="{{ url_for('inbox', state=filters.state) }}">Clear</a>
+        </div>
+      {% endif %}
+    </form>
+
+    {% if rows %}
+      {% for r in rows %}
+        <article class="row">
+          <div class="row__main">
+            <div class="row__top">
+              <span class="row__who">
+                <a href="{{ url_for('thread', item_id=r.id) }}">{{ r.deal.guest_name or 'Unknown guest' }}</a>
+              </span>
+              <span class="pill pill--kind">{{ r.deal.kind or 'lead' }}</span>
+              {% if r.deal.notes %}<span class="pill" title="{{ r.deal.notes }}">Note</span>{% endif %}
+            </div>
+            <div class="row__title">{{ r.title }}</div>
+            <div class="row__meta">
+              <span>{{ r.stage_label }}</span>
+              {% if r.deal.check_in %}<span>Check-in {{ r.deal.check_in }}</span>{% endif %}
+              {% if r.deal.unit_id %}<span>{{ r.deal.unit_id }}</span>{% endif %}
+              {% if r.deal.next_action_at %}<span>Next step {{ r.deal.next_action_at[:10] }}</span>{% endif %}
+            </div>
+          </div>
+          <div class="row__side">
+            <span class="pill pill--{{ r.state }}">{{ r.state_label }}</span>
+            <span class="faint" style="font-size:.78rem">{{ r.age }}</span>
+            <a class="btn btn--ghost btn--sm" href="{{ url_for('thread', item_id=r.id) }}">Open</a>
+          </div>
+        </article>
+      {% endfor %}
+
+      {% if pages > 1 %}
+        {# per_page rides along, or paging out of a custom page size silently
+           snaps back to the default and the row you were looking at moves. #}
+        {% set p = {'state': filters.state, 'kind': filters.kind,
+                    'unit': filters.unit, 'q': filters.q, 'per_page': per_page} %}
+        <nav class="pager" aria-label="Pagination">
+          {% if page > 1 %}
+            <a class="btn btn--ghost btn--sm" href="{{ url_for('inbox', page=page-1, **p) }}">← Previous</a>
+          {% endif %}
+          <span>Page {{ page }} of {{ pages }}</span>
+          {% if page < pages %}
+            <a class="btn btn--ghost btn--sm" href="{{ url_for('inbox', page=page+1, **p) }}">Next →</a>
+          {% endif %}
+        </nav>
+      {% endif %}
+    {% else %}
+      <div class="empty">
+        <h3>Nothing here</h3>
+        <p>
+          {% if filters.state or filters.q or filters.unit or filters.kind != 'all' %}
+            No conversation matches this filter.
+            <a href="{{ url_for('inbox') }}">Show everything</a>.
+          {% else %}
+            Leads and messages appear here as they arrive.
+          {% endif %}
+        </p>
+      </div>
+    {% endif %}
+
+  </main>
+</body>
+</html>

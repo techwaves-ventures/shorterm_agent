@@ -570,11 +570,27 @@
       async function approveMsg(mid) {
         const ta = document.getElementById("ob-" + mid);
         const res = await postForm(`/outbox/${mid}/approve`, { text: ta ? ta.value : "" });
-        if (res.ok) location.reload();
+        if (res.ok) { location.reload(); return; }
+        // The server refuses to release a message that has already been sent,
+        // is in flight, or was cancelled. Say so and refresh: this button gets
+        // clicked from a stale tab or a back-button replay, and silence reads
+        // as a broken button rather than as the guard doing its job.
+        setMsg("ob-" + mid, res.already
+          ? `Not sent again — already "${res.error}". Refreshing…`
+          : (res.error || "Could not approve this message."), "err");
+        if (res.already) setTimeout(() => location.reload(), 2000);
       }
       async function cancelMsg(mid) {
         const res = await postForm(`/outbox/${mid}/cancel`, {});
-        if (res.ok) location.reload();
+        if (res.ok) { location.reload(); return; }
+        // The server refuses to call off a message that has already been sent —
+        // cancelling one drops it out of the sent history and re-arms a second
+        // delivery. Same stale-tab and back-button replays as approve, so say
+        // so rather than leaving the button looking broken.
+        setMsg("ob-" + mid, res.already
+          ? `Not cancelled — already "${res.error}". Refreshing…`
+          : (res.error || "Could not cancel this message."), "err");
+        if (res.already) setTimeout(() => location.reload(), 2000);
       }
 
       async function runAgent(btn) {

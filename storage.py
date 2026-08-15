@@ -204,6 +204,33 @@ def all_items(tenant_id: str, site: str) -> dict[str, dict]:
     return out
 
 
+def items_by_ids(tenant_id: str, site: str, item_ids) -> dict[str, dict]:
+    """Stored items for a specific set of ids, keyed by item_id.
+
+    The inbox renders one page at a time, so it wants 25 payloads — not the
+    tenant's entire mailbox (`all_items`) and not 25 round-trips (`get_item` in
+    a loop). Ids come from our own query, never from the request.
+    """
+    ids = [str(i) for i in item_ids]
+    if not ids:
+        return {}
+    out: dict[str, dict] = {}
+    placeholders = ",".join("?" * len(ids))
+    with _conn() as c:
+        rows = c.execute(
+            f"""SELECT item_id, payload, first_seen, kind FROM seen
+                WHERE tenant_id=? AND site=? AND item_id IN ({placeholders})""",
+            [tenant_id, site] + ids,
+        ).fetchall()
+    for item_id, payload, first_seen, kind in rows:
+        item = _parse_payload(payload)
+        item["first_seen"] = first_seen
+        item.setdefault("kind", kind)
+        item.setdefault("id", item_id)
+        out[item_id] = item
+    return out
+
+
 def get_item(tenant_id: str, site: str, item_id: str) -> dict | None:
     """One stored item by id, regardless of kind (tagged with its kind).
 
@@ -253,17 +280,47 @@ def save_response(tenant_id: str, site: str, kind: str, item_id: str, **fields) 
 
 
 def update_response(tenant_id: str, site: str, item_id: str, **fields) -> None:
-    """Patch fields on an existing response row (e.g. mark sent)."""
+    """Patch fields on a response row, creating it if there isn't one yet.
+
+    An upsert rather than a bare UPDATE, because "no row yet" is not a rare
+    case: a deal opened by `pipeline.backfill` goes through `pipeline.ensure`
+    only, which writes no `responses` row at all. Marking such a reply `sent`
+    then updated nothing and reported success, so `status` stayed unset — and
+    both things that gate the second send read that status. The thread page went
+    on showing an enabled "Approve & send" over a message the guest had already
+    received, and the 409 behind it did not fire either. The guard failed
+    *open*, which is the dangerous direction for a duplicate-message bug.
+    """
     allowed = _RESPONSE_FIELDS + ("sent_at", "emailed_at")
     sets = [f for f in fields if f in allowed]
     if not sets:
         return
     assignments = ", ".join(f"{f}=?" for f in sets)
-    vals = [fields[f] for f in sets] + [tenant_id, site, item_id]
+    vals = [fields[f] for f in sets] + [tenant_id, site, str(item_id)]
     with _conn() as c:
-        c.execute(
+        cur = c.execute(
             f"UPDATE responses SET {assignments} WHERE tenant_id=? AND site=? AND item_id=?",
             vals,
+        )
+        if getattr(cur, "rowcount", 0) > 0:
+            return
+        # `kind` and `status` are NOT NULL. Take the kind from the stored item
+        # so the new row matches what `save_response` would have written, and
+        # only default the status when the caller isn't setting one.
+        row = c.execute(
+            "SELECT kind FROM seen WHERE tenant_id=? AND site=? AND item_id=? LIMIT 1",
+            (tenant_id, site, str(item_id)),
+        ).fetchone()
+        cols = ["tenant_id", "site", "kind", "item_id"] + sets
+        values = [tenant_id, site, (row[0] if row else None) or "lead",
+                  str(item_id)] + [fields[f] for f in sets]
+        if "status" not in sets:
+            cols.append("status")
+            values.append("draft")
+        c.execute(
+            f"INSERT INTO responses ({','.join(cols)}) "
+            f"VALUES ({','.join('?' * len(cols))})",
+            values,
         )
 
 

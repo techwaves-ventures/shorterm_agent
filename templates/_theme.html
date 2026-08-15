@@ -171,7 +171,10 @@
     h2 { font-size: 1.3rem; }
     .container { padding: 0 18px; }
     .appbar__inner { padding: 10px 16px; gap: 10px; flex-wrap: wrap; }
-    .appbar__nav { margin-left: 0; order: 3; width: 100%; overflow-x: auto; }
+    /* wrap, don't scroll: the Inbox link makes five items, and the fifth
+       (Billing) fell off a 390px viewport with no visible scroll affordance. */
+    .appbar__nav { margin-left: 0; order: 3; width: 100%; flex-wrap: wrap;
+                   overflow-x: auto; }
     .appbar__right { gap: 10px; }
     .appbar__acct { display: none; }
     .app-main { padding: 20px 16px 48px; }

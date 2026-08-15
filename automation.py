@@ -217,9 +217,11 @@ def send_next(tenant_id: str, site: str, timeout: int = 300) -> dict | None:
     # Claim it before dispatching so a second drainer can't pick up the same row.
     outbox.set_status(msg["id"], outbox.SENDING)
     state = runner.send_reply(tenant_id, site, item, msg["body"])
-    # A busy runner means another run owns the browser; put it back and retry later.
+    # A busy runner means another run owns the browser; put it back and retry
+    # later. Nothing was dispatched, so the claim's attempt is refunded — see
+    # `release_unattempted`.
     if state.get("status") == "busy":
-        outbox.set_status(msg["id"], outbox.QUEUED)
+        outbox.release_unattempted(msg["id"])
         return None
 
     # send_reply dispatches to a background thread and returns immediately, so
@@ -401,11 +403,14 @@ def _scheduler_loop(site: str) -> None:
 
 def enqueue_send(tenant_id: str, site: str, item_id: str, body: str,
                  step_label: str = "Reply") -> dict | None:
-    """Queue an approved reply for background delivery and kick the drainer.
+    """Queue a **human-approved** reply for background delivery.
 
     Used by the dashboard's send button: the message is recorded as `queued`
     (already approved by the click), so the request returns straight away and
     the card tracks delivery from the outbox.
+
+    Only call this when a person actually approved the text. Unattended sends go
+    through `enqueue_autopilot_reply`, which records who authorized them.
     """
     deal = pipeline.get(tenant_id, site, item_id)
     step_id = (deal or {}).get("next_action_step") or "intro"
@@ -417,4 +422,47 @@ def enqueue_send(tenant_id: str, site: str, item_id: str, body: str,
         reason="Approved by you",
     )
     start_drainer(site)
+    return msg
+
+
+def enqueue_autopilot_reply(tenant_id: str, site: str, item_id: str, body: str,
+                            reason: str = "",
+                            step: dict | None = None) -> dict | None:
+    """Queue autopilot's unattended first reply — through the same rails as the
+    scheduled steps, and honestly labelled.
+
+    This previously called `enqueue_send` directly, which meant an unattended
+    message to a live prospect was written to the outbox as
+    `reason="Approved by you"` with `approved_at` stamped, when no human had
+    seen it. That is not a cosmetic string: the outbox is the audit record of
+    who authorized contact with a guest, and it was recording a person where
+    there was none. It also skipped `sequences.can_auto_send` and quiet hours,
+    so the one path that sends without review was the one path with no rails.
+
+    Now: the intro step must be auto-send-eligible under this tenant's settings
+    (it is not, by default) or the message waits for approval like every other
+    draft, and delivery is clamped out of the middle of the night.
+
+    `step` names which step this is. It defaults to the intro because the common
+    case is a brand-new lead, but a reply to a guest who wrote back must pass
+    `sequences.GUEST_REPLY` — labelling that "First reply" told the operator the
+    conversation was starting when it was already underway.
+    """
+    auto = settings_for(tenant_id)
+    step = step or sequences.find_step(sequences.PRESALE, "intro") or {}
+    may_auto = auto["enabled"] and sequences.can_auto_send(step, auto["steps"])
+    deal = pipeline.get(tenant_id, site, item_id)
+    msg = outbox.add(
+        tenant_id, site, item_id,
+        sequence=(deal or {}).get("sequence") or sequences.PRESALE,
+        step_id=step.get("id") or "intro",
+        step_label=step.get("label") or "First reply",
+        body=body,
+        auto=may_auto,
+        reason=reason or ("Sent automatically by autopilot" if may_auto
+                          else "Drafted by autopilot — awaiting your approval"),
+        scheduled_at=sequences.next_send_time(),
+    )
+    if may_auto:
+        start_drainer(site)
     return msg
