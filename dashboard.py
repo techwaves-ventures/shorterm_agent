@@ -1389,9 +1389,13 @@ def responder_send():
         # between it and the insert — two clicks both passed it and both queued.
         # `enqueue_send` now refuses at the write, and this is that refusal:
         # same 409 as the pre-read, because to the operator it is the same fact.
+        # Worded through `row_label`, like the pre-read guard above it — this
+        # route carries the same refusal twice, and reaching for the raw
+        # mapping here meant it answered one fact with two different strings
+        # depending on which of its two guards happened to fire.
         blocker = outbox.in_flight_for_item(tenant_id, SITE, item_id)
         return jsonify({"ok": False, "already": True, "error": (
-            outbox.STATUS_LABELS.get(blocker["status"], blocker["status"])
+            outbox.row_label(blocker)
             if blocker else "Another send for this guest was already under way."
         )}), 409
     return jsonify({

@@ -667,32 +667,89 @@ def test_the_section_promises_a_future_send_only_when_the_send_is_future(
             f"for a row whose scheduled time is still ahead={deferred}")
 
 
-def test_the_refusal_words_a_row_the_way_the_card_words_it(client, tenant):
-    """One row, two surfaces, one set of words.
+@pytest.mark.parametrize("route", ["approve", "retry"])
+@pytest.mark.parametrize("shape", ["one blocker", "deferred holds the lower id"])
+def test_the_refusal_words_a_row_the_way_the_card_words_it(
+        client, tenant, shape, route):
+    """One item, two surfaces, one row, one set of words.
 
     The card reads its caption through `send_state` (so `row_deferred` applies
     and a deferred row is "Scheduled to send"); `_release_refusal` used to reach
     for `STATUS_LABELS` directly, which has no deferred branch. So the card said
     "Scheduled to send" and clicking the sibling's Approve & send popped
-    `already "Queued to send…"` — the same row, named two different ways, in one
-    interaction. Asserted as *equality between the surfaces* rather than against
-    a literal, so it keeps holding if the wording changes.
+    `already "Queued to send…"`.
+
+    **Sharing the labeller is only half of it, and the half alone is worse than
+    neither.** The two surfaces also *select* the row they word, and they did it
+    by different orders: `send_state` ranks `(sending, scheduled_at, id)` while
+    `in_flight_for_item` ranked `(sending, id)`. With two in-flight rows whose
+    stamp order and id order disagree they name different rows — which raw
+    `STATUS_LABELS` used to flatten to one string by accident. Adding the
+    deferred branch without aligning the orders turned an invisible
+    disagreement into a visible contradiction, in the dangerous direction: the
+    operator was told "Scheduled to send" — *there is still time to stop this* —
+    about a guest whose next message the drainer takes immediately.
+
+    So `shape` composes the two rows; the single-blocker case alone cannot
+    reach it. Asserted as *equality between the surfaces* rather than against a
+    literal, so it keeps holding if the wording changes.
     """
     _deal(tenant, "L1")
-    blocker = _add(tenant, "L1", auto=True, scheduled_at=_shift(8))
-    pending = _add(tenant, "L1", auto=False)
+    if shape == "one blocker":
+        _add(tenant, "L1", auto=True, scheduled_at=_shift(8))
+    else:
+        # Deferred added first, so it takes the lower id while the *due* row is
+        # the one `next_queued` hands the drainer next.
+        _add(tenant, "L1", auto=True, scheduled_at=_shift(8))
+        _add(tenant, "L1", auto=True, scheduled_at=_shift(-3))
+    acted = _add(tenant, "L1", auto=False)
+    if route == "retry":
+        outbox.set_status(acted["id"], outbox.FAILED)
 
-    resp = client.post(f"/outbox/{pending['id']}/approve", data={"text": "hello"})
+    resp = client.post(f"/outbox/{acted['id']}/{route}", data={"text": "hello"})
     card = _governing(tenant, "L1")
 
     assert resp.status_code == 409, (
-        "precondition: the deferred sibling no longer blocks, so there is no "
-        f"refusal to word (got {resp.status_code})")
-    assert card["id"] == blocker["id"], (
-        "precondition: the card is captioned off some other row")
+        "precondition: the sibling no longer blocks, so there is no refusal to "
+        f"word (got {resp.status_code})")
     assert resp.get_json()["error"] == card["label"], (
-        f"the card calls row {blocker['id']} {card['label']!r} and the refusal "
-        f"for that same row calls it {resp.get_json()['error']!r}")
+        f"the card calls row {card['id']} {card['label']!r} and the /{route} "
+        f"refusal for the same item calls it {resp.get_json()['error']!r}")
+
+
+def test_responder_send_words_its_race_refusal_the_way_the_card_does(
+        client, tenant, monkeypatch):
+    """`/responder/send` carries the same refusal twice and worded it two ways.
+
+    Its pre-read guard goes through `_sent_state` (and so through `row_label`),
+    but the *write*-side refusal underneath — the one that catches a send
+    landing between the read and the insert — reached for raw `STATUS_LABELS`.
+    So one route answered the identical fact with two different strings
+    depending on which of its two guards fired. Driven by forcing the write
+    refusal, since the race itself is not schedulable from a test.
+    """
+    import automation
+    import dashboard
+    _deal(tenant, "L1")
+    blocker = _add(tenant, "L1", auto=True, scheduled_at=_shift(8))
+    # Both guards answer 409 for this row, and the *pre-read* one is already
+    # correct — leaving it live made this test green while never executing the
+    # line it names. Stand it down so the write refusal is what replies, which
+    # is what a send landing between the read and the insert produces.
+    monkeypatch.setattr(dashboard, "_sent_state", lambda *a, **k: "")
+    monkeypatch.setattr(automation, "enqueue_send", lambda *a, **k: None)
+
+    resp = client.post("/responder/send",
+                       data={"item_id": "L1", "text": "hi"})
+    card = _governing(tenant, "L1")
+
+    assert resp.status_code == 409, (
+        f"precondition: the write refusal did not fire (got {resp.status_code})")
+    assert card["id"] == blocker["id"], "precondition: card names another row"
+    assert resp.get_json()["error"] == card["label"], (
+        f"the card calls row {blocker['id']} {card['label']!r} and "
+        f"/responder/send's write refusal calls it "
+        f"{resp.get_json()['error']!r}")
 
 
 def test_the_section_stops_telling_the_operator_to_cancel_when_nothing_can_be(

@@ -428,11 +428,23 @@ def in_flight_for_item(tenant_id: str, site: str, item_id: str, *,
     browser is already driving that row, which is the stronger claim on the
     thread and the more honest thing to name.
 
+    **The ORDER BY is `_governing_rank` in SQL, and has to stay that way.** It
+    used to stop at `id ASC`, so for an item holding two in-flight rows this
+    named one row while the card named another. That was invisible for as long
+    as both came out of `STATUS_LABELS` as the same string, and became a visible
+    contradiction the moment a deferred row got its own caption: the card read
+    "Queued to send…" off the due row while the refusal read "Scheduled to
+    send" off the deferred one — *there is still time to stop this*, about a
+    guest whose next message the drainer takes immediately. Sharing the
+    labeller is not enough if the two surfaces still choose different rows to
+    label. `COALESCE` because `_governing_rank` reads a missing stamp as `""`,
+    which sorts first in Python and SQLite but last in Postgres.
+
     Shares `_in_flight_terms` with that UPDATE, so this keeps explaining the
     same refusal. It has to move in lockstep with that predicate or it resumes
     naming a blocker that no longer blocks.
     """
-    order = "CASE WHEN status=? THEN 0 ELSE 1 END, id ASC"
+    order = "CASE WHEN status=? THEN 0 ELSE 1 END, COALESCE(scheduled_at, '') ASC, id ASC"
     terms, term_params = _in_flight_terms("outbox")
     sql = (f"{_SELECT} WHERE tenant_id=? AND site=? AND item_id=? "
            f"AND {terms}")
