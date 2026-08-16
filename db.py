@@ -22,6 +22,7 @@ the caller's own connection. On SQLite the lazy-every-time behavior is kept
 exactly; on Postgres running DDL inside the caller's transaction deadlocks two
 concurrent writers. See open_with_schema for the full reasoning.
 """
+import hashlib
 import os
 import re
 import sqlite3
@@ -264,6 +265,37 @@ def insert_returning_id(conn: Conn, sql: str, params, id_col: str = "id"):
         cur = conn.execute(f"{sql} RETURNING {id_col}", params)
         return cur.fetchone()[0]
     return conn.execute(sql, params).lastrowid
+
+
+def lock_key(conn: Conn, key: str) -> None:
+    """Serialize this transaction against any other touching the same key.
+
+    Needed because a guard whose predicate spans *rows* cannot be enforced by
+    row-level MVCC. Under Postgres' default READ COMMITTED, two transactions
+    each evaluate `NOT EXISTS (...)` against their own snapshot, neither sees
+    the other's uncommitted row, and when they update *different* rows there is
+    no row lock to serialize them and no EvalPlanQual recheck. Measured on
+    PG 16.14 before this lock: 14/15 concurrent pairs released two messages for
+    one guest, and 15/15 for the insert-shaped guard. SQLite hid it completely —
+    its single writer lock serializes everything, so the same code measured
+    0/150 there. A guard verified only on SQLite is a guard verified on the
+    wrong backend: `DATABASE_URL` is required on the deployed target.
+
+    An advisory lock rather than `SELECT ... FOR UPDATE` because the condition
+    is partly about rows that do not exist yet (insert vs insert), which no row
+    lock can cover. Taken inside the caller's transaction and released when it
+    ends. The hash is computed here rather than with Postgres' `hashtext()` so
+    the key does not depend on an undocumented internal function; collisions
+    only cost unrelated serialization, never correctness.
+
+    No-op on SQLite, which already gives this for free.
+    """
+    if not conn.pg:
+        return
+    # Signed 64-bit, which is what pg_advisory_xact_lock(bigint) accepts.
+    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+    conn.execute("SELECT pg_advisory_xact_lock(?)",
+                 (int.from_bytes(digest, "big", signed=True),))
 
 
 def insert_returning_id_maybe(conn: Conn, sql: str, params, id_col: str = "id"):

@@ -171,6 +171,11 @@ def _row(row) -> dict | None:
     return dict(zip(_COLS, row)) if row else None
 
 
+def _item_key(tenant_id, site, item_id) -> str:
+    """The scope every release guard serializes on: one guest's thread."""
+    return f"outbox:{tenant_id}:{site}:{item_id}"
+
+
 def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
         step_label: str, body: str, auto: bool, reason: str = "",
         scheduled_at: str | None = None,
@@ -203,6 +208,11 @@ def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
             scheduled_at or timeframe.now(), now, now if auto else None)
     with _conn() as c:
         if unless_in_flight:
+            # Same reason as the update-shaped guard, and more sharply: this one
+            # is partly about a row that does not exist yet, so no row lock could
+            # cover it. Two concurrent inserts each found NOT EXISTS true on
+            # their own snapshot and both wrote — 15/15 on PG. See `db.lock_key`.
+            db.lock_key(c, _item_key(tenant_id, site, item_id))
             new_id = db.insert_returning_id_maybe(
                 c,
                 f"""{cols} SELECT {','.join('?' * len(vals))}
@@ -302,13 +312,20 @@ def release_to_send(msg_id: int, *, from_statuses: tuple, body: str | None = Non
     Returns `(released, row_as_it_now_is)`. `released` is True only for the call
     that actually moved the row, so two racing requests cannot both be told yes.
 
-    This is the single choke point for putting a *new* message in front of a
-    guest. Every route that releases one goes through here, because guarding
-    per-route has now missed a route three times on this ticket: the approve
-    button was guarded, then the second approve button, and `/outbox/<id>/retry`
-    was still re-queueing a sibling of a message already going out. A route that
-    forgets the guard is a bug; a route that cannot reach the write without it
-    is not possible.
+    This is the release path for every *operator-initiated* send: the approve
+    buttons, `/outbox/<id>/retry`, and (insert-shaped, via `add`) the send
+    button. Guarding per-route missed a route three times on this ticket — the
+    approve button was guarded, then the second approve button, and
+    `/outbox/<id>/retry` was still re-queueing a sibling of a message already
+    going out — so the check moved onto the write.
+
+    Be precise about how far that goes: the guard is **opt-in, not structural**.
+    `set_status(msg_id, QUEUED)` and `add(..., unless_in_flight=False)` remain
+    reachable without it, and `automation.enqueue_autopilot_reply` deliberately
+    takes that path — autopilot can still queue a reply into a thread a browser
+    is mid-delivery on. That is pre-existing behaviour and a product decision
+    (several drafted steps per item is ordinary there), not something this
+    guard closes. A new caller that wants the rule must ask for it.
 
     Two conditions, both in the WHERE clause rather than in a preceding read:
 
@@ -514,6 +531,20 @@ def set_status(msg_id: int, status: str, *, error: str | None = None,
         vals += list(IN_FLIGHT)
 
     with _conn() as c:
+        if unless_sibling_in_flight:
+            # Serialize against anything else releasing for this same item before
+            # the predicate is evaluated. Reading the row's identity first is
+            # safe: an outbox row never changes item. Whoever loses the race for
+            # the lock blocks here, and because READ COMMITTED gives each
+            # *statement* a fresh snapshot, the UPDATE below then sees the
+            # winner's committed row and correctly refuses. Without this the
+            # sibling test is not a CAS at all on Postgres — see `db.lock_key`.
+            owner = c.execute(
+                "SELECT tenant_id, site, item_id FROM outbox WHERE id=?",
+                (msg_id,)).fetchone()
+            if owner is None:
+                return False
+            db.lock_key(c, _item_key(*owner))
         cur = c.execute(
             f"UPDATE outbox SET {', '.join(sets)} WHERE {' AND '.join(where)}", vals)
         return (cur.rowcount or 0) > 0

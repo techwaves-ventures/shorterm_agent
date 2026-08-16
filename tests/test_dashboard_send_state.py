@@ -584,6 +584,38 @@ def test_the_send_button_cannot_queue_two_by_racing_itself(client, tenant):
     assert _in_flight_count(tenant, "s1") == 1
 
 
+def test_the_send_route_answers_409_when_only_the_insert_refuses(
+        client, tenant, monkeypatch):
+    """The `msg is None` branch, with the pre-read blinded so it cannot answer.
+
+    Without this the branch had **zero** coverage: the test above posts to
+    /responder/send and gets its 409 from the `_sent_state` pre-read, never from
+    the refusal path. Replacing the branch with `if False:` left all 31 other
+    tests passing, and the route then answered
+    `{"ok": true, "queued": true, "message_id": null}` on a refused insert —
+    telling the operator a message was queued when nothing was written.
+
+    The pre-read is stubbed out precisely because it masks the branch. That is
+    the only honest way to reach a race-losing insert from a single-threaded
+    test: in production the pre-read passes because the competing send had not
+    landed yet, which is the whole reason the insert has to refuse.
+    """
+    import dashboard
+
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING, body="already going out")
+    monkeypatch.setattr(dashboard, "_sent_state", lambda *a, **k: "")
+
+    resp = client.post("/responder/send", data={"item_id": "s1", "text": "second"})
+
+    assert resp.status_code == 409, (
+        f"the route reported success for an insert that wrote nothing: "
+        f"{resp.status_code} {resp.get_data(as_text=True)[:200]}"
+    )
+    assert resp.get_json()["error"] == "Sending…", resp.get_json()
+    assert _in_flight_count(tenant, "s1") == 1
+
+
 def test_the_send_button_still_queues_when_the_thread_is_idle(client, tenant):
     """Control: the guard must not refuse the ordinary first send."""
     import automation
