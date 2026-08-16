@@ -20,6 +20,7 @@ Statuses:
 from datetime import datetime, timezone
 
 import db
+import timeframe
 
 PENDING = "pending_approval"
 QUEUED = "queued"
@@ -147,8 +148,14 @@ def _now_utc() -> str:
     stale and hands it to a second drainer, delivering the message twice.
 
     So this column carries its offset. Deliberately narrow: `_now()` is shared
-    with `approved_at`/`sent_at`/`scheduled_at`, whose local semantics the
-    quiet-hours clamp depends on, and none of those are compared across hosts.
+    with `approved_at`/`sent_at`/`created_at`, which record when something
+    happened for a human to read and are never compared across hosts.
+
+    `scheduled_at` used to be on that list and should not have been — it is
+    written by the drafting/approving host and gated by the draining host, the
+    same split this stamp exists for. It is fixed separately rather than here,
+    because it is compared with SQL `<=` and `ORDER BY` and so cannot carry an
+    offset suffix without breaking that lexicographic compare. See `timeframe`.
     """
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -161,7 +168,11 @@ def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
         step_label: str, body: str, auto: bool, reason: str = "",
         scheduled_at: str | None = None) -> dict | None:
     """Queue a drafted step. `auto=True` skips the approval gate (goes straight
-    to `queued`); otherwise it waits for a human in `pending_approval`."""
+    to `queued`); otherwise it waits for a human in `pending_approval`.
+
+    `scheduled_at` is in the schedule frame (see `timeframe`) — callers that
+    compute a send time hand one in, and "no particular time" means now.
+    """
     now = _now()
     status = QUEUED if auto else PENDING
     with _conn() as c:
@@ -172,7 +183,8 @@ def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
                    created_at, approved_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (str(tenant_id), site, str(item_id), sequence, step_id, step_label,
-             body, status, 1 if auto else 0, reason, scheduled_at or now, now,
+             body, status, 1 if auto else 0, reason,
+             scheduled_at or timeframe.now(), now,
              now if auto else None),
         )
     return get(new_id)
@@ -353,9 +365,14 @@ def next_queued(tenant_id: str | None = None,
     been deliberately pushed to a civilised hour went out the moment a drainer
     woke up — the quiet-hours clamp computed upstream had no effect on delivery
     at all. A message is due only once its scheduled time has arrived.
+
+    "Now" is absolute, not this host's wall clock: the drainer is routinely a
+    different host from the one that scheduled the message, and a naive compare
+    across that boundary withholds a due send for the whole offset (westward) or
+    releases a deferred one early (eastward). See `timeframe`.
     """
     sql = f"{_SELECT} WHERE status=? AND scheduled_at<=?"
-    params: list = [QUEUED, now_iso or _now()]
+    params: list = [QUEUED, now_iso or timeframe.now()]
     if tenant_id is not None:
         sql += " AND tenant_id=?"
         params.append(str(tenant_id))
@@ -379,8 +396,11 @@ def set_status(msg_id: int, status: str, *, error: str | None = None,
         # in place would make the operator click Send, see success, and watch
         # nothing happen for hours. GREATEST-style clamp, so a message that is
         # already due keeps its position and can't jump the queue.
+        # Both sides in the schedule frame: the stored stamp was written by
+        # whichever host drafted the message, and the approver is often another.
         sets.append("scheduled_at=CASE WHEN scheduled_at>? THEN ? ELSE scheduled_at END")
-        vals += [_now(), _now()]
+        _release = timeframe.now()
+        vals += [_release, _release]
     if status == SENDING:
         # When the send actually started — which is what "stuck" is measured
         # against. `approved_at` cannot answer that: a message approved into

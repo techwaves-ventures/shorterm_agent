@@ -353,7 +353,7 @@
               <div class="deal__top">
                 <span class="deal__name">{{ c.deal.guest_name or 'Guest' }}</span>
                 <span class="badge badge--brand">{{ msg.step_label }}</span>
-                <span class="deal__age">due {{ msg.scheduled_at[:16].replace('T', ' ') if msg.scheduled_at else '—' }}</span>
+                <span class="deal__age">due {{ msg.scheduled_at|sched_local }}</span>
               </div>
               {% if msg.reason %}<div class="deal__sub">{{ msg.reason }}</div>{% endif %}
               <details class="draft">
@@ -428,7 +428,7 @@
         <div class="row">
           <span class="row__name">{{ c.deal.guest_name or 'Guest' }}</span>
           <span class="row__mid">{{ (c.deal.next_action_step or '').replace('_', ' ')|title }} · {{ c.stage_label }}</span>
-          <span class="row__when">{{ c.deal.next_action_at[:16].replace('T', ' ') if c.deal.next_action_at }}</span>
+          <span class="row__when">{{ c.deal.next_action_at|sched_local }}</span>
         </div>
         {% endfor %}
       </div>
