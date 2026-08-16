@@ -261,13 +261,16 @@ def _board(tenant_id: str) -> dict:
     # existing install picks up the lifecycle without a migration step.
     pipeline.backfill(tenant_id, SITE, items, responses, config.get_units(tenant_id))
     deals = pipeline.all_deals(tenant_id, SITE)
-    pending = {
-        m["item_id"]: m
-        for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
-    }
-    send_rows = outbox.rows_by_item(tenant_id, SITE)
     # Self-heal on view: requeue sends stranded by a crashed process, and make
     # sure something is draining if messages are waiting (e.g. after a restart).
+    #
+    # This runs *before* the outbox reads below, not after. It writes rows the
+    # board then renders — a stranded `sending` row becomes `queued` — so
+    # reading first meant the one render that performed the reclaim described
+    # the state it had just replaced: still "Sending…", still absent from
+    # "Waiting to send", still offering no way to clear it, while an
+    # /api/send-states poll moments later already said `queued`. The render that
+    # fixes something is the render that most needs to show it.
     #
     # The reclaim is deliberately *not* gated on `_can_deliver_in_process()`.
     # It is pure DB work — it drives no browser — and the topology that cannot
@@ -281,6 +284,12 @@ def _board(tenant_id: str) -> dict:
     outbox.reclaim_stuck_sending()
     if _can_deliver_in_process() and outbox.queued_tenants():
         automation.start_drainer(SITE)
+
+    pending = {
+        m["item_id"]: m
+        for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
+    }
+    send_rows = outbox.rows_by_item(tenant_id, SITE)
 
     def card(deal: dict) -> dict:
         item = items.get(deal["item_id"], {})
@@ -320,25 +329,37 @@ def _board(tenant_id: str) -> dict:
             for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
             if m["item_id"] in by_id
         ],
-        # Approved rows still waiting on a drainer or on their scheduled time.
-        # These were rendered nowhere, which is what made the release guard
-        # indefensible: a `queued` row refuses approve/retry/send for its guest,
-        # and with no row on the page and no cancel control the operator could
-        # neither see what was blocking them nor clear it — the only escape was
-        # hand-POSTing /outbox/<id>/cancel. `queued` is in `outbox.CANCELABLE`
-        # and that route already answers 200, so the affordance was the only
-        # missing piece. It matters most where no drainer runs at all: there the
-        # block is not a window, it is permanent.
+        # Every approved row that is holding its guest's card — waiting on a
+        # drainer, on its scheduled time, or already going out. These were
+        # rendered nowhere, which is what made the release guard indefensible: a
+        # row in flight refuses approve/retry/send for its guest, and with no row
+        # on the page and no cancel control the operator could neither see what
+        # was blocking them nor clear it — the only escape was hand-POSTing
+        # /outbox/<id>/cancel. `queued` is in `outbox.CANCELABLE` and that route
+        # already answers 200, so the affordance was the only missing piece. It
+        # matters most where no drainer runs at all: there the block is not a
+        # window, it is permanent.
+        #
+        # The set is `IN_FLIGHT`, not `QUEUED`, because it has to match the
+        # predicate that does the refusing (`_in_flight_terms`). Listing only the
+        # clearable half meant an operator could cancel every blocker the page
+        # showed and still be 409'd with nothing left to click — a page that is
+        # complete about what it can fix and silent about what it cannot. A
+        # `sending` row renders read-only (see `outbox.CANCELABLE`: an in-flight
+        # browser send genuinely cannot be called off, and a button that would
+        # 409 is not an affordance), so the section answers "what is holding this
+        # guest" completely and is honest about which of it you can act on.
         #
         # Derived from `send_rows` — already a whole-table read for this tenant —
         # rather than a seventh `for_tenant` query, because the board's query
         # count is fixed by design and asserted as such. Ordered as `for_tenant`
         # orders, so the section reads oldest-due first.
-        "queued_sends": [
-            {**card(by_id[m["item_id"]]), "pending": m}
+        "blocking_sends": [
+            {**card(by_id[m["item_id"]]), "pending": m,
+             "cancelable": m["status"] in outbox.CANCELABLE}
             for m in sorted(
                 (m for rows in send_rows.values() for m in rows
-                 if m["status"] == outbox.QUEUED and m["item_id"] in by_id),
+                 if m["status"] in outbox.IN_FLIGHT and m["item_id"] in by_id),
                 key=lambda m: (m.get("scheduled_at") or "", m["id"]),
             )
         ],

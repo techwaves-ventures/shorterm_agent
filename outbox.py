@@ -208,8 +208,10 @@ def _in_flight_terms(alias: str) -> tuple[str, list]:
 
     The lockout that narrowing was meant to cure is real, and is cured instead
     by making the refusal *legible*: the blocking row is rendered on the board
-    with a working "Don't send" (`dashboard._board`'s `queued_sends`), so the
-    operator clears it in one click and then sends. A refusal you can see and
+    with a working "Don't send" (`dashboard._board`'s `blocking_sends`, which
+    lists every row this predicate matches — a `sending` one read-only, since
+    `CANCELABLE` rightly excludes it), so the operator clears it in one click and
+    then sends. A refusal you can see and
     undo is a different thing from the invisible one this ticket was filed
     about. `send_state` still *describes* a deferred row honestly — see
     `_row_deferred` — because how a row is labelled and whether it blocks are
@@ -242,6 +244,36 @@ def _row_deferred(row: dict, now_iso: str) -> bool:
     """
     return (row.get("status") == QUEUED
             and (row.get("scheduled_at") or "") > now_iso)
+
+
+def _governing_rank(row: dict, now_iso: str) -> tuple:
+    """Sort key for "which in-flight row decides what this item is doing".
+
+    Ranks on every dimension the caption depends on, worst-news-first: a row a
+    browser is already driving outranks a merely queued one, a row the drainer
+    takes on its next pass outranks one held back for its scheduled time, and
+    inside a tier the row that goes out first wins — which is the drainer's own
+    order (`next_queued`: `scheduled_at ASC, id ASC`).
+
+    The middle term is the one an earlier round missed. It ranked `sending` over
+    `queued` and stopped there, taking the lowest id among the rest, so for rows
+    `[deferred, due]` a message leaving at 08:00 tomorrow captioned a card whose
+    sibling the drainer takes in seconds: the page said "Scheduled to send" —
+    which reads as *there is still time to stop this* — over a send with seconds
+    to live. That is this ticket's own failure class, the board describing a send
+    it is not describing. Ordering on one dimension of a multi-dimensional choice
+    is not a tiebreak, it is a coin flip on the others.
+
+    The last term matters for the same reason: among two deferred rows the
+    earlier stamp is the one that actually happens next, and captioning with the
+    later one misstates the deadline the operator is reading the time for.
+    """
+    return (
+        0 if row.get("status") == SENDING else 1,
+        1 if _row_deferred(row, now_iso) else 0,
+        str(row.get("scheduled_at") or ""),
+        row.get("id") or 0,
+    )
 
 
 def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
@@ -756,11 +788,11 @@ def send_state(rows: list[dict] | None, now_iso: str | None = None) -> dict | No
     newest `failed` while an older row was `queued` would offer "Retry send"
     over a live delivery. Returns None for an item with no rows at all.
 
-    Among in-flight rows `sending` outranks `queued` regardless of id, because
-    the label is what the operator reads: taking the first row by id reported
-    "Queued to send…" for an item whose *other* row a browser was already
-    delivering, which reads as "there is still time to stop this" when there is
-    not. Same precedence as `in_flight_for_item`.
+    Among in-flight rows the governing one is chosen by `_governing_rank`, not
+    by id: `sending` outranks `queued` and a due row outranks a deferred one,
+    because the label is what the operator reads and the id order is unrelated
+    to which message actually leaves first. `sending` first is the same
+    precedence as `in_flight_for_item`.
 
     "In flight" here is `_row_in_flight`, the same rule the release guard
     enforces, because these two disagreeing is the whole of this ticket: the
@@ -779,8 +811,9 @@ def send_state(rows: list[dict] | None, now_iso: str | None = None) -> dict | No
     if not rows:
         return None
     now = now_iso or timeframe.now()
-    governing = (next((m for m in rows if m["status"] == SENDING), None)
-                 or next((m for m in rows if _row_in_flight(m)), rows[-1]))
+    governing = min((m for m in rows if _row_in_flight(m)),
+                    key=lambda m: _governing_rank(m, now),
+                    default=rows[-1])
     status = governing["status"]
     in_flight = _row_in_flight(governing)
     label = STATUS_LABELS.get(status, status)

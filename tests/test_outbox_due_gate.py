@@ -32,7 +32,7 @@ is **labelled** (`_row_deferred`, which reads the stamp). A deferred row blocks
 import os
 import re
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -485,3 +485,172 @@ def test_the_cancel_route_reports_the_race_rather_than_a_green_toast(client, ten
     assert resp.status_code == 409, (
         f"cancel answered {resp.status_code} for a row already being delivered")
     assert outbox.get(msg["id"])["status"] == outbox.SENDING
+
+
+# --------------------------------------------------------------------------
+# 6. Which of an item's rows gets to speak for it
+#
+# Round 7 ranked `sending` over `queued` and stopped there, breaking the tie
+# among the rest on id. Id order is unrelated to send order, so for rows
+# [deferred, due] the card was captioned by the message leaving tomorrow while
+# its sibling left on the drainer's next pass: "Scheduled to send" — *there is
+# still time to stop this* — over a send with seconds to live. That is this
+# ticket's own failure class, and the suite was green with it present.
+#
+# So these run each case in **both insertion orders**. A rule that reads
+# correctly in one order and not the other is not a rule, and asserting only
+# the order that happens to pass is how the first version shipped.
+# --------------------------------------------------------------------------
+
+def _governing(tenant_id, item_id):
+    return outbox.send_state(outbox.rows_by_item(tenant_id, SITE).get(item_id))
+
+
+@pytest.mark.parametrize("order", ["deferred first", "due first"])
+def test_a_due_sibling_captions_the_card_whichever_row_was_added_first(tenant, order):
+    """Two `queued` rows for one item is ordinary, not exotic.
+
+    `enqueue_autopilot_reply` adds without `unless_in_flight` and its
+    `scheduled_at` is quiet-hours-clamped, so a draft queued at 23:00 lands +9h
+    while a later one lands due-now — and the later one is the one going out.
+    """
+    _deal(tenant, "L1")
+    offsets = [8, -1] if order == "deferred first" else [-1, 8]
+    rows = [_add(tenant, "L1", auto=True, scheduled_at=_shift(o)) for o in offsets]
+    due = rows[offsets.index(-1)]
+
+    state = _governing(tenant, "L1")
+
+    assert state["id"] == due["id"], (
+        f"{order}: row {state['id']} spoke for the card, but row {due['id']} is "
+        "the one the drainer takes on its next pass")
+    assert state["label"] == "Queued to send…", (
+        f"{order}: card reads {state['label']!r} over a message that is due "
+        "now — the caption says there is still time to stop it when there is not")
+
+
+@pytest.mark.parametrize("order", ["late first", "soon first"])
+def test_the_soonest_deferred_row_names_the_deadline(tenant, order):
+    """The operator reads that time to decide whether to intervene.
+
+    Same defect one tier down: with every row deferred, the id tiebreak could
+    still name the *later* stamp, so the card promised 08:00 tomorrow over a
+    message leaving at 20:00 tonight. A caption carrying the wrong time is worse
+    than one carrying none, because it is checkable and checks out wrong.
+    """
+    _deal(tenant, "L1")
+    offsets = [8, 2] if order == "late first" else [2, 8]
+    rows = [_add(tenant, "L1", auto=True, scheduled_at=_shift(o)) for o in offsets]
+    soonest = rows[offsets.index(2)]
+
+    state = _governing(tenant, "L1")
+
+    assert state["label"] == "Scheduled to send", (
+        f"{order}: nothing here is due, so the caption should not claim it is")
+    assert state["scheduled_at"] == soonest["scheduled_at"], (
+        f"{order}: card names {state['scheduled_at']} but the next message out "
+        f"goes at {soonest['scheduled_at']} — the operator is reading a deadline "
+        "that is hours late")
+
+
+@pytest.mark.parametrize("order", ["sending first", "sending second"])
+def test_a_send_already_going_out_outranks_a_deferred_sibling(tenant, order):
+    """Non-regression for the precedence round 7 *did* get right, in both
+    orders — the new rank must not trade one dimension away for the other."""
+    _deal(tenant, "L1")
+    first, second = _add(tenant, "L1", auto=True), _add(tenant, "L1", auto=True)
+    live, deferred = (first, second) if order == "sending first" else (second, first)
+    outbox.set_status(live["id"], outbox.SENDING)
+    with outbox._conn() as c:
+        c.execute("UPDATE outbox SET scheduled_at=? WHERE id=?",
+                  (_shift(8), deferred["id"]))
+
+    state = _governing(tenant, "L1")
+
+    assert state["label"] == "Sending…", (
+        f"{order}: card reads {state['label']!r} while a browser is already "
+        "driving row %d" % live["id"])
+    assert state["id"] == live["id"]
+
+
+# --------------------------------------------------------------------------
+# 7. The section has to list what is holding the guest, not just what you can
+#    undo. Cancelling every blocker the page showed could still leave the
+#    operator 409'd with nothing left to click.
+# --------------------------------------------------------------------------
+
+def test_a_sending_blocker_is_listed_even_though_it_cannot_be_called_off(
+        client, tenant):
+    _deal(tenant, "L1")
+    blocker = _add(tenant, "L1", auto=True, body="the message going out now")
+    outbox.set_status(blocker["id"], outbox.SENDING)
+
+    html = SCRIPT_RE.sub("", client.get("/dashboard").get_data(as_text=True))
+
+    assert outbox.get(blocker["id"])["status"] == outbox.SENDING, (
+        "precondition: the reclaim requeued the row, so this asserts nothing")
+    assert "the message going out now" in html, (
+        "the one blocker the operator cannot clear is also the one the page "
+        "does not mention: every visible blocker can be cancelled and the guest "
+        "is still blocked, with nothing left to click")
+    assert "cannot be called off" in html, (
+        "listed without saying why it has no cancel, which reads as a missing "
+        "button rather than a deliberate refusal")
+
+
+def test_a_sending_blocker_is_not_offered_a_cancel_that_would_409(client, tenant):
+    """Visibility is not the same as an affordance. `outbox.CANCELABLE` excludes
+    `sending` for good reason — the route answers 409 — so rendering the button
+    anyway would be the page lying about what it can do, one layer up."""
+    _deal(tenant, "L1")
+    blocker = _add(tenant, "L1", auto=True)
+    outbox.set_status(blocker["id"], outbox.SENDING)
+
+    html = SCRIPT_RE.sub("", client.get("/dashboard").get_data(as_text=True))
+
+    assert not re.search(r"cancelMsg\(%d\)" % blocker["id"], html), (
+        "offered 'Don't send' for a row already being delivered; the route "
+        "refuses it with 409")
+    assert client.post(f"/outbox/{blocker['id']}/cancel", data={}).status_code == 409, (
+        "precondition: the route no longer refuses, so hiding the button is "
+        "now the page under-reporting what the operator can do")
+
+
+def test_a_queued_blocker_still_gets_its_working_cancel(client, tenant):
+    """Control for the two above: widening the section to every in-flight row
+    must not cost the clearable half its button."""
+    _deal(tenant, "L1")
+    blocker = _add(tenant, "L1", auto=True, body="still clearable")
+
+    html = SCRIPT_RE.sub("", client.get("/dashboard").get_data(as_text=True))
+
+    assert "still clearable" in html and re.search(
+        r"cancelMsg\(%d\)" % blocker["id"], html), (
+        "the queued blocker lost the cancel control it is supposed to have")
+
+
+def test_the_render_that_reclaims_a_stranded_send_shows_the_reclaimed_state(
+        client, tenant):
+    """`_board` reads the outbox and self-heals it in the same request.
+
+    Reading first meant the one render that freed a wedged row still described
+    the state it had just replaced — `Sending…`, no cancel — while an
+    /api/send-states poll seconds later already said `queued`. The next reload
+    was correct, which is precisely what makes it hard to notice.
+    """
+    _deal(tenant, "L1")
+    blocker = _add(tenant, "L1", auto=True, body="stranded by a crashed process")
+    outbox.set_status(blocker["id"], outbox.SENDING)
+    stale = (datetime.now(timezone.utc) - timedelta(seconds=5000)).isoformat()
+    with outbox._conn() as c:
+        c.execute("UPDATE outbox SET sending_at=?, attempts=0 WHERE id=?",
+                  (stale, blocker["id"]))
+
+    html = SCRIPT_RE.sub("", client.get("/dashboard").get_data(as_text=True))
+
+    assert outbox.get(blocker["id"])["status"] == outbox.QUEUED, (
+        "precondition: this render was supposed to reclaim the row")
+    assert re.search(r"cancelMsg\(%d\)" % blocker["id"], html), (
+        "the render that reclaimed the row still shows it as uncancelable, so "
+        "the operator sees a blocker with no escape that the server had already "
+        "made clearable")

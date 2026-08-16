@@ -397,15 +397,15 @@
          a deferred row's own caption reads "Scheduled to send": two names for
          one row on one page is the same confusion this ticket fixed once
          already, and this wording covers both without contradicting either. -->
-    {% if board.queued_sends %}
+    {% if board.blocking_sends %}
     <section>
       <div class="sec-head">
         <h2>Waiting to send</h2>
-        <span class="sec-count">{{ board.queued_sends|length }}</span>
-        <span class="sec-sub">already approved — each one holds its guest's card until it goes out or you cancel it</span>
+        <span class="sec-count">{{ board.blocking_sends|length }}</span>
+        <span class="sec-sub">already approved — each one holds its guest's card until it goes out; cancel the ones that have not started</span>
       </div>
       <div class="sec-body">
-        {% for c in board.queued_sends %}
+        {% for c in board.blocking_sends %}
           {% set msg = c.pending %}
           <article class="deal">
             <div class="deal__rail"></div>
@@ -417,7 +417,18 @@
               </div>
               <div class="preview">{{ msg.body }}</div>
               <div class="actions">
+                {% if c.cancelable %}
                 <button class="mini danger" onclick="cancelMsg({{ msg.id }})">Don't send</button>
+                {% else %}
+                {# A browser is already driving this one. `outbox.CANCELABLE`
+                   excludes `sending`, so a "Don't send" here would answer 409 —
+                   and a button that refuses is not an affordance. It is listed
+                   anyway because the section answers "what is holding this
+                   guest", and omitting the single blocker the operator cannot
+                   clear is how the page came to be complete about what it can
+                   fix and silent about what it cannot. #}
+                <span class="muted">Sending… — cannot be called off</span>
+                {% endif %}
               </div>
               <div class="msg" id="msg-ob-{{ msg.id }}"></div>
             </div>
