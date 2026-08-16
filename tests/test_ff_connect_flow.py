@@ -337,8 +337,12 @@ def test_ff_login_dialog_invalidates_session_probe():
 
 
 def _expire_worker():
-    from datetime import datetime, timedelta
-    old = (datetime.now() - timedelta(seconds=jobs.WORKER_TTL_SECONDS + 60)).isoformat(timespec="seconds")
+    # Offset-aware, matching what `jobs.heartbeat()` actually writes (VEN-137).
+    # A naive stamp here would still expire the worker, but it would route every
+    # reap/offline test in this file down the legacy-naive compatibility branch
+    # in `worker_online()`, leaving the real shipped path with no coverage.
+    from datetime import datetime, timedelta, timezone
+    old = (datetime.now(timezone.utc) - timedelta(seconds=jobs.WORKER_TTL_SECONDS + 60)).isoformat(timespec="seconds")
     with jobs._conn() as c:
         c.execute("UPDATE ff_worker SET last_seen=? WHERE id=1", (old,))
 

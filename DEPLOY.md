@@ -152,6 +152,35 @@ the browser. Human-in-the-loop send posture is unchanged — nothing auto-sends.
 This split (Vercel = dashboard/UI, `worker.py` = browser jobs, shared Postgres)
 is the recommended production topology.
 
+#### Deploy order for the worker-liveness beacon (upgrading past VEN-137)
+
+`ff_worker.last_seen` is written by the worker and read by the web host. It now
+carries a UTC offset, because comparing a naive wall-clock stamp across two
+hosts is off by the offset between them — which always exceeds the 90s TTL, so
+a westward worker read permanently offline while healthy, and an eastward
+worker read online *even after it had crashed*.
+
+Upgrading across that change:
+
+- **Deploy the web host first.** It understands both the old naive stamp and
+  the new offset-aware one.
+- **Do not deploy the worker first.** It would write offset-aware stamps that an
+  old web host subtracts from a naive `datetime`, raising an uncaught
+  `TypeError` — a 500 on the dashboard `/api/status` poll. This hits *every*
+  deploy, not only split-timezone ones.
+- **Rolling the web host back has the same hazard** once a new worker has
+  written an aware stamp. Roll the worker back first, or expect that 500 until
+  the web host is forward again.
+- **The fix is inert until the worker is redeployed.** A naive row persists
+  until a new-code worker heartbeats; it is not self-healing within the 90s
+  TTL. If the worker has crashed — exactly the case the beacon exists to catch
+  — the row stays naive indefinitely.
+- On the single-image topologies (`Dockerfile`, `docker-compose.yml`) both roles
+  turn over together, so there is no mixed window and no ordering to enforce.
+
+Pinning `TZ=UTC` on both hosts is cheap belt-and-braces, and is currently not
+set anywhere in this repo.
+
 ### Authenticated Chrome wake endpoint on a VM
 
 For deployments that need an HTTP wake hook in front of the browser worker,
