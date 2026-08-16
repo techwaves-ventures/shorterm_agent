@@ -26,7 +26,7 @@ indefinitely.
 
 Two properties this file exists to keep apart, because fusing them is what broke
 it: whether a row **blocks** (`_row_in_flight`, status membership) and how a row
-is **labelled** (`_row_deferred`, which reads the stamp). A deferred row blocks
+is **labelled** (`row_deferred`, which reads the stamp). A deferred row blocks
 *and* says "Scheduled to send".
 """
 import os
@@ -111,6 +111,25 @@ def _add(tenant_id, item_id, *, auto, scheduled_at=None, body="hello"):
     return outbox.add(tenant_id, SITE, item_id, sequence="presale",
                       step_id="intro", step_label="First reply",
                       body=body, auto=auto, scheduled_at=scheduled_at)
+
+
+def _caption(html, msg_id):
+    """The "Waiting to send" time caption for one row, read out of its own card.
+
+    Scoped to the `<article>` carrying this row's `msg-ob-<id>` rather than
+    grepped globally: `awaiting_approval` renders `due <t>` from the same filter
+    seventy lines up (`dashboard.html:364`), so a bare substring test would pass
+    on the wrong section's markup. Asserts it matched exactly one card, because
+    a helper that silently returns the first of two is how a caption test starts
+    describing a row other than the one it named.
+    """
+    cards = [a for a in re.split(r"<article\b", html)
+             if 'id="msg-ob-%d"' % msg_id in a]
+    assert len(cards) == 1, (
+        f"expected row {msg_id} on exactly one card, found {len(cards)}")
+    m = re.search(r'class="deal__age">(.*?)</span>', cards[0], re.S)
+    assert m, f"row {msg_id} rendered no deal__age caption at all"
+    return " ".join(m.group(1).split())
 
 
 def _statuses(tenant_id, item_id):
@@ -599,6 +618,114 @@ def test_a_sending_blocker_is_listed_even_though_it_cannot_be_called_off(
     assert "going out now" in html, (
         "the section's row template states a plan — 'sends <time>' — and the "
         "stamp it prints for a row already being delivered is in the past")
+
+
+@pytest.mark.parametrize("kind, hours, sending, word", [
+    ("due", -3, False, "due"),
+    ("deferred", 8, False, "sends"),
+    ("sending", -3, True, "going out now"),
+])
+def test_the_section_promises_a_future_send_only_when_the_send_is_future(
+        client, tenant, kind, hours, sending, word):
+    """Every value the caption's subject can take, pinned in one place.
+
+    A **due** `queued` row is the common case here — deferred rows are the
+    quiet-hours exception — and it used to fall through to `sends <t>`, a
+    future-tense promise about a stamp that is in the past by definition. Read
+    live: `sends 2026-08-15 20:07` under a heading that says "Waiting to send".
+
+    `outbox.send_state` already splits due from deferred so a due row gets no
+    schedule wording (`Queued to send…`, no time); the section printed the
+    schedule anyway, so one page described one row in two frames. The caption
+    now asks `row_deferred` — the same predicate — instead of guessing from the
+    stamp a second time.
+
+    Parametrized over all three states rather than the one a review named,
+    because shipping one side of a two-valued distinction is the failure this
+    ticket has now repeated three times.
+    """
+    _deal(tenant, "L1")
+    row = _add(tenant, "L1", auto=True, scheduled_at=_shift(hours))
+    if sending:
+        outbox.set_status(row["id"], outbox.SENDING)
+
+    html = SCRIPT_RE.sub("", client.get("/dashboard").get_data(as_text=True))
+    caption = _caption(html, row["id"])
+
+    fresh = outbox.get(row["id"])
+    assert fresh["status"] == (outbox.SENDING if sending else outbox.QUEUED), (
+        f"precondition: row is {fresh['status']!r}, so this pins the wrong arm")
+    assert caption.startswith(word), (
+        f"a {kind} row is captioned {caption!r}; expected it to lead with "
+        f"{word!r}")
+    # The property underneath the wording: only a stamp still in the future may
+    # be spoken about in the future tense. This is what fails on a due row.
+    if not sending:
+        deferred = outbox.row_deferred(fresh)
+        assert caption.startswith("sends") == deferred, (
+            f"caption {caption!r} uses future tense={caption.startswith('sends')} "
+            f"for a row whose scheduled time is still ahead={deferred}")
+
+
+def test_the_refusal_words_a_row_the_way_the_card_words_it(client, tenant):
+    """One row, two surfaces, one set of words.
+
+    The card reads its caption through `send_state` (so `row_deferred` applies
+    and a deferred row is "Scheduled to send"); `_release_refusal` used to reach
+    for `STATUS_LABELS` directly, which has no deferred branch. So the card said
+    "Scheduled to send" and clicking the sibling's Approve & send popped
+    `already "Queued to send…"` — the same row, named two different ways, in one
+    interaction. Asserted as *equality between the surfaces* rather than against
+    a literal, so it keeps holding if the wording changes.
+    """
+    _deal(tenant, "L1")
+    blocker = _add(tenant, "L1", auto=True, scheduled_at=_shift(8))
+    pending = _add(tenant, "L1", auto=False)
+
+    resp = client.post(f"/outbox/{pending['id']}/approve", data={"text": "hello"})
+    card = _governing(tenant, "L1")
+
+    assert resp.status_code == 409, (
+        "precondition: the deferred sibling no longer blocks, so there is no "
+        f"refusal to word (got {resp.status_code})")
+    assert card["id"] == blocker["id"], (
+        "precondition: the card is captioned off some other row")
+    assert resp.get_json()["error"] == card["label"], (
+        f"the card calls row {blocker['id']} {card['label']!r} and the refusal "
+        f"for that same row calls it {resp.get_json()['error']!r}")
+
+
+def test_the_section_stops_telling_the_operator_to_cancel_when_nothing_can_be(
+        client, tenant):
+    """The sub-copy is an instruction, so it has to match what is on offer.
+
+    Widening the section to every in-flight row made an all-`sending` section
+    reachable for the first time, and "cancel the ones that have not started"
+    then sits above zero buttons. Both arms are driven: the control proves the
+    clause is still there when it is actionable, so this cannot pass by the
+    sentence having been deleted outright.
+    """
+    _deal(tenant, "L1")
+    only = _add(tenant, "L1", auto=True)
+    outbox.set_status(only["id"], outbox.SENDING)
+
+    html = SCRIPT_RE.sub("", client.get("/dashboard").get_data(as_text=True))
+
+    assert outbox.get(only["id"])["status"] == outbox.SENDING, (
+        "precondition: the reclaim requeued the row, so a cancel *is* on offer")
+    assert "Waiting to send" in html, (
+        "precondition: the section did not render, so its copy asserts nothing")
+    assert "cancel the ones that have not started" not in html, (
+        "the section tells the operator to cancel rows while every row in it is "
+        "already being delivered and carries no cancel control")
+
+    _deal(tenant, "L2", guest="Omar K.")
+    _add(tenant, "L2", auto=True)
+    html = SCRIPT_RE.sub("", client.get("/dashboard").get_data(as_text=True))
+
+    assert "cancel the ones that have not started" in html, (
+        "control: a cancelable row is in the section and the copy that points "
+        "at its button is gone")
 
 
 def test_a_sending_blocker_is_not_offered_a_cancel_that_would_409(client, tenant):

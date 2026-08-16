@@ -287,6 +287,12 @@ def _board(tenant_id: str) -> dict:
         for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
     }
     send_rows = outbox.rows_by_item(tenant_id, SITE)
+    # One clock for the whole render. Both surfaces that describe a send read
+    # dueness off it — the card's label via `send_state` and the "Waiting to
+    # send" caption via `row_deferred` — and taking `timeframe.now()` twice lets
+    # a render that straddles a scheduled time caption one row as still upcoming
+    # and label the same row as due, on one page, from one request.
+    now_iso = timeframe.now()
     # Kept *after* the reads, unlike the reclaim above. This one spawns a thread
     # that writes the very rows just read, claiming `queued` into `sending`; in
     # front of the reads it would race its own render, so a board could show
@@ -308,7 +314,7 @@ def _board(tenant_id: str) -> dict:
             # The derived state, not the raw row: the template gates the
             # in-flight display and the disabled button on `send.in_flight`,
             # which is not a column.
-            "send": outbox.send_state(send_rows.get(deal["item_id"])),
+            "send": outbox.send_state(send_rows.get(deal["item_id"]), now_iso),
             "age": pipeline.humanize_age(deal.get("inquiry_at")),
             "age_hours": pipeline.age_hours(deal.get("inquiry_at")),
             "stage_label": pipeline.STAGE_LABELS.get(deal.get("stage"), deal.get("stage")),
@@ -362,15 +368,27 @@ def _board(tenant_id: str) -> dict:
         # count is fixed by design and asserted as such. Ordered as `for_tenant`
         # orders, so the section reads oldest-due first.
         #
-        # Two flags, not one. `cancelable` decides whether a control is offered
-        # at all and has to track the predicate the route enforces; `sending`
-        # decides the wording. They coincide today only because `CANCELABLE`
-        # excludes exactly `SENDING`, and a caption reading itself off an
-        # unrelated permission is the shape of this ticket's original defect.
+        # Three flags, not one. `cancelable` decides whether a control is offered
+        # at all and has to track the predicate the route enforces; `sending` and
+        # `deferred` decide the wording. `cancelable` and `sending` coincide
+        # today only because `CANCELABLE` excludes exactly `SENDING`, and a
+        # caption reading itself off an unrelated permission is the shape of this
+        # ticket's original defect.
+        #
+        # `deferred` is the one the caption was missing. Without it the section
+        # had a single "is it sending" bit and wrote the *stamp* for everything
+        # else, so a due `queued` row — the common case, since deferral is the
+        # quiet-hours exception — was captioned "sends <a time already past>".
+        # It comes from `outbox.row_deferred`, the same predicate `send_state`
+        # uses for the card, so the two surfaces cannot describe one row in two
+        # tenses. Computed against a single `now` for the whole render: taken
+        # per row, a board straddling the boundary could caption two identically
+        # scheduled rows differently.
         "blocking_sends": [
             {**card(by_id[m["item_id"]]), "pending": m,
              "cancelable": m["status"] in outbox.CANCELABLE,
-             "sending": m["status"] == outbox.SENDING}
+             "sending": m["status"] == outbox.SENDING,
+             "deferred": outbox.row_deferred(m, now_iso)}
             for m in sorted(
                 (m for rows in send_rows.values() for m in rows
                  if m["status"] in outbox.IN_FLIGHT and m["item_id"] in by_id),
@@ -1114,15 +1132,21 @@ def _release_refusal(tenant_id: str, msg: dict | None, msg_id: int,
     Read *after* the write refused, never before it: this is the explanation,
     not the guard. Deciding from a read like this one is exactly the race the
     CAS closes, and a second copy of the rule here would drift from it.
+
+    Worded through `outbox.row_label`, not `STATUS_LABELS`. The raw mapping has
+    no deferred branch, so for one row the card said "Scheduled to send" while
+    clicking its sibling popped `already "Queued to send…"` — the same row named
+    two ways on two surfaces, which is this ticket's own defect one layer up.
+    The refusal is still decided by the write; only the wording is shared.
     """
     if not msg:
         return "That message is no longer there."
     if msg["status"] not in from_statuses:
-        return outbox.STATUS_LABELS.get(msg["status"], msg["status"])
+        return outbox.row_label(msg)
     blocker = outbox.in_flight_for_item(tenant_id, SITE, msg["item_id"],
                                         exclude_id=msg_id)
     if blocker:
-        return outbox.STATUS_LABELS.get(blocker["status"], blocker["status"])
+        return outbox.row_label(blocker)
     # Refused, yet nothing explains it any more — the blocking row settled
     # between the UPDATE and this read. Don't invent a reason; say what is true.
     return "Another send for this guest was already under way."

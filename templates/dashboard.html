@@ -409,7 +409,14 @@
       <div class="sec-head">
         <h2>Waiting to send</h2>
         <span class="sec-count">{{ board.blocking_sends|length }}</span>
-        <span class="sec-sub">already approved — each one holds its guest's card until it goes out; cancel the ones that have not started</span>
+        {# The "cancel the ones that have not started" half is conditional
+           because the section can now legitimately contain zero cancelable
+           rows. Widening it to every `IN_FLIGHT` row made an all-`sending`
+           section reachable, and that sentence then sits above no buttons at
+           all — telling the operator to do something the page is not offering,
+           which is the same class of lie as the dead branch this ticket was
+           filed about, pointed the other way. #}
+        <span class="sec-sub">already approved — each one holds its guest's card until it goes out{% if board.blocking_sends|selectattr('cancelable')|list %}; cancel the ones that have not started{% endif %}</span>
       </div>
       <div class="sec-body">
         {% for c in board.blocking_sends %}
@@ -420,18 +427,38 @@
               <div class="deal__top">
                 <span class="deal__name">{{ c.deal.guest_name or 'Guest' }}</span>
                 <span class="badge badge--brand">{{ msg.step_label }}</span>
-                {# "sends 07:08" over a row a browser is already driving states a
+                {# Three captions, because the row's send time can be in three
+                   relations to now and each needs a different tense.
+
+                   "sends 07:08" over a row a browser is already driving states a
                    plan where there is now an outcome, and the stamp it would
                    print is in the past. The scheduled time stops being the
                    useful fact the moment the send starts.
 
-                   Keyed on `sending`, not on `cancelable`: those two coincide
-                   only because `CANCELABLE` happens to exclude exactly
-                   `SENDING`. Keyed on cancelability, any future change to that
-                   tuple would silently retitle a `queued` row "going out now" —
-                   a caption deciding itself from an unrelated permission is how
-                   this ticket's original defect read the wrong field. #}
-                <span class="deal__age">{% if c.sending %}going out now{% else %}sends {{ msg.scheduled_at|sched_local }}{% endif %}</span>
+                   The *same objection* applies to a due `queued` row, which is
+                   the common case here — deferral is the quiet-hours exception,
+                   so most rows in this section are due. Its stamp is by
+                   definition past, and "sends <yesterday 20:07>" under a heading
+                   that says "Waiting to send" is the identical lie one state
+                   earlier. It gets `due`, matching the wording the approval
+                   section already uses for this very filter (line 364) — that
+                   word is tense-neutral and reads correctly on a past stamp.
+
+                   `deferred` comes from `outbox.row_deferred`, the predicate
+                   `send_state` uses to caption the card, rather than being
+                   re-derived from the stamp here. `send_state` deliberately
+                   splits due from deferred and gives a due row no schedule
+                   wording at all; a section that re-decided dueness for itself
+                   is how one page came to describe one row in two frames.
+
+                   Keyed on `sending`/`deferred`, not on `cancelable`: sending
+                   and not-cancelable coincide only because `CANCELABLE` happens
+                   to exclude exactly `SENDING`. Keyed on cancelability, any
+                   future change to that tuple would silently retitle a `queued`
+                   row "going out now" — a caption deciding itself from an
+                   unrelated permission is how this ticket's original defect read
+                   the wrong field. #}
+                <span class="deal__age">{% if c.sending %}going out now{% elif c.deferred %}sends {{ msg.scheduled_at|sched_local }}{% else %}due {{ msg.scheduled_at|sched_local }}{% endif %}</span>
               </div>
               <div class="preview">{{ msg.body }}</div>
               <div class="actions">

@@ -214,7 +214,7 @@ def _in_flight_terms(alias: str) -> tuple[str, list]:
     then sends. A refusal you can see and
     undo is a different thing from the invisible one this ticket was filed
     about. `send_state` still *describes* a deferred row honestly — see
-    `_row_deferred` — because how a row is labelled and whether it blocks are
+    `row_deferred` — because how a row is labelled and whether it blocks are
     two questions, and fusing them is what produced the duplicate.
     """
     return (f"({alias}.status=? OR {alias}.status=?)", [QUEUED, SENDING])
@@ -230,7 +230,7 @@ def _row_in_flight(row: dict) -> bool:
     return row.get("status") in (QUEUED, SENDING)
 
 
-def _row_deferred(row: dict, now_iso: str) -> bool:
+def row_deferred(row: dict, now_iso: str | None = None) -> bool:
     """Is this a `queued` row still waiting on its scheduled time?
 
     Presentation only — deliberately *not* wired into any guard. A deferred row
@@ -241,9 +241,35 @@ def _row_deferred(row: dict, now_iso: str) -> bool:
     NULL/missing `scheduled_at` reads as due rather than deferred: a row with no
     readable stamp is not evidence about the future, and the plainer caption is
     the safer thing to show.
+
+    **Public because every surface that words a row has to ask this same
+    question**, and the ones that answered it themselves got it wrong. The
+    "Waiting to send" section re-derived tense from the stamp and captioned a
+    due row `sends <a time in the past>`; `_release_refusal` skipped the
+    question entirely and worded a deferred row off `STATUS_LABELS`, so the card
+    said "Scheduled to send" and the 409 for that same row said "Queued to
+    send…". One predicate, imported, or the page contradicts itself.
     """
     return (row.get("status") == QUEUED
-            and (row.get("scheduled_at") or "") > now_iso)
+            and (row.get("scheduled_at") or "") > (now_iso or timeframe.now()))
+
+
+def row_label(row: dict, now_iso: str | None = None) -> str:
+    """How one row is described to the operator — the only place that decides.
+
+    `STATUS_LABELS` is the raw mapping and is *not* the answer on its own: a
+    deferred row is `queued`, so the mapping calls it "Queued to send…" while
+    the card calls it "Scheduled to send". Callers that reached for the mapping
+    directly are how the same row ended up worded two ways on two surfaces.
+    Take this instead, and the caption and the refusal cannot drift.
+    """
+    if row_deferred(row, now_iso):
+        # Approved and waiting on its scheduled time rather than on a drainer.
+        # Still blocking — the operator's escape is "Don't send" on the board,
+        # not an enabled button here.
+        return "Scheduled to send"
+    status = row.get("status")
+    return STATUS_LABELS.get(status, status)
 
 
 def _governing_rank(row: dict, now_iso: str) -> tuple:
@@ -264,7 +290,7 @@ def _governing_rank(row: dict, now_iso: str) -> tuple:
     tiebreak, it is a coin flip on the others.
 
     **`scheduled_at` is what separates due from deferred here** — there is no
-    separate `_row_deferred` term, because it would be inert. Deferred means
+    separate `row_deferred` term, because it would be inert. Deferred means
     `scheduled_at > now` and due means `<= now`, so every due stamp already
     sorts before every deferred one, and `SENDING` is split off by the first
     term and is never deferred. A term restating that was measurably
@@ -810,10 +836,22 @@ def send_state(rows: list[dict] | None, now_iso: str | None = None) -> dict | No
     A deferred row is still in flight — it blocks, so the control stays
     disabled — but it is *labelled* differently, because "Queued to send…" over
     a message that leaves at 08:00 tomorrow is its own small dishonesty. That
-    split is deliberate: `_row_deferred` decides the caption, `_row_in_flight`
+    split is deliberate: `row_deferred` decides the caption, `_row_in_flight`
     decides the refusal, and an earlier round fusing the two is what let a
-    second message reach the guest. The caption carries the time (`scheduled_at`
-    ships in this payload) so "Scheduled to send" is checkable rather than vague.
+    second message reach the guest.
+
+    **This label is bare wording and carries no time.** An earlier draft of this
+    docstring claimed the time shipped with it, which was never true of any
+    surface: `/api/send-states` projects to
+    `("status","label","error","step","in_flight")` and the card renders only
+    `label`/`in_flight`, so the operator read "Scheduled to send" with nothing to
+    check it against. The stamp reaches them from the *other* surface instead —
+    every in-flight row, including whichever one governs here, is listed in
+    "Waiting to send" with its own `scheduled_at` rendered in the property's
+    timezone by `sched_local` (`dashboard.html:434`). `scheduled_at` and `id`
+    stay in this payload for callers that want the governing row itself; the
+    template deliberately does not word a time out of them, because a second
+    place formatting the same stamp is what this ticket keeps having to unpick.
     """
     rows = [m for m in (rows or []) if m]
     if not rows:
@@ -824,12 +862,7 @@ def send_state(rows: list[dict] | None, now_iso: str | None = None) -> dict | No
                     default=rows[-1])
     status = governing["status"]
     in_flight = _row_in_flight(governing)
-    label = STATUS_LABELS.get(status, status)
-    if _row_deferred(governing, now):
-        # Approved and waiting on its scheduled time rather than on a drainer.
-        # Still blocking — the operator's escape is "Don't send" on the board,
-        # not an enabled button here.
-        label = "Scheduled to send"
+    label = row_label(governing, now)
     return {
         "id": governing["id"],
         "status": status,
