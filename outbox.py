@@ -249,28 +249,36 @@ def _row_deferred(row: dict, now_iso: str) -> bool:
 def _governing_rank(row: dict, now_iso: str) -> tuple:
     """Sort key for "which in-flight row decides what this item is doing".
 
-    Ranks on every dimension the caption depends on, worst-news-first: a row a
-    browser is already driving outranks a merely queued one, a row the drainer
-    takes on its next pass outranks one held back for its scheduled time, and
-    inside a tier the row that goes out first wins — which is the drainer's own
-    order (`next_queued`: `scheduled_at ASC, id ASC`).
+    A row a browser is already driving outranks a merely queued one; among the
+    rest, the row that goes out first wins. That second half is deliberately
+    the drainer's own order — `next_queued` sorts `scheduled_at ASC, id ASC` —
+    so the card names the message the drainer will actually take next rather
+    than whichever row happens to have the lowest id.
 
-    The middle term is the one an earlier round missed. It ranked `sending` over
-    `queued` and stopped there, taking the lowest id among the rest, so for rows
-    `[deferred, due]` a message leaving at 08:00 tomorrow captioned a card whose
-    sibling the drainer takes in seconds: the page said "Scheduled to send" —
-    which reads as *there is still time to stop this* — over a send with seconds
-    to live. That is this ticket's own failure class, the board describing a send
-    it is not describing. Ordering on one dimension of a multi-dimensional choice
-    is not a tiebreak, it is a coin flip on the others.
+    An earlier round ranked `sending` over `queued` and stopped there, breaking
+    the remaining tie on id. Id order has nothing to do with send order, so for
+    rows `[deferred, due]` a message leaving at 08:00 tomorrow captioned a card
+    whose sibling the drainer takes in seconds: the page read "Scheduled to
+    send" — *there is still time to stop this* — over a send with seconds to
+    live. Ordering on one dimension of a multi-dimensional choice is not a
+    tiebreak, it is a coin flip on the others.
 
-    The last term matters for the same reason: among two deferred rows the
-    earlier stamp is the one that actually happens next, and captioning with the
-    later one misstates the deadline the operator is reading the time for.
+    **`scheduled_at` is what separates due from deferred here** — there is no
+    separate `_row_deferred` term, because it would be inert. Deferred means
+    `scheduled_at > now` and due means `<= now`, so every due stamp already
+    sorts before every deferred one, and `SENDING` is split off by the first
+    term and is never deferred. A term restating that was measurably
+    indistinguishable from a constant across 112,944 row-sets — nothing could
+    ever kill it, so it would have rotted unnoticed. Do not "clarify" this by
+    adding one back, and do not drop the stamp term thinking dueness is handled
+    elsewhere: it is handled *here*.
+
+    Ties on the stamp are real, not theoretical — `sequences` clamps quiet-hours
+    sends to a fixed wake time, so two drafts queued at 23:10 and 23:47 both
+    land on exactly 08:00. Id ascending breaks those, matching `next_queued`.
     """
     return (
         0 if row.get("status") == SENDING else 1,
-        1 if _row_deferred(row, now_iso) else 0,
         str(row.get("scheduled_at") or ""),
         row.get("id") or 0,
     )

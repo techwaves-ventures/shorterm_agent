@@ -361,9 +361,16 @@ def _board(tenant_id: str) -> dict:
         # rather than a seventh `for_tenant` query, because the board's query
         # count is fixed by design and asserted as such. Ordered as `for_tenant`
         # orders, so the section reads oldest-due first.
+        #
+        # Two flags, not one. `cancelable` decides whether a control is offered
+        # at all and has to track the predicate the route enforces; `sending`
+        # decides the wording. They coincide today only because `CANCELABLE`
+        # excludes exactly `SENDING`, and a caption reading itself off an
+        # unrelated permission is the shape of this ticket's original defect.
         "blocking_sends": [
             {**card(by_id[m["item_id"]]), "pending": m,
-             "cancelable": m["status"] in outbox.CANCELABLE}
+             "cancelable": m["status"] in outbox.CANCELABLE,
+             "sending": m["status"] == outbox.SENDING}
             for m in sorted(
                 (m for rows in send_rows.values() for m in rows
                  if m["status"] in outbox.IN_FLIGHT and m["item_id"] in by_id),

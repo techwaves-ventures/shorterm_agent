@@ -390,8 +390,15 @@
          see or undo is the same class of lie as the dead in-flight branch this
          ticket was filed about. "Don't send" is the escape: `queued` is in
          `outbox.CANCELABLE`, and cancelling one immediately unblocks the guest.
-         `sending` is deliberately absent — that row cannot be called off, and
-         offering a button that would 409 is not visibility.
+
+         `sending` rows are listed too, read-only. Leaving them out made this
+         section complete about what the operator can fix and silent about what
+         they cannot: cancel every blocker shown and the guest could still be
+         409'd, with nothing left to click. The section answers "what is holding
+         this guest", so it has to list the whole set and be honest about which
+         half is actionable — `outbox.CANCELABLE` excludes `sending` because a
+         browser is already driving it, and a button that answers 409 is not an
+         affordance.
 
          The heading says "Waiting to send" rather than "Queued to send" because
          a deferred row's own caption reads "Scheduled to send": two names for
@@ -416,22 +423,28 @@
                 {# "sends 07:08" over a row a browser is already driving states a
                    plan where there is now an outcome, and the stamp it would
                    print is in the past. The scheduled time stops being the
-                   useful fact the moment the send starts. #}
-                <span class="deal__age">{% if c.cancelable %}sends {{ msg.scheduled_at|sched_local }}{% else %}going out now{% endif %}</span>
+                   useful fact the moment the send starts.
+
+                   Keyed on `sending`, not on `cancelable`: those two coincide
+                   only because `CANCELABLE` happens to exclude exactly
+                   `SENDING`. Keyed on cancelability, any future change to that
+                   tuple would silently retitle a `queued` row "going out now" —
+                   a caption deciding itself from an unrelated permission is how
+                   this ticket's original defect read the wrong field. #}
+                <span class="deal__age">{% if c.sending %}going out now{% else %}sends {{ msg.scheduled_at|sched_local }}{% endif %}</span>
               </div>
               <div class="preview">{{ msg.body }}</div>
               <div class="actions">
+                {# The button is gated on `cancelable` — the real predicate the
+                   route enforces — so it can never offer a control that 409s.
+                   The wording is chosen separately, for the same reason as the
+                   caption above. #}
                 {% if c.cancelable %}
                 <button class="mini danger" onclick="cancelMsg({{ msg.id }})">Don't send</button>
-                {% else %}
-                {# A browser is already driving this one. `outbox.CANCELABLE`
-                   excludes `sending`, so a "Don't send" here would answer 409 —
-                   and a button that refuses is not an affordance. It is listed
-                   anyway because the section answers "what is holding this
-                   guest", and omitting the single blocker the operator cannot
-                   clear is how the page came to be complete about what it can
-                   fix and silent about what it cannot. #}
+                {% elif c.sending %}
                 <span class="muted">Sending… — cannot be called off</span>
+                {% else %}
+                <span class="muted">Cannot be called off</span>
                 {% endif %}
               </div>
               <div class="msg" id="msg-ob-{{ msg.id }}"></div>

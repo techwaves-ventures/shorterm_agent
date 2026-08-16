@@ -657,3 +657,37 @@ def test_the_render_that_reclaims_a_stranded_send_shows_the_reclaimed_state(
         "the render that reclaimed the row still shows it as uncancelable, so "
         "the operator sees a blocker with no escape that the server had already "
         "made clearable")
+
+
+@pytest.mark.parametrize("order", ["ascending", "descending"])
+def test_rows_sharing_one_clamped_stamp_are_broken_the_drainer_s_way(tenant, order):
+    """Identical `scheduled_at` is reachable, so the id tiebreak is load-bearing.
+
+    `sequences._clamp_quiet_hours` returns `datetime.combine(date, QUIET_START)`
+    — a *fixed* wake time — so two drafts queued at 23:10 and 23:47 both land on
+    exactly 08:00. Nothing about the stamp separates them after that, and the
+    card has to name the one the drainer will really take.
+
+    So this asserts agreement with `next_queued` rather than a hardcoded id:
+    the property is "the card names what goes out next", and pinning it to the
+    drainer's own query is what keeps the two from drifting apart. Reversing the
+    id term passes every other test in this file.
+    """
+    _deal(tenant, "L1")
+    clamped = _shift(-1)                     # one stamp, both rows, already due
+    rows = [_add(tenant, "L1", auto=True, scheduled_at=clamped, body="first"),
+            _add(tenant, "L1", auto=True, scheduled_at=clamped, body="second")]
+    if order == "descending":                # same tie, opposite list order
+        rows = list(reversed(rows))
+    assert rows[0]["scheduled_at"] == rows[1]["scheduled_at"], (
+        "precondition: the two rows do not actually share a stamp, so this "
+        "asserts nothing about the tiebreak")
+
+    state = outbox.send_state([outbox.get(r["id"]) for r in rows])
+    drainer_takes = outbox.next_queued(tenant)
+
+    assert drainer_takes is not None, "precondition: neither row is deliverable"
+    assert state["id"] == drainer_takes["id"], (
+        f"{order}: the card is captioned by row {state['id']} but the drainer "
+        f"takes row {drainer_takes['id']} next — with the stamps tied, the id "
+        "order is the only thing left to agree on and it does not")
