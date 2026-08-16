@@ -261,8 +261,7 @@ def _board(tenant_id: str) -> dict:
     # existing install picks up the lifecycle without a migration step.
     pipeline.backfill(tenant_id, SITE, items, responses, config.get_units(tenant_id))
     deals = pipeline.all_deals(tenant_id, SITE)
-    # Self-heal on view: requeue sends stranded by a crashed process, and make
-    # sure something is draining if messages are waiting (e.g. after a restart).
+    # Self-heal on view: requeue sends stranded by a crashed process.
     #
     # This runs *before* the outbox reads below, not after. It writes rows the
     # board then renders — a stranded `sending` row becomes `queued` — so
@@ -282,14 +281,22 @@ def _board(tenant_id: str) -> dict:
     # `has_open_step` counts it as open, so the agent never re-drafts that step
     # for that guest again.
     outbox.reclaim_stuck_sending()
-    if _can_deliver_in_process() and outbox.queued_tenants():
-        automation.start_drainer(SITE)
 
     pending = {
         m["item_id"]: m
         for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
     }
     send_rows = outbox.rows_by_item(tenant_id, SITE)
+    # Kept *after* the reads, unlike the reclaim above. This one spawns a thread
+    # that writes the very rows just read, claiming `queued` into `sending`; in
+    # front of the reads it would race its own render, so a board could show
+    # "Sending…" for a row whose claim had not been made when the page was
+    # composed, and the two outbox reads above could straddle the claim and
+    # disagree with each other. The reclaim has no such problem — it is
+    # synchronous and finishes before the reads begin. "Heal before reading"
+    # applies to the write this request completes, not to the one it starts.
+    if _can_deliver_in_process() and outbox.queued_tenants():
+        automation.start_drainer(SITE)
 
     def card(deal: dict) -> dict:
         item = items.get(deal["item_id"], {})
