@@ -308,6 +308,17 @@ def test_the_capability_decision_reads_playwright_and_the_worker_queue_flag(
     must not depend on whether the host running the suite happens to have
     Playwright installed, nor on `FORCE_WORKER_QUEUE` residue left behind by
     an earlier test file.
+
+    Scope, precisely — the same disclosure the test above carries, because the
+    recursion stops here rather than ending. Patching `playwright_available`
+    means this covers `_can_deliver_in_process`'s body, *not* the probe's:
+    inverting `check_leads.py:60` to `sync_playwright is None` ships green
+    through the whole suite, measured. That is a deliberate stop (the probe is
+    a branchless import check, and mocking one level further only moves the
+    boundary again), not a claim of coverage. Two other things this does not
+    reach: `_use_worker_queue`'s `"true"`/`"yes"` tokens, which nothing sets,
+    and the four sites that inline this expression instead of calling the
+    helper (`dashboard.py:142`, `:193`, `:1185`, `:1200`).
     """
     import check_leads
     import dashboard
