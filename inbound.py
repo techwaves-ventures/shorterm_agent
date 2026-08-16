@@ -33,6 +33,7 @@ import logging
 import os
 import re
 from email.utils import parseaddr
+from html.parser import HTMLParser
 
 log = logging.getLogger(__name__)
 
@@ -186,6 +187,186 @@ def extract_sender(payload: dict) -> str:
     return ""
 
 
+# Tags whose *content* is markup rather than prose, and must not reach the body.
+_OPAQUE_ELEMENTS = frozenset({"script", "style"})
+# End tags that closed a block in the old regex, and so still become a newline.
+_BLOCK_END_TAGS = frozenset({"p", "div", "tr"})
+
+# Stand-in for `&` while the parser runs. `html.parser` cannot be asked to leave
+# entities alone *and* stay well-behaved: with `convert_charrefs=False` an
+# incomplete reference (`?id=9&#details` in a guest's URL) makes it abandon the
+# scan and hand back every remaining byte as raw text, so the whole notification
+# lands in the body as markup and `parse` finds nothing. Hiding `&` from it
+# sidesteps that path entirely and keeps entities byte-exact, which is what the
+# old substitution did and what the money/email patterns downstream expect.
+# U+E000 is a private-use codepoint; any that somehow arrive are dropped first so
+# the round trip cannot invent one.
+_AMP_SENTINEL = "\ue000"
+
+
+class _BodyExtractor(HTMLParser):
+    """Turn notification HTML into the plain text the parser downstream reads.
+
+    Replaces a `<[^>]+>` substitution that treated a bare `<` in guest prose as a
+    tag opener: "my budget is < $2400" swallowed everything up to the next `>`,
+    which is normally the rest of the message — the guest's ask and their reply
+    address — plus several real tags. A real parser knows a `<` that no tag name
+    follows is text, so it survives (VEN-152).
+
+    Written as a parser rather than a smarter regex because no single tag pattern
+    serves the four grammars an ESP actually emits — tags, `<!-- -->` comments,
+    `<? ?>` processing instructions and `<![CDATA[ ]]>`. Every regex tried either
+    kept eating prose or leaked a comment's innards into the guest-visible body,
+    and a leaked prefix is worse than the bug: it un-anchors the label matching in
+    `sites.ff_email`, `parse` returns None and the enquiry is dropped outright.
+
+    The unterminated-construct handling exists for the same reason, and is the
+    part worth reading twice. Real mail is full of truncated markup, and
+    `html.parser` reports an unclosed `<style>` or `<!--` by handing over the
+    entire rest of the document as one opaque blob. Dropping that blob — the
+    obvious reading of "script bodies are not prose" — silently destroys every
+    enquiry whose template has an unclosed `<style>` in its head. So the blob is
+    kept and re-stripped as markup instead, which is what the old regex did with
+    it. `suppress_opaque=False` marks that second pass and stops it recursing.
+    """
+
+    def __init__(self, suppress_opaque: bool = True) -> None:
+        super().__init__(convert_charrefs=True)
+        self._out: list[str] = []
+        self._opaque: list[str] = []
+        self._opaque_depth = 0
+        self._suppress_opaque = suppress_opaque
+        self._at_eof = False
+
+    # -- collection ---------------------------------------------------------
+    def _emit(self, text: str) -> None:
+        (self._opaque if self._opaque_depth else self._out).append(text)
+
+    def _recover(self, markup: str) -> None:
+        """Salvage a blob the parser could not terminate, as the old regex would.
+
+        Re-stripped rather than emitted raw: the blob is usually real markup, and
+        pasting it into the body verbatim un-anchors the `Traveler:` label just as
+        badly as dropping it. The nested pass never suppresses, so `<script>` in
+        an already-unterminated blob cannot start this over.
+        """
+        if not markup:
+            return
+        nested = _BodyExtractor(suppress_opaque=False)
+        nested.feed(markup)
+        self._out.append(nested.finish())
+
+    def finish(self) -> str:
+        self._at_eof = True
+        self.close()
+        # Still inside an element that never closed: its "body" is the remainder
+        # of the email, not a script.
+        if self._opaque_depth:
+            pending, self._opaque = "".join(self._opaque), []
+            self._opaque_depth = 0
+            self._recover(pending)
+        return "".join(self._out)
+
+    # -- element boundaries -------------------------------------------------
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in _OPAQUE_ELEMENTS and self._suppress_opaque:
+            # Emit the separator before going quiet, so the surrounding words do
+            # not run together once the script's body is dropped.
+            self._emit(" ")
+            self._opaque_depth += 1
+            return
+        self._emit("\n" if tag == "br" else " ")
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        # `<br/>` is a start tag that never opens a region; a self-closing
+        # script/style likewise has no content to suppress.
+        self._emit("\n" if tag == "br" else " ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _OPAQUE_ELEMENTS and self._opaque_depth:
+            self._opaque_depth -= 1
+            if not self._opaque_depth:
+                self._opaque.clear()   # a properly closed script body is not prose
+            self._emit(" ")
+            return
+        self._emit("\n" if tag in _BLOCK_END_TAGS else " ")
+
+    # -- prose --------------------------------------------------------------
+    def handle_data(self, data: str) -> None:
+        self._emit(data)
+
+    # No `handle_entityref`/`handle_charref`: the `&` sentinel means the parser
+    # never sees a reference, so those hooks are unreachable and an override
+    # would be untestable dead code. Entities survive because they are hidden
+    # from the parser and restored afterwards, not because they are handled.
+    # Reconstructing them here is what corrupted ordinary mail: html.parser
+    # matches `&name` with no semicolon, so re-emitting `f"&{name};"` turned a
+    # guest's "Q&A" into "Q&A;" and moved the message's dedup id.
+
+    # -- markup that is never prose ----------------------------------------
+    # Each becomes a separator, never its contents. Outlook puts a conditional
+    # comment in nearly every HTML mail it sends, so leaking these is the common
+    # case, not an edge one. The `_at_eof` branch is the exception: a construct
+    # still open when the document ends is not a comment, it is the rest of the
+    # email, and discarding it loses the enquiry.
+    def _markup(self, data: str) -> None:
+        if self._at_eof:
+            self._recover(data)
+        else:
+            self._emit(" ")
+
+    def handle_comment(self, data: str) -> None:
+        # A downlevel-revealed conditional (`<!--[if gte mso 9]>…`) that never
+        # closed still opens with a marker, and that marker is not prose.
+        if self._at_eof and data.startswith("[if") and ">" in data:
+            data = data.split(">", 1)[1]
+        self._markup(data)
+
+    def handle_decl(self, decl: str) -> None:
+        self._markup(decl)
+
+    def handle_pi(self, data: str) -> None:
+        self._markup(data)
+
+    def unknown_decl(self, data: str) -> None:
+        # `<![CDATA[ … ` arrives with its opener as part of the payload; that
+        # marker is markup even when the section it opened never closed.
+        if self._at_eof and data.upper().startswith("CDATA["):
+            data = data[len("CDATA["):]
+        self._markup(data)
+
+
+def _legacy_strip_html(value: str) -> str:
+    """The pre-VEN-152 substitution, kept only as a last-resort safety net."""
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", value)
+    return re.sub(r"<[^>]+>", " ", text)
+
+
+def strip_html(value: str) -> str:
+    """Extract readable text from an HTML mail part. Never raises, never blanks.
+
+    `accept` turns an unparseable body into a `Rejected`, and the webhook still
+    answers 202 — so the provider never retries and the enquiry is gone. Every
+    failure here has to degrade to "some text" rather than "no text".
+    """
+    guarded = value.replace(_AMP_SENTINEL, "").replace("&", _AMP_SENTINEL)
+    extractor = _BodyExtractor()
+    try:
+        extractor.feed(guarded)
+        text = extractor.finish()
+    except Exception:
+        # html.parser is lenient by design, so this is belt and braces — but the
+        # cost of being wrong is a destroyed enquiry, not a stack trace.
+        log.warning("inbound: HTML extraction failed, falling back to tag strip")
+        text = _legacy_strip_html(guarded)
+    if not text.strip() and value.strip():
+        # Whatever happened, returning nothing guarantees the enquiry is dropped.
+        # The old substitution is worse at prose but it never blanks a document.
+        log.warning("inbound: HTML extraction came back empty, falling back")
+        text = _legacy_strip_html(guarded)
+    return re.sub(r"[ \t]+", " ", text.replace(_AMP_SENTINEL, "&"))
+
+
 def extract_body(payload: dict) -> str:
     for key in ("text", "plain", "TextBody", "body-plain", "stripped-text", "body"):
         value = payload.get(key)
@@ -196,10 +377,7 @@ def extract_body(payload: dict) -> str:
     for key in ("html", "HtmlBody", "body-html"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
-            text = re.sub(r"(?is)<(script|style).*?</\1>", " ", value)
-            text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", text)
-            text = re.sub(r"<[^>]+>", " ", text)
-            return re.sub(r"[ \t]+", " ", text)
+            return strip_html(value)
     return ""
 
 
