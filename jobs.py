@@ -13,9 +13,11 @@ logged. Job `message` values are UI-safe (site/progress text only, no traveler
 PII), and worker errors are stored as short friendly strings, not raw traces.
 
 Timestamps are stored as ISO strings we control so worker-liveness math is done
-in Python (portable across SQLite and Postgres, no SQL date arithmetic).
+in Python (portable across SQLite and Postgres, no SQL date arithmetic). Every
+one of them is *absolute* (UTC, offset-carrying) because every one of them is
+written on one host and read on another — see `_now_utc` and `_age_seconds`.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import crypto
 import db
@@ -60,44 +62,87 @@ STALE_JOB_MESSAGE = (
 )
 
 
-def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
-
-
 def _now_utc() -> str:
-    """An *absolute* stamp, for the one column here compared across processes.
+    """An *absolute* stamp. Every timestamp in this table crosses a host boundary.
 
-    Every other timestamp in this module is naive local wall-clock, which is
-    fine while a single host both writes and reads it. `last_seen` is not that
-    column: it is written by the *worker* host (`heartbeat`) and read by the
-    *web* host (`worker_online`), and the documented production topology runs
-    those as separate processes over one shared database with nothing pinning
-    `TZ` on either. Comparing a naive stamp across that boundary is off by the
-    offset between the hosts, which always exceeds WORKER_TTL_SECONDS, so the
-    beacon does not degrade -- it inverts. A worker to the east stamps the
-    future, the subtraction goes negative, and a crashed worker reads online
-    forever, which is precisely when the liveness signal is load-bearing:
-    `reap_stale` then never frees its stranded jobs.
+    Unlike `outbox`, where only one column is read by a different process than
+    wrote it, there is no naive-safe column here: this whole module exists to let
+    the web dyno and the worker VM talk through one shared `DATABASE_URL`, and
+    the worker may sit in any timezone while the web host runs UTC.
 
-    So this column carries its offset. Deliberately narrow, mirroring
-    `outbox._now_utc`: `_now()` is shared with `created_at`/`updated_at`, which
-    are left naive here only because they are outside this change's scope --
-    *not* because they were checked and cleared. Both in fact cross the same
-    host boundary and are wrong in the same way: `created_at` via `reap_stale`,
-    and `updated_at` via `_cooldown_remaining`, where a westward worker loses
-    the FurnishedFinder login-email cooldown entirely and an eastward one locks
-    the user out for hours. Tracked separately; do not read this helper's
-    narrowness as a judgement that those are safe.
+      * `ff_worker.last_seen` is written ONLY by the worker (`heartbeat`) and read
+        ONLY by the web host (`worker_online`). With WORKER_TTL_SECONDS=90, *any*
+        nonzero offset breaks it: westward the worker reads permanently offline
+        and `reap_stale` kills live scrapes on every dashboard poll; eastward it
+        reads permanently online and crash recovery never fires.
+      * `ff_jobs.created_at` is written by the web host at `enqueue` and read by
+        the worker at startup (`worker.py` -> `reap_stale(active_worker_id=...)`).
+        Westward the MAX_ACTIVE_JOB_SECONDS backstop silently never trips, so a
+        wedged-but-heartbeating job hangs forever with no route out.
+      * `ff_jobs.updated_at` is written by the worker (`set_status`) and read by
+        the web host (`_cooldown_remaining`). Westward the FurnishedFinder
+        login-email burst guard is defeated; eastward it surfaces an absurd
+        cooldown ("please wait 43319s") that locks the tenant out of retrying.
+
+    So the rule here is simpler than in `outbox`: one helper, used for every
+    write. Nothing in this table is compared as a *local wall clock* (no
+    quiet-hours semantics, and ordering is by `id`, never by timestamp), so there
+    is no reason to keep a naive writer around. VEN-142.
     """
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _age_seconds(value: str | None) -> float | None:
+    """How long ago `value` happened, in absolute seconds, or None if unreadable.
+
+    Stamps written by `_now_utc` carry their offset and are compared absolutely,
+    which is the whole point. A *naive* value is a row written before this module
+    stamped absolute (or by a not-yet-upgraded host mid-rollout); it names a wall
+    clock on an unknown host, so it is read as the reader's own local time.
+
+    That is exactly what this code did before VEN-142, and reading it any other
+    way would be a regression rather than a fix:
+
+      * Treating naive as UTC would shift every legacy row by the reader's offset
+        — on the ordinary single-host deploy, where naive stamps are *correct*
+        today, that would newly break the cooldown and reap live jobs.
+      * Declining to judge it (returning None, as `outbox.reclaim_stuck_sending`
+        does for its own column) is unsafe *here*, because for `created_at` this
+        age IS the last line of defence: None skips the wedged-job backstop and
+        strands the tenant on "Checking…" forever, which is worse than base.
+
+    The naive branch subtracts wall clock from wall clock, which is bit-for-bit
+    what the previous release computed. It deliberately does NOT convert the naive
+    stamp with `astimezone()` first: that resolves the offset as of the *stamp's*
+    wall clock (with `fold=0`), while the reader's "now" carries the offset in
+    force *now*, so the two disagree by the DST delta whenever a transition falls
+    between them. Inside the autumn fall-back hour that reads a 60-second-old
+    heartbeat as 3660 seconds old — which fails a live worker as offline, reaps
+    the `running` job it is driving, and zeroes the cooldown, i.e. it re-creates
+    all three harms this change exists to remove, on a single-host deploy the
+    previous release got right.
+
+    Legacy rows therefore behave exactly as they did before, DST included. They
+    also converge, though not uniformly: the worker re-stamps `last_seen` every
+    15s, while `created_at` is written once at `enqueue` and never re-stamped, so
+    a job queued by a not-yet-upgraded web host keeps a naive `created_at` for its
+    whole life. For that column the cross-host defect persists until the *writer*
+    is upgraded; this reader change alone does not cure it.
+    """
     if not value:
         return None
     try:
-        return (datetime.now() - datetime.fromisoformat(str(value))).total_seconds()
-    except Exception:
+        stamp = datetime.fromisoformat(str(value))
+        now = datetime.now(timezone.utc)
+        if stamp.tzinfo is None:
+            # Wall clock minus wall clock, exactly as the previous release did.
+            return (now.astimezone().replace(tzinfo=None) - stamp).total_seconds()
+        return (now - stamp).total_seconds()
+    except Exception:  # noqa: BLE001 - an unreadable stamp must not 500 a page
+        # Kept as broad as the previous release's: this feeds `worker_online` ->
+        # `reap_stale` -> `public_state`/`enqueue`, none of which is wrapped, so a
+        # raise here surfaces as a 500 on the dashboard rather than a bad age.
+        # `datetime.min`/`max`-adjacent values overflow on conversion.
         return None
 
 
@@ -204,7 +249,34 @@ def _cooldown_remaining(recent: dict | None) -> int:
     FurnishedFinder login emails, so it only applies to errors from an actual
     browser/login attempt. A reaper-induced error (STALE_JOB_MESSAGE) means the
     worker crashed/restarted before finishing — no login/email happened — so the
-    user must be able to retry immediately (acceptance criterion #1)."""
+    user must be able to retry immediately (acceptance criterion #1).
+
+    A *negative* age means `updated_at` is in the future: the host that wrote it
+    has a clock ahead of ours. Stamping absolutely (VEN-142) removes the timezone
+    cause of that, but not the remaining one — NTP skew between two machines —
+    and `int(ERROR_RETRY_COOLDOWN_SECONDS - age)` on an unclamped negative is
+    what actually produced the harm this ticket filed: a worker 12h fast renders
+    as "Please wait 43309s", a half-day lockout from a 120-second guard.
+
+    Clamped to the full cooldown rather than to 0, deliberately. Both directions
+    are defensible and each re-creates one of the two harms named in the ticket,
+    so the tiebreaker is which one we can take back:
+
+      * Clamping to 0 lets the tenant retry at once, but under a persistently
+        fast writer *every* stamp reads future, so the guard is not merely
+        skipped once — it is off for as long as the skew lasts. Each Check-now
+        click then bursts a real FurnishedFinder login email. That harm lands on
+        a third party's system and we cannot undo it.
+      * Clamping to the cap bounds the wait, and the displayed number, at
+        `ERROR_RETRY_COOLDOWN_SECONDS`. The guard keeps working and nothing
+        leaves the building.
+
+    The residual, stated plainly so the next reader does not think it is cured:
+    while the writer's clock stays ahead, each poll re-reports the cap, so the
+    tenant's wait persists until real time catches up to the stamp. That is also
+    what the previous release did — it simply lied about the number as well.
+    Repairing a future-dated stamp at the source is VEN-133's territory, not this
+    reader's; this function's job is to refuse to turn one into a half-day ban."""
     if not recent or recent.get("status") != ERROR:
         return 0
     if (recent.get("message") or "") == STALE_JOB_MESSAGE:
@@ -212,6 +284,8 @@ def _cooldown_remaining(recent: dict | None) -> int:
     age = _age_seconds(recent.get("updated_at"))
     if age is None or age >= ERROR_RETRY_COOLDOWN_SECONDS:
         return 0
+    if age < 0:
+        return ERROR_RETRY_COOLDOWN_SECONDS
     return int(ERROR_RETRY_COOLDOWN_SECONDS - age)
 
 
@@ -233,7 +307,7 @@ def enqueue(tenant_id: str, kind: str = "scrape") -> dict:
         throttled = dict(recent)
         throttled["cooldown_remaining"] = remaining
         return throttled
-    now = _now()
+    now = _now_utc()
     with _conn() as c:
         job_id = db.insert_returning_id(
             c,
@@ -281,7 +355,7 @@ def submit_otp(tenant_id: str, code: str) -> bool:
     with _conn() as c:
         c.execute(
             "UPDATE ff_jobs SET otp_enc=?, updated_at=? WHERE id=? AND tenant_id=?",
-            (enc, _now(), job["id"], str(tenant_id)),
+            (enc, _now_utc(), job["id"], str(tenant_id)),
         )
     return True
 
@@ -293,7 +367,7 @@ def cancel_active(tenant_id: str) -> None:
         c.execute(
             f"UPDATE ff_jobs SET status=?, updated_at=? "
             f"WHERE tenant_id=? AND status IN ({placeholders})",
-            (CANCELED, _now(), str(tenant_id), *ACTIVE_STATES),
+            (CANCELED, _now_utc(), str(tenant_id), *ACTIVE_STATES),
         )
 
 
@@ -319,7 +393,7 @@ def claim_next(worker_id: str) -> dict | None:
         cur = c.execute(
             "UPDATE ff_jobs SET status=?, worker_id=?, message=?, updated_at=? "
             "WHERE id=? AND status=?",
-            (RUNNING, worker_id, "Starting…", _now(), job["id"], QUEUED),
+            (RUNNING, worker_id, "Starting…", _now_utc(), job["id"], QUEUED),
         )
         if getattr(cur, "rowcount", 1) == 0:
             return None  # lost the race to another worker
@@ -331,7 +405,7 @@ def set_status(job_id: int, status: str, message: str | None = None,
                counts: str | None = None) -> None:
     """Update a job's status/message/counts. `message` must be UI-safe."""
     sets = ["status=?", "updated_at=?"]
-    vals: list = [status, _now()]
+    vals: list = [status, _now_utc()]
     if message is not None:
         sets.append("message=?")
         vals.append(message[:500])
@@ -354,7 +428,7 @@ def consume_otp(job_id: int) -> str | None:
             return None
         c.execute(
             "UPDATE ff_jobs SET otp_enc=NULL, updated_at=? WHERE id=?",
-            (_now(), job_id),
+            (_now_utc(), job_id),
         )
         enc = row[0]
     return crypto.decrypt(enc)
@@ -373,33 +447,43 @@ def heartbeat(worker_id: str) -> None:
 
 
 def worker_online() -> bool:
-    """True if a worker heartbeated within WORKER_TTL_SECONDS."""
+    """True if a worker heartbeated within WORKER_TTL_SECONDS.
+
+    `last_seen` is written on the worker and read here on the web host, so the
+    comparison must be absolute — it goes through `_age_seconds` rather than
+    subtracting wall clocks, which also means an unreadable stamp is handled in
+    exactly one place instead of two.
+
+    The two non-ordinary ages fail in *opposite* directions, which is worth
+    naming because the safe-sounding half is only half the story:
+
+      * An *unknown* age (None — unparseable, or absent row) reads offline. That
+        is what an empty `ff_worker` table already meant, and it fails towards
+        crash recovery: a stranded job gets reaped rather than the dashboard
+        being stranded.
+      * A *future-dated* stamp — a worker whose clock is ahead of ours — gives a
+        negative age, which is `<= WORKER_TTL_SECONDS` and so reads **online**.
+        That fails open, but only on one arm: it shuts off `reap_stale`'s
+        crash-recovery path (`not online`), which is the one that exists to
+        catch a worker that stopped. Its other two arms are independent `or`
+        branches and still fire — the `MAX_ACTIVE_JOB_SECONDS` cap and the
+        orphaned-worker-id check both reap normally with `online` True (see
+        `test_hard_cap_backstop`). So a dead-but-skewed worker's job is not
+        stranded forever; it waits for the cap instead of the 90s TTL.
+        Deliberate and unchanged from the previous
+        release — clamping it here would newly reap a live skewed worker's jobs,
+        a regression rather than a fix — and pinned by
+        `test_future_dated_stamp_still_reads_online_as_before`. Future-dated
+        stamps as a class are VEN-133; see also `_cooldown_remaining`, which
+        does clamp its negative case because there the failure is a lockout
+        rather than a lost backstop.
+    """
     with _conn() as c:
         row = c.execute("SELECT last_seen FROM ff_worker WHERE id=1").fetchone()
     if not row or not row[0]:
         return False
-    try:
-        last = datetime.fromisoformat(row[0])
-    except ValueError:
-        return False
-    if last.tzinfo is None:
-        # A stamp written before `last_seen` carried its offset (see
-        # `_now_utc`). It names a wall-clock reading on an unknown host, and
-        # there is no sound way to place it on the timeline. `outbox.py` meets
-        # the same case by declining to judge and restamping absolute, but that
-        # remedy is not available here: the reader is the *web* host, and
-        # restamping a liveness beacon it does not own would forge liveness for
-        # a worker that may already be dead. Declining the other way --
-        # reporting offline -- is just as wrong: `reap_stale` would destroy the
-        # live in-flight jobs of every single-host deploy for the whole rollout
-        # window.
-        #
-        # So fall back to the pre-fix comparison verbatim: wrong across hosts
-        # exactly as it was before, and never newly wrong. This branch is not a
-        # brief crash-guard -- a naive row persists until a NEW-CODE WORKER
-        # heartbeats, so the fix is inert until the worker itself is redeployed.
-        return datetime.now() - last <= timedelta(seconds=WORKER_TTL_SECONDS)
-    return datetime.now(timezone.utc) - last <= timedelta(seconds=WORKER_TTL_SECONDS)
+    age = _age_seconds(row[0])
+    return age is not None and age <= WORKER_TTL_SECONDS
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +493,13 @@ def worker_online() -> bool:
 # Job status -> the dashboard's status vocabulary (idle | launching | checking |
 # waiting_for_otp | done | error), matching the in-process runner state shape so
 # the dashboard JS is identical on both the serverless and worker-host paths.
+#
+# One field is NOT identical between the two paths: `updated_at` is absolute here
+# (see `_now_utc`) and still naive local in `runner._state`. The dashboard reads
+# only `status` and `message` from this dict, so nothing consumes the difference
+# today — but the two paths are mutually exclusive per process, so a future reader
+# would see one shape or the other depending on the host it landed on. Parse it
+# with `_age_seconds`, which accepts both, rather than assuming either.
 def public_state(tenant_id: str) -> dict:
     """A runner-compatible state snapshot derived from the tenant's latest job.
 

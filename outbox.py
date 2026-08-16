@@ -154,15 +154,26 @@ def _now_utc() -> str:
     in the dangerous direction it makes a one-second-old live send look hours
     stale and hands it to a second drainer, delivering the message twice.
 
-    So this column carries its offset. Deliberately narrow: `_now()` is shared
-    with `approved_at`/`sent_at`/`created_at`, which record when something
-    happened for a human to read and are never compared across hosts.
+    So this column carries its offset. Deliberately narrow *within this module*:
+    `_now()` is still shared with `approved_at`/`sent_at`, which record when
+    something happened for a human to read and are never compared across hosts.
 
     `scheduled_at` used to be on that list and should not have been — it is
     written by the drafting/approving host and gated by the draining host, the
-    same split this stamp exists for. It is fixed separately rather than here,
-    because it is compared with SQL `<=` and `ORDER BY` and so cannot carry an
-    offset suffix without breaking that lexicographic compare. See `timeframe`.
+    same split this stamp exists for. It is fixed separately rather than here
+    (VEN-134), because it is compared with SQL `<=` and `ORDER BY` and so cannot
+    carry an offset suffix without breaking that lexicographic compare. See
+    `timeframe`.
+
+    That narrowness is not a claim about the rest of the codebase. An earlier
+    version of this docstring said "none of those are compared across hosts",
+    which read as a general statement and sent the next reader looking in the
+    wrong place: other modules have the same shape and needed the same fix.
+    `jobs.py` compares `ff_worker.last_seen`, `ff_jobs.created_at` and
+    `ff_jobs.updated_at` across the web/worker boundary and now stamps all three
+    absolute — `last_seen` via VEN-137, `created_at`/`updated_at` via VEN-142;
+    see `jobs._now_utc`.
+    Before assuming a naive column is safe, check who writes it and who reads it.
     """
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
