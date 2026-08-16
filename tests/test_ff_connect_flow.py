@@ -34,15 +34,21 @@ import ff_account  # noqa: E402
 import jobs  # noqa: E402
 from sites import furnishedfinder  # noqa: E402
 
-_FAILURES: list[str] = []
-
-
 def check(cond, msg):
-    if cond:
-        print(f"  ok  {msg}")
-    else:
-        print(f" FAIL {msg}")
-        _FAILURES.append(msg)
+    """Fail the calling test when `cond` is falsey, using `msg` as the reason.
+
+    This raises rather than recording the failure. An earlier version appended
+    to a module-level list that only the `__main__` runner below inspected, so
+    under pytest every test in this file returned normally no matter what the
+    code under test did — 13 tests that were counted as green while asserting
+    nothing (VEN-166).
+
+    Raises AssertionError explicitly instead of using a bare `assert` so the
+    check survives `python -O`, which strips assert statements; `msg` is a
+    pre-computed string, so pytest's assertion rewriting has nothing to add.
+    """
+    if not cond:
+        raise AssertionError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -442,23 +448,35 @@ def test_retry_cooldown_blocks_burst():
 
 
 if __name__ == "__main__":
-    test_connect_states()
-    test_jobs_queue()
-    test_public_state()
-    test_serverless_refresh_routing()
-    test_force_worker_queue_routing()
-    test_cloudflare_challenge_is_fatal()
-    test_lead_detail_email_regex_avoids_quadratic_rescans()
-    test_ff_login_dialog_invalidates_session_probe()
-    test_reap_stale_running_job()
-    test_worker_restart_recovery()
-    test_hard_cap_backstop()
-    test_magic_link_required_error()
-    test_retry_cooldown_blocks_burst()
+    # Same tests, same order, as pytest collects them. `check()` now raises, so
+    # each test is run in its own try/except to keep this runner's "report every
+    # failing test" behaviour instead of aborting on the first one.
+    _TESTS = [
+        test_connect_states,
+        test_jobs_queue,
+        test_public_state,
+        test_serverless_refresh_routing,
+        test_force_worker_queue_routing,
+        test_cloudflare_challenge_is_fatal,
+        test_lead_detail_email_regex_avoids_quadratic_rescans,
+        test_ff_login_dialog_invalidates_session_probe,
+        test_reap_stale_running_job,
+        test_worker_restart_recovery,
+        test_hard_cap_backstop,
+        test_magic_link_required_error,
+        test_retry_cooldown_blocks_burst,
+    ]
+    failed: list[str] = []
+    for _test in _TESTS:
+        try:
+            _test()
+        except AssertionError as exc:
+            print(f" FAIL {_test.__name__}: {exc}")
+            failed.append(_test.__name__)
     print()
-    if _FAILURES:
-        print(f"{len(_FAILURES)} FAILURE(S):")
-        for f in _FAILURES:
-            print(f"  - {f}")
+    if failed:
+        print(f"{len(failed)} FAILING TEST(S):")
+        for name in failed:
+            print(f"  - {name}")
         sys.exit(1)
     print("ALL TESTS PASSED")
