@@ -33,6 +33,7 @@ import logging
 import os
 import re
 from email.utils import parseaddr
+from html.parser import HTMLParser
 
 log = logging.getLogger(__name__)
 
@@ -186,6 +187,186 @@ def extract_sender(payload: dict) -> str:
     return ""
 
 
+# Tags whose *content* is markup rather than prose, and must not reach the body.
+_OPAQUE_ELEMENTS = frozenset({"script", "style"})
+# End tags that closed a block in the old regex, and so still become a newline.
+_BLOCK_END_TAGS = frozenset({"p", "div", "tr"})
+
+# Stand-in for `&` while the parser runs. `html.parser` cannot be asked to leave
+# entities alone *and* stay well-behaved: with `convert_charrefs=False` an
+# incomplete reference (`?id=9&#details` in a guest's URL) makes it abandon the
+# scan and hand back every remaining byte as raw text, so the whole notification
+# lands in the body as markup and `parse` finds nothing. Hiding `&` from it
+# sidesteps that path entirely and keeps entities byte-exact, which is what the
+# old substitution did and what the money/email patterns downstream expect.
+# U+E000 is a private-use codepoint; any that somehow arrive are dropped first so
+# the round trip cannot invent one.
+_AMP_SENTINEL = "\ue000"
+
+
+class _BodyExtractor(HTMLParser):
+    """Turn notification HTML into the plain text the parser downstream reads.
+
+    Replaces a `<[^>]+>` substitution that treated a bare `<` in guest prose as a
+    tag opener: "my budget is < $2400" swallowed everything up to the next `>`,
+    which is normally the rest of the message — the guest's ask and their reply
+    address — plus several real tags. A real parser knows a `<` that no tag name
+    follows is text, so it survives (VEN-152).
+
+    Written as a parser rather than a smarter regex because no single tag pattern
+    serves the four grammars an ESP actually emits — tags, `<!-- -->` comments,
+    `<? ?>` processing instructions and `<![CDATA[ ]]>`. Every regex tried either
+    kept eating prose or leaked a comment's innards into the guest-visible body,
+    and a leaked prefix is worse than the bug: it un-anchors the label matching in
+    `sites.ff_email`, `parse` returns None and the enquiry is dropped outright.
+
+    The unterminated-construct handling exists for the same reason, and is the
+    part worth reading twice. Real mail is full of truncated markup, and
+    `html.parser` reports an unclosed `<style>` or `<!--` by handing over the
+    entire rest of the document as one opaque blob. Dropping that blob — the
+    obvious reading of "script bodies are not prose" — silently destroys every
+    enquiry whose template has an unclosed `<style>` in its head. So the blob is
+    kept and re-stripped as markup instead, which is what the old regex did with
+    it. `suppress_opaque=False` marks that second pass and stops it recursing.
+    """
+
+    def __init__(self, suppress_opaque: bool = True) -> None:
+        super().__init__(convert_charrefs=True)
+        self._out: list[str] = []
+        self._opaque: list[str] = []
+        self._opaque_depth = 0
+        self._suppress_opaque = suppress_opaque
+        self._at_eof = False
+
+    # -- collection ---------------------------------------------------------
+    def _emit(self, text: str) -> None:
+        (self._opaque if self._opaque_depth else self._out).append(text)
+
+    def _recover(self, markup: str) -> None:
+        """Salvage a blob the parser could not terminate, as the old regex would.
+
+        Re-stripped rather than emitted raw: the blob is usually real markup, and
+        pasting it into the body verbatim un-anchors the `Traveler:` label just as
+        badly as dropping it. The nested pass never suppresses, so `<script>` in
+        an already-unterminated blob cannot start this over.
+        """
+        if not markup:
+            return
+        nested = _BodyExtractor(suppress_opaque=False)
+        nested.feed(markup)
+        self._out.append(nested.finish())
+
+    def finish(self) -> str:
+        self._at_eof = True
+        self.close()
+        # Still inside an element that never closed: its "body" is the remainder
+        # of the email, not a script.
+        if self._opaque_depth:
+            pending, self._opaque = "".join(self._opaque), []
+            self._opaque_depth = 0
+            self._recover(pending)
+        return "".join(self._out)
+
+    # -- element boundaries -------------------------------------------------
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in _OPAQUE_ELEMENTS and self._suppress_opaque:
+            # Emit the separator before going quiet, so the surrounding words do
+            # not run together once the script's body is dropped.
+            self._emit(" ")
+            self._opaque_depth += 1
+            return
+        self._emit("\n" if tag == "br" else " ")
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        # `<br/>` is a start tag that never opens a region; a self-closing
+        # script/style likewise has no content to suppress.
+        self._emit("\n" if tag == "br" else " ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in _OPAQUE_ELEMENTS and self._opaque_depth:
+            self._opaque_depth -= 1
+            if not self._opaque_depth:
+                self._opaque.clear()   # a properly closed script body is not prose
+            self._emit(" ")
+            return
+        self._emit("\n" if tag in _BLOCK_END_TAGS else " ")
+
+    # -- prose --------------------------------------------------------------
+    def handle_data(self, data: str) -> None:
+        self._emit(data)
+
+    # No `handle_entityref`/`handle_charref`: the `&` sentinel means the parser
+    # never sees a reference, so those hooks are unreachable and an override
+    # would be untestable dead code. Entities survive because they are hidden
+    # from the parser and restored afterwards, not because they are handled.
+    # Reconstructing them here is what corrupted ordinary mail: html.parser
+    # matches `&name` with no semicolon, so re-emitting `f"&{name};"` turned a
+    # guest's "Q&A" into "Q&A;" and moved the message's dedup id.
+
+    # -- markup that is never prose ----------------------------------------
+    # Each becomes a separator, never its contents. Outlook puts a conditional
+    # comment in nearly every HTML mail it sends, so leaking these is the common
+    # case, not an edge one. The `_at_eof` branch is the exception: a construct
+    # still open when the document ends is not a comment, it is the rest of the
+    # email, and discarding it loses the enquiry.
+    def _markup(self, data: str) -> None:
+        if self._at_eof:
+            self._recover(data)
+        else:
+            self._emit(" ")
+
+    def handle_comment(self, data: str) -> None:
+        # A downlevel-revealed conditional (`<!--[if gte mso 9]>…`) that never
+        # closed still opens with a marker, and that marker is not prose.
+        if self._at_eof and data.startswith("[if") and ">" in data:
+            data = data.split(">", 1)[1]
+        self._markup(data)
+
+    def handle_decl(self, decl: str) -> None:
+        self._markup(decl)
+
+    def handle_pi(self, data: str) -> None:
+        self._markup(data)
+
+    def unknown_decl(self, data: str) -> None:
+        # `<![CDATA[ … ` arrives with its opener as part of the payload; that
+        # marker is markup even when the section it opened never closed.
+        if self._at_eof and data.upper().startswith("CDATA["):
+            data = data[len("CDATA["):]
+        self._markup(data)
+
+
+def _legacy_strip_html(value: str) -> str:
+    """The pre-VEN-152 substitution, kept only as a last-resort safety net."""
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", value)
+    return re.sub(r"<[^>]+>", " ", text)
+
+
+def strip_html(value: str) -> str:
+    """Extract readable text from an HTML mail part. Never raises, never blanks.
+
+    `accept` turns an unparseable body into a `Rejected`, and the webhook still
+    answers 202 — so the provider never retries and the enquiry is gone. Every
+    failure here has to degrade to "some text" rather than "no text".
+    """
+    guarded = value.replace(_AMP_SENTINEL, "").replace("&", _AMP_SENTINEL)
+    extractor = _BodyExtractor()
+    try:
+        extractor.feed(guarded)
+        text = extractor.finish()
+    except Exception:
+        # html.parser is lenient by design, so this is belt and braces — but the
+        # cost of being wrong is a destroyed enquiry, not a stack trace.
+        log.warning("inbound: HTML extraction failed, falling back to tag strip")
+        text = _legacy_strip_html(guarded)
+    if not text.strip() and value.strip():
+        # Whatever happened, returning nothing guarantees the enquiry is dropped.
+        # The old substitution is worse at prose but it never blanks a document.
+        log.warning("inbound: HTML extraction came back empty, falling back")
+        text = _legacy_strip_html(guarded)
+    return re.sub(r"[ \t]+", " ", text.replace(_AMP_SENTINEL, "&"))
+
+
 def extract_body(payload: dict) -> str:
     for key in ("text", "plain", "TextBody", "body-plain", "stripped-text", "body"):
         value = payload.get(key)
@@ -196,10 +377,7 @@ def extract_body(payload: dict) -> str:
     for key in ("html", "HtmlBody", "body-html"):
         value = payload.get(key)
         if isinstance(value, str) and value.strip():
-            text = re.sub(r"(?is)<(script|style).*?</\1>", " ", value)
-            text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", text)
-            text = re.sub(r"<[^>]+>", " ", text)
-            return re.sub(r"[ \t]+", " ", text)
+            return strip_html(value)
     return ""
 
 
@@ -231,7 +409,24 @@ def extract_date(payload: dict) -> str:
 
 
 class Rejected(Exception):
-    """Inbound message failed a check. The reason is for logs, never the caller."""
+    """Inbound message failed a check. The reason is for logs, never the caller.
+
+    `code` and `tenant_id` exist so the route can tell a *lost lead* from a
+    *probe*. Only a rejection that got past the provider secret AND resolved to
+    a real tenant is worth persisting; anything earlier is unauthenticated or
+    unattributable, and storing it would turn this public endpoint into a write
+    amplifier pointed at the operator's own screen.
+    """
+
+    def __init__(self, message, code: str = "other", tenant_id: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.tenant_id = tenant_id
+
+
+# Rejections worth showing an operator: past the provider secret, attributed to
+# a tenant, and representing a lead that was genuinely lost rather than refused.
+RECORDABLE_CODES = ("unparsed", "sender_not_allowed")
 
 
 def accept(payload: dict, webhook_secret: str, raw_size: int = 0) -> tuple[str, dict]:
@@ -240,27 +435,37 @@ def accept(payload: dict, webhook_secret: str, raw_size: int = 0) -> tuple[str, 
     Raises `Rejected` on any failure. The caller returns a flat 202 either way,
     so a probe learns nothing about which tenants or addresses exist.
     """
+    # Everything above `tenant_id` is pre-authentication: the caller could be
+    # anyone, so these carry no tenant and are never persisted.
     if not configured():
-        raise Rejected("inbound email is not configured")
+        raise Rejected("inbound email is not configured", code="not_configured")
     if raw_size and raw_size > MAX_PAYLOAD_BYTES:
-        raise Rejected("payload too large")
+        raise Rejected("payload too large", code="too_large")
     if not verify_webhook(webhook_secret):
-        raise Rejected("bad webhook secret")
+        raise Rejected("bad webhook secret", code="bad_secret")
 
     tenant_id = tenant_for_address(extract_recipient(payload))
     if not tenant_id:
-        raise Rejected("unrecognised recipient")
+        raise Rejected("unrecognised recipient", code="unknown_recipient")
 
     sender = extract_sender(payload)
     if not sender_allowed(sender):
-        raise Rejected(f"sender not allowed: {sender[:80]!r}")
+        raise Rejected(
+            f"sender not allowed: {sender[:80]!r}",
+            code="sender_not_allowed",
+            tenant_id=tenant_id,
+        )
 
     from sites import ff_email
 
     item = ff_email.parse(extract_subject(payload), extract_body(payload),
                           received_at=extract_date(payload))
     if not item:
-        raise Rejected("could not parse a lead from the message")
+        raise Rejected(
+            "could not parse a lead from the message",
+            code="unparsed",
+            tenant_id=tenant_id,
+        )
     return tenant_id, item
 
 
@@ -275,9 +480,26 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
     became a new deal: the owner saw the same person twice, the reply carried
     none of the original's booking facts, and the nurture sequence on the
     original kept chasing someone who had just written back.
+
+    The dedup row is recorded first — one atomic claim, so two concurrent
+    deliveries of the same message can't both go on to apply it — and it is
+    *kept* even when the board then refuses the item. That row is not only a
+    dedup marker: `storage.all_items` reads its payload and the dashboard runs
+    `pipeline.backfill` over that on every load and every board poll, opening a
+    deal for any stored item that has none. A transient board failure — a
+    locked SQLite file while the worker writes, say — therefore heals itself the
+    next time anyone looks at the board, and threading survives with it, because
+    `backfill` joins a reply to its parent exactly as this path does.
+
+    Releasing the claim instead is what would make the loss permanent. The
+    provider is answered 202 and never redelivers, so deleting the row leaves a
+    lead that parsed perfectly with no deal, no stored item and no route back
+    onto the board — and no `inbound_rejects` row either, since that table is
+    only reached from the `except Rejected` branch and this email did not fail
+    to parse. Whether the board took it is still `open_deal`'s to report and the
+    return value below says so honestly; what state to keep is a separate
+    question from what to tell the caller.
     """
-    import config
-    import pipeline
     import storage
 
     kind = item.get("kind", "lead")
@@ -285,16 +507,197 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
     if not new_items:
         return False
     try:
-        parent = None
-        if kind == "message":
-            parent = pipeline.find_thread(
-                tenant_id, site, pipeline.thread_key(item),
-                exclude_item_id=item.get("id"))
-        if parent:
-            pipeline.record_guest_reply(tenant_id, site, parent["item_id"])
-        else:
-            pipeline.ensure(tenant_id, site, item, None,
-                            units=config.get_units(tenant_id))
+        on_board = open_deal(tenant_id, item, site)
     except Exception:
         log.exception("Could not open a deal for ingested item %s", item.get("id"))
+        on_board = False
+    if not on_board:
+        # Report the failure, keep the payload. The stored item is what
+        # `pipeline.backfill` heals from on the next dashboard load or board
+        # poll; dropping the dedup row here would delete the only remaining
+        # route back onto the board, because the 202 already told the provider
+        # not to redeliver.
+        log.warning(
+            "Ingested item %s did not reach the board; kept its stored item so "
+            "the next dashboard load can backfill a deal for it", item.get("id"),
+        )
+        return False
     return True
+
+
+def already_answered(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
+    """Whether a reply has already been drafted for this item.
+
+    For a **lead** the response store answers directly: a lead owns its own
+    response row, so this distinguishes "on the board" from "on the board and
+    already answered" — which `backfill` made two different things, since it
+    opens deals and drafts nothing.
+
+    For a **message** this answers `True`, which is the conservative direction
+    and the one that preserves the existing rule. A threaded reply's draft is
+    stored against the *parent* deal, where that conversation's own introduction
+    already sits, so the store cannot tell "this reply was answered" from "this
+    conversation was ever answered". Answering False here would draft a reply on
+    every click of Try again — a second answer to a guest who wrote once, which
+    is a filed defect on this path. So a message keeps the older rule: it is
+    drafted when this attempt is the one that applied it, and not otherwise.
+    """
+    import storage
+
+    if item.get("kind", "lead") == "message":
+        return True
+    return bool(storage.get_responses(tenant_id, site).get(str(item.get("id", ""))))
+
+
+def _applied(tenant_id: str, item: dict, site: str) -> bool:
+    """Whether a *stored* item's effect is already on the board.
+
+    Only meaningful for an item `storage` has already seen. It answers "did the
+    ingest that recorded this actually finish?", which stopped being the same
+    question as "is it seen?" once `store` began keeping its row through a board
+    failure so `backfill` could heal it.
+
+    A **lead** owns a deal row, so the board answers directly.
+
+    A **message** is answered `True` by policy, not by evidence, and that is the
+    conservative direction on purpose. A threaded reply owns no deal of its own;
+    the only trace it leaves is the stamp on its parent, and that cannot be
+    attributed to *this* reply. Comparing the stored `first_seen` against the
+    parent's `last_guest_reply_at` — the comparison `backfill` uses — is sound
+    there only because `store` writes `first_seen` *before* attempting the board
+    write. `recover` inverts that order, so a reply recovered through here lands
+    its stamp before its row and would read as un-applied on the next click, at
+    second precision, sometimes. Re-applying a reply is not a harmless retry: it
+    cancels the deal's queued follow-up and drafts a second answer to a guest who
+    wrote once, which is a filed defect on this very path. So the ambiguous case
+    stands down and leaves recovery to `backfill`, whose own predicate is
+    evaluated against the ordering it is sound for.
+    """
+    import pipeline
+
+    if item.get("kind", "lead") == "message":
+        return True
+    return bool(pipeline.get(tenant_id, site, str(item.get("id", ""))))
+
+
+def _thread_parent(tenant_id: str, item: dict, site: str):
+    """The open deal this item continues, or None if it starts its own."""
+    import pipeline
+
+    if item.get("kind", "lead") != "message":
+        return None
+    return pipeline.find_thread(
+        tenant_id, site, pipeline.thread_key(item),
+        exclude_item_id=item.get("id"))
+
+
+def open_deal(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
+    """Put an already-deduped item on the board, threading a reply if it is one.
+
+    Split out of `store` so recovery can reach the board without going through
+    the dedup that `store` does first. Recovery cannot simply call
+    `pipeline.ensure`: half of what this does is the *threading*, and a reply
+    that skips it opens a second deal beside the conversation it answers — the
+    duplicate this branching exists to prevent.
+
+    Returns whether the board actually took the item. Reporting it is the point:
+    a threaded reply leaves no deal of its own, so a caller that tries to infer
+    this by looking at the board afterwards cannot tell a reply that landed from
+    one that never did, and telling the operator the wrong one of those is the
+    whole defect this path exists to avoid.
+    """
+    import config
+    import pipeline
+
+    parent = _thread_parent(tenant_id, item, site)
+    if parent:
+        return bool(pipeline.record_guest_reply(tenant_id, site, parent["item_id"]))
+    pipeline.ensure(tenant_id, site, item, None,
+                    units=config.get_units(tenant_id))
+    # Read it back rather than trusting that `ensure` returned: it is the one
+    # case where presence is proof, because a deal under this item's own id can
+    # only have been opened for this item.
+    return bool(pipeline.get(tenant_id, site, item.get("id", "")))
+
+
+def recover(tenant_id: str, item: dict, site: str = "furnishedfinder") -> tuple[bool, bool]:
+    """Put a recovered item on the board. Returns `(already_had_it, on_board)`.
+
+    Deliberately not `store()`. That records the dedup row *before* the board
+    write and swallows the failure while still reporting success, which cost this
+    feature two separate defects: a failed recovery both told the operator the
+    lead was safe and poisoned every later retry, because the next attempt
+    short-circuited at the dedup and never reached the board again.
+
+    Here the order is inverted — the board write happens first and records itself,
+    and the item is marked seen only once it has actually landed. A failed attempt
+    therefore leaves nothing behind and can simply be retried.
+
+    `already_had_it` separates "this message was ingested earlier" from "this
+    attempt ingested it". Re-applying the first is not harmless: `record_guest_reply`
+    cancels the deal's queued follow-up and re-opens the drafting path, so a second
+    click would cancel a scheduled nurture step and queue a *second* reply to a
+    guest who only ever wrote once.
+
+    The cost of that inversion is a race, and it is accepted rather than
+    unnoticed. `store`'s single `filter_new` is one atomic claim; reading first
+    and writing after leaves a window in which a retry and the identical webhook
+    delivery both find the item unseen and both apply it. Two *retries* cannot
+    collide — the route's `mark_recovered` is a conditional UPDATE and the loser
+    stops before reaching here — so it needs a retry racing an ingest of the same
+    message within the board write. Review measured 0 occurrences in 40
+    barrier-synchronised trials; only an injected delay reproduces it.
+
+    Closing it means claiming before the write, which is precisely the ordering
+    that produced the two defects above: a failed claim-first attempt leaves the
+    message unreachable forever, because every later delivery short-circuits at
+    the dedup. That is a permanent silent loss on a common path traded against a
+    duplicated reply on a rare one, so the window stays.
+    """
+    import storage
+
+    kind = item.get("kind", "lead")
+    if storage.already_seen(tenant_id, site, kind, item.get("id", "")):
+        # `seen` does not mean "landed": `store` keeps its dedup row even when
+        # the board refuses the item, so that the stored payload survives for
+        # `pipeline.backfill` to heal from. Reporting on_board from the flag
+        # alone would therefore be a guess, and a wrong one in exactly the case
+        # the operator is clicking Try again for — nothing landed, and this
+        # would clear the row off their list saying it had.
+        if _applied(tenant_id, item, site):
+            # Applied by an earlier delivery, so do not apply it a second time:
+            # re-running a reply cancels the deal's queued follow-up and drafts
+            # a second answer for a guest who only ever wrote once.
+            return (True, True)
+        # Stored, never applied. This attempt is the one that lands it, and it
+        # says so: a lead recovered through here has had no draft queued by any
+        # path (the webhook skipped it too, for the same failure), so reporting
+        # "you already had this" would quietly cost it its answer.
+        try:
+            return (False, open_deal(tenant_id, item, site))
+        except Exception:
+            log.exception("Could not open a deal for stored item %s", item.get("id"))
+            return (False, False)
+
+    try:
+        on_board = open_deal(tenant_id, item, site)
+    except Exception:
+        log.exception("Could not open a deal for recovered item %s", item.get("id"))
+        return (False, False)
+
+    if on_board:
+        try:
+            storage.filter_new(tenant_id, site, kind, [item])
+        except Exception:
+            # The lead is on the board. Failing to write the dedup row afterwards
+            # is a bookkeeping loss, not a lead loss, and reporting it as failure
+            # would hand back a row that is actually resolved, tell the operator
+            # the lead was lost, and invite the click that applies the guest's
+            # reply a second time — cancelling a queued follow-up and drafting
+            # again for someone who wrote once. The cost of the other choice is
+            # only that a later re-delivery of this item may be ingested twice.
+            log.exception(
+                "Recovered item %s reached the board but its dedup row could "
+                "not be written; reporting success", item.get("id"),
+            )
+    return (False, on_board)

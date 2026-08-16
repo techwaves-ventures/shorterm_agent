@@ -288,6 +288,20 @@ def test_cloudflare_challenge_is_fatal():
           "Cloudflare error has a UI-safe message")
 
 
+def test_lead_detail_email_regex_avoids_quadratic_rescans():
+    print("test_lead_detail_email_regex_avoids_quadratic_rescans")
+    check(furnishedfinder._EMAIL_RE.pattern.startswith(r"(?<![\w.+-])"),
+          "email regex requires the start of a candidate token")
+
+    # Inquiry blocks are capped at 2,500 characters. Exercise that full-size
+    # scrape input before a valid address so a missing boundary guard cannot be
+    # hidden by testing only short, friendly parser fixtures.
+    detail = "Notes:\n" + ("a" * 2500) + "\nEmail:\nlead.person+tag@example-domain.com"
+    facts = furnishedfinder._parse_lead_detail(detail)
+    check(facts.get("email") == "lead.person+tag@example-domain.com",
+          "lead parser still extracts a valid email after a maximal token")
+
+
 def test_ff_login_dialog_invalidates_session_probe():
     print("test_ff_login_dialog_invalidates_session_probe")
 
@@ -337,11 +351,11 @@ def test_ff_login_dialog_invalidates_session_probe():
 
 
 def _expire_worker():
-    # Offset-aware, matching what `jobs.heartbeat()` actually writes (VEN-142).
-    # A naive stamp expires the worker just as well, so this looks inert — but it
-    # routes every reap/offline assertion in this file down the legacy-naive
-    # compatibility branch of `_age_seconds`, leaving the shipped path with no
-    # coverage here at all.
+    # Offset-aware, matching what `jobs.heartbeat()` actually writes (VEN-137,
+    # VEN-142). A naive stamp expires the worker just as well, so this looks
+    # inert — but it routes every reap/offline assertion in this file down the
+    # legacy-naive compatibility branch of `_age_seconds`, leaving the shipped
+    # path with no coverage here at all.
     from datetime import datetime, timedelta, timezone
     old = (datetime.now(timezone.utc)
            - timedelta(seconds=jobs.WORKER_TTL_SECONDS + 60)).isoformat(timespec="seconds")
@@ -455,6 +469,7 @@ if __name__ == "__main__":
     test_serverless_refresh_routing()
     test_force_worker_queue_routing()
     test_cloudflare_challenge_is_fatal()
+    test_lead_detail_email_regex_avoids_quadratic_rescans()
     test_ff_login_dialog_invalidates_session_probe()
     test_reap_stale_running_job()
     test_worker_restart_recovery()

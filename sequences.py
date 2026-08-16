@@ -23,6 +23,8 @@ Safety model — three layers, deliberately conservative:
 """
 from datetime import datetime, time, timedelta
 
+import timeframe
+
 # Sends are clamped into these local hours: an automated 3am message reads as a
 # bot and burns the trust the product is selling.
 QUIET_START = time(8, 0)
@@ -279,11 +281,18 @@ def next_send_time(now: datetime | None = None) -> str:
     product's advantage right up until it wakes a prospect at 3am, at which
     point it reads as a bot and burns the trust the product is selling.
     """
-    return _clamp_quiet_hours(now or datetime.now()).isoformat(timespec="seconds")
+    return timeframe.stamp(_clamp_quiet_hours(now or datetime.now()))
 
 
 def _clamp_quiet_hours(dt: datetime) -> datetime:
-    """Nudge a send time into waking hours (see QUIET_START/QUIET_END)."""
+    """Nudge a send time into waking hours (see QUIET_START/QUIET_END).
+
+    Stays a *local* computation, and stays naive: quiet hours are a claim about
+    the wall clock a human reads, not about an absolute instant. Callers convert
+    the result into the schedule frame (see `timeframe`). Keeping those two steps
+    separate is what lets the clamp's zone be decided independently of the frame
+    the answer is stored and compared in.
+    """
     if dt.time() < QUIET_START:
         return datetime.combine(dt.date(), QUIET_START)
     if dt.time() > QUIET_END:
@@ -301,9 +310,9 @@ def due_at(deal: dict, step: dict) -> str | None:
     anchor = _anchor_dt(deal, step["anchor"])
     if anchor is None:
         return None
-    return _clamp_quiet_hours(
+    return timeframe.stamp(_clamp_quiet_hours(
         anchor + timedelta(hours=step.get("offset_hours", 0))
-    ).isoformat(timespec="seconds")
+    ))
 
 
 def schedule(deal: dict) -> tuple[str | None, str | None]:

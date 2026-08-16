@@ -286,6 +286,22 @@
               <p class="hint">In Gmail: Settings → Forwarding → add this address, then a filter
                 for mail from <code>furnishedfinder.com</code>. This address is unique to you —
                 treat it like a password.</p>
+              {# Stated even at zero: "nothing was lost" is the reassurance the
+                 host is actually after, and silence can't distinguish that from
+                 a broken forwarding rule. #}
+              <p class="hint">
+                {% if rejected_open %}
+                  <b>{{ rejected_open }} forwarded email{{ 's' if rejected_open > 1 }}</b>
+                  couldn't be read and never reached your board —
+                  <a href="{{ url_for('inbound_rejected') }}">review {{ 'them' if rejected_open > 1 else 'it' }}</a>.
+                {% elif rejected_total %}
+                  Forwarding health: nothing unread right now.
+                  {{ rejected_total }} earlier email{{ 's' if rejected_total > 1 }}
+                  couldn't be read and {{ 'have' if rejected_total > 1 else 'has' }} been handled.
+                {% else %}
+                  Forwarding health: every forwarded email so far has been understood.
+                {% endif %}
+              </p>
             </div>
             {% else %}
             <div class="hint" style="margin-bottom:14px">

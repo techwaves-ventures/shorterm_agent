@@ -48,8 +48,7 @@ _STATE_LABELS = {
 _VALID_STATES = set(_STATE_LABELS)
 
 
-def _conn() -> db.Conn:
-    c = db.connect()
+def _ddl(c) -> None:
     c.execute(
         """CREATE TABLE IF NOT EXISTS ff_accounts (
             tenant_id TEXT PRIMARY KEY,
@@ -77,7 +76,10 @@ def _conn() -> db.Conn:
             "UPDATE ff_accounts SET state=? WHERE state IS NULL",
             (NEEDS_VERIFICATION,),
         )
-    return c
+
+
+def _conn() -> db.Conn:
+    return db.open_with_schema("ff_account", _ddl)
 
 
 def connect(tenant_id: str, ff_email: str) -> None:

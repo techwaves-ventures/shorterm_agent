@@ -157,6 +157,16 @@
       {% for f in flashes %}<div class="flash">{{ f }}</div>{% endfor %}
     {% endwith %}
 
+    {# Outside the can_scrape branch on purpose: a host who ingests by email may
+       never connect an account, and they're exactly the one losing leads. #}
+    {% if rejected_count %}
+    <div class="banner show error" style="margin-bottom:18px">
+      <span>{{ rejected_count }} forwarded email{{ 's' if rejected_count > 1 }}
+        couldn't be read, so {{ 'they' if rejected_count > 1 else 'it' }} never reached your board.</span>
+      <a href="{{ url_for('inbound_rejected') }}" class="btn btn--primary btn--sm">Review</a>
+    </div>
+    {% endif %}
+
   {% if not can_scrape %}
     <div class="connect-card">
       <h2>Connect your FurnishedFinder account</h2>
@@ -343,7 +353,7 @@
               <div class="deal__top">
                 <span class="deal__name">{{ c.deal.guest_name or 'Guest' }}</span>
                 <span class="badge badge--brand">{{ msg.step_label }}</span>
-                <span class="deal__age">due {{ msg.scheduled_at[:16].replace('T', ' ') if msg.scheduled_at else '—' }}</span>
+                <span class="deal__age">due {{ msg.scheduled_at|sched_local }}</span>
               </div>
               {% if msg.reason %}<div class="deal__sub">{{ msg.reason }}</div>{% endif %}
               <details class="draft">
@@ -418,7 +428,7 @@
         <div class="row">
           <span class="row__name">{{ c.deal.guest_name or 'Guest' }}</span>
           <span class="row__mid">{{ (c.deal.next_action_step or '').replace('_', ' ')|title }} · {{ c.stage_label }}</span>
-          <span class="row__when">{{ c.deal.next_action_at[:16].replace('T', ' ') if c.deal.next_action_at }}</span>
+          <span class="row__when">{{ c.deal.next_action_at|sched_local }}</span>
         </div>
         {% endfor %}
       </div>

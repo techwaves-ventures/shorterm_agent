@@ -20,6 +20,7 @@ Statuses:
 from datetime import datetime, timezone
 
 import db
+import timeframe
 
 PENDING = "pending_approval"
 QUEUED = "queued"
@@ -99,8 +100,12 @@ MAX_SEND_ATTEMPTS = 3
 _SELECT = f"SELECT {', '.join(_COLS)} FROM outbox"
 
 
-def _conn() -> db.Conn:
-    c = db.connect()
+def _ddl(c) -> None:
+    # NOTE (VEN-146/VEN-145): this block moved out of _conn(). VEN-145 adds a
+    # `claim_token` column to BOTH the CREATE TABLE and the migration loop
+    # below. Merging the two branches can resolve cleanly while dropping it, and
+    # the send-ownership guard then fails *open* with a green suite. Whoever
+    # merges must assert "claim_token" in db.table_columns(c, "outbox").
     c.execute(
         """CREATE TABLE IF NOT EXISTS outbox (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -127,7 +132,10 @@ def _conn() -> db.Conn:
                       ("attempts", "INTEGER NOT NULL DEFAULT 0")):
         if col not in have:
             c.execute(f"ALTER TABLE outbox ADD COLUMN {col} {decl}")
-    return c
+
+
+def _conn() -> db.Conn:
+    return db.open_with_schema("outbox", _ddl)
 
 
 def _now() -> str:
@@ -147,8 +155,15 @@ def _now_utc() -> str:
     stale and hands it to a second drainer, delivering the message twice.
 
     So this column carries its offset. Deliberately narrow *within this module*:
-    `_now()` is still shared with `approved_at`/`sent_at`/`scheduled_at`, whose
-    local wall-clock semantics the quiet-hours clamp depends on.
+    `_now()` is still shared with `approved_at`/`sent_at`, which record when
+    something happened for a human to read and are never compared across hosts.
+
+    `scheduled_at` used to be on that list and should not have been — it is
+    written by the drafting/approving host and gated by the draining host, the
+    same split this stamp exists for. It is fixed separately rather than here
+    (VEN-134), because it is compared with SQL `<=` and `ORDER BY` and so cannot
+    carry an offset suffix without breaking that lexicographic compare. See
+    `timeframe`.
 
     That narrowness is not a claim about the rest of the codebase. An earlier
     version of this docstring said "none of those are compared across hosts",
@@ -156,9 +171,8 @@ def _now_utc() -> str:
     wrong place: other modules have the same shape and needed the same fix.
     `jobs.py` compares `ff_worker.last_seen`, `ff_jobs.created_at` and
     `ff_jobs.updated_at` across the web/worker boundary and now stamps all three
-    absolute (VEN-142; see `jobs._now_utc`). `scheduled_at` here is tracked as
-    its own defect, because unlike `sending_at` it is *also* a local-intent value
-    the quiet-hours clamp reads, so making it absolute is not a one-line change.
+    absolute — `last_seen` via VEN-137, `created_at`/`updated_at` via VEN-142;
+    see `jobs._now_utc`.
     Before assuming a naive column is safe, check who writes it and who reads it.
     """
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -172,7 +186,11 @@ def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
         step_label: str, body: str, auto: bool, reason: str = "",
         scheduled_at: str | None = None) -> dict | None:
     """Queue a drafted step. `auto=True` skips the approval gate (goes straight
-    to `queued`); otherwise it waits for a human in `pending_approval`."""
+    to `queued`); otherwise it waits for a human in `pending_approval`.
+
+    `scheduled_at` is in the schedule frame (see `timeframe`) — callers that
+    compute a send time hand one in, and "no particular time" means now.
+    """
     now = _now()
     status = QUEUED if auto else PENDING
     with _conn() as c:
@@ -183,7 +201,8 @@ def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
                    created_at, approved_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (str(tenant_id), site, str(item_id), sequence, step_id, step_label,
-             body, status, 1 if auto else 0, reason, scheduled_at or now, now,
+             body, status, 1 if auto else 0, reason,
+             scheduled_at or timeframe.now(), now,
              now if auto else None),
         )
     return get(new_id)
@@ -327,8 +346,9 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
                 # So decline to judge it at all: treat it exactly like an
                 # unparseable stamp above. Restamp absolute and let the next
                 # pass measure a real age. The cost is that a row already
-                # wedged at deploy time takes two passes to recover instead of
-                # one; the alternative is sending a live message twice.
+                # wedged at deploy time takes two passes — after the restamp, the
+                # row must age out again (up to max_age_seconds); the alternative
+                # is sending a live message twice.
                 c.execute("UPDATE outbox SET sending_at=? WHERE id=? AND status=?",
                           (_now_utc(), msg["id"], SENDING))
                 continue
@@ -363,9 +383,14 @@ def next_queued(tenant_id: str | None = None,
     been deliberately pushed to a civilised hour went out the moment a drainer
     woke up — the quiet-hours clamp computed upstream had no effect on delivery
     at all. A message is due only once its scheduled time has arrived.
+
+    "Now" is absolute, not this host's wall clock: the drainer is routinely a
+    different host from the one that scheduled the message, and a naive compare
+    across that boundary withholds a due send for the whole offset (westward) or
+    releases a deferred one early (eastward). See `timeframe`.
     """
     sql = f"{_SELECT} WHERE status=? AND scheduled_at<=?"
-    params: list = [QUEUED, now_iso or _now()]
+    params: list = [QUEUED, now_iso or timeframe.now()]
     if tenant_id is not None:
         sql += " AND tenant_id=?"
         params.append(str(tenant_id))
@@ -389,8 +414,11 @@ def set_status(msg_id: int, status: str, *, error: str | None = None,
         # in place would make the operator click Send, see success, and watch
         # nothing happen for hours. GREATEST-style clamp, so a message that is
         # already due keeps its position and can't jump the queue.
+        # Both sides in the schedule frame: the stored stamp was written by
+        # whichever host drafted the message, and the approver is often another.
         sets.append("scheduled_at=CASE WHEN scheduled_at>? THEN ? ELSE scheduled_at END")
-        vals += [_now(), _now()]
+        _release = timeframe.now()
+        vals += [_release, _release]
     if status == SENDING:
         # When the send actually started — which is what "stuck" is measured
         # against. `approved_at` cannot answer that: a message approved into

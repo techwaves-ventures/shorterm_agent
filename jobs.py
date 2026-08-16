@@ -146,8 +146,7 @@ def _age_seconds(value: str | None) -> float | None:
         return None
 
 
-def _conn() -> db.Conn:
-    c = db.connect()
+def _ddl(c) -> None:
     c.execute(
         """CREATE TABLE IF NOT EXISTS ff_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,7 +168,10 @@ def _conn() -> db.Conn:
             last_seen TEXT
         )"""
     )
-    return c
+
+
+def _conn() -> db.Conn:
+    return db.open_with_schema("jobs", _ddl)
 
 
 def _row_to_dict(row) -> dict | None:
