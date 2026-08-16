@@ -1,27 +1,33 @@
-"""The release guard must refuse only sends that are actually going out.
+"""One message per guest per exchange, and a refusal the operator can undo.
 
-Round 5 accepted the guard's race fix and rejected its blast radius. The guard
-tested `status IN (queued, sending)`, but `outbox.next_queued` — the only thing
-that ever *delivers* a row — additionally gates on `scheduled_at <= now`. Two
-definitions of "in flight" inside one module, and the broader one won:
+Round 5 accepted the guard's race fix and rejected its blast radius: a `queued`
+row deferred by the quiet-hours clamp refused approve/retry/send for that guest
+for the whole window, and the row doing the blocking was rendered **nowhere**,
+so the only escape was hand-POSTing `/outbox/<id>/cancel`.
 
-* a `queued` row scheduled past its time is not deliverable by anything, yet it
-  refused approve/retry/send for that guest for the entire window. Reached the
-  ordinary way, not exotically: `automation.enqueue_autopilot_reply` schedules
-  through `sequences.next_send_time()`, i.e. the quiet-hours clamp, so an
-  evening inquiry under shipped defaults locked the guest until morning.
-* and the row doing the blocking was rendered **nowhere** — `_board` built its
-  approval list from `PENDING` only — so the operator could neither see the
-  blocker nor clear it without hand-POSTing `/outbox/<id>/cancel`.
+Round 6 tried to fix that by narrowing the guard to `scheduled_at <= now`, on
+the reasoning that a row no drainer will touch for eight hours is not "in
+flight". **That was wrong, and this file used to assert it.** A deferred row is
+not cancelled, it is *scheduled*: releasing a second message beside it does not
+avoid a collision, it guarantees one. Measured through the real routes, it put
+two messages in front of one guest where the broad test put one — and on the
+`/responder/send` path the two bodies were byte-identical, because `runner.py`
+hands the same draft string to `enqueue_autopilot_reply` and to the textarea the
+operator posts.
 
-Both halves are needed and the tests below separate them, because the second is
-what covers the variant a `scheduled_at` gate cannot: a *due* `queued` row that
-no drainer ever picks up (worker down, no in-process browser). That one blocks
-correctly and indefinitely, so the escape has to be an affordance, not a clock.
+Serializing at drain time does not rescue the narrow gate either: spacing the
+two rows apart still delivers both, and nothing downstream compares bodies
+(`sent_bodies()` is read only by `/responder/send`'s pre-read, never by
+`send_next`). So the guard keeps the broad test, and the lockout is cured by the
+*affordance* instead — the blocking row is rendered with a working "Don't send".
+That also covers the variant no clock could: a *due* `queued` row that no
+drainer ever picks up (worker down, no in-process browser) blocks correctly and
+indefinitely.
 
-Guarding the inverse is half the file. A gate that refuses nothing is not a fix
-— `test_*_still_blocks_*` and `test_missing_scheduled_at_counts_as_due` fail if
-the predicate is loosened past what `next_queued` would actually deliver.
+Two properties this file exists to keep apart, because fusing them is what broke
+it: whether a row **blocks** (`_row_in_flight`, status membership) and how a row
+is **labelled** (`_row_deferred`, which reads the stamp). A deferred row blocks
+*and* says "Scheduled to send".
 """
 import os
 import re
@@ -120,37 +126,74 @@ def _statuses(tenant_id, item_id):
 # 1. The lockout: a deferred sibling must not refuse the operator
 # --------------------------------------------------------------------------
 
-def test_a_deferred_queued_sibling_does_not_block_approval(tenant):
-    """The reviewer's A/B, as a test. Base: refused. Fixed: released."""
+def test_only_one_message_is_on_its_way_after_the_operator_acts(tenant):
+    """The assertion round 6 never made, and the one that catches its defect.
+
+    Counted as *deliveries*, which is the property the guest experiences. Round
+    6 asserted only that the operator was not refused, so it read as fixed while
+    stacking a second message behind the first. Both doors are driven here: the
+    UPDATE-shaped release and the INSERT-shaped `/responder/send`.
+    """
     _deal(tenant, "L1")
-    blocker = _add(tenant, "L1", auto=True, scheduled_at=_shift(8))
+    # Exactly what the quiet-hours clamp produces for an evening inquiry.
+    _add(tenant, "L1", auto=True, scheduled_at=_shift(8))
     pending = _add(tenant, "L1", auto=False)
 
-    # Precondition — the thing that makes this a lockout and not a race: the
-    # blocking row is not deliverable by the only code path that delivers.
-    assert outbox.next_queued(tenant) is None, (
-        "precondition failed: the deferred row is due, so refusing the operator "
-        "would be correct and this test would prove nothing")
+    outbox.release_to_send(pending["id"], from_statuses=outbox.APPROVABLE)
+    outbox.add(tenant, SITE, "L1", sequence="presale", step_id="manual",
+               step_label="Manual reply", body="second", auto=True,
+               unless_in_flight=True)
 
-    released, row = outbox.release_to_send(pending["id"],
-                                           from_statuses=outbox.APPROVABLE)
-    assert released is True, (
-        "a row nothing can deliver for 8h blocked the operator's approval "
-        f"(rows now {_statuses(tenant, 'L1')})")
-    assert row["status"] == outbox.QUEUED
+    undelivered = [s for _, s in _statuses(tenant, "L1")
+                   if s in (outbox.QUEUED, outbox.SENDING)]
+    assert len(undelivered) == 1, (
+        "more than one message is on its way to this guest "
+        f"(rows now {_statuses(tenant, 'L1')}). A deferred row is not cancelled, "
+        "it is scheduled: releasing a second beside it does not avoid a "
+        "collision, it guarantees one.")
 
 
-def test_a_deferred_queued_sibling_does_not_block_a_new_send(tenant):
-    """Same gate, insert-shaped half — `add(unless_in_flight=True)`."""
+def test_a_deferred_queued_sibling_still_blocks_approval(tenant):
+    """Deferred is not harmless — it is the *ordinary* way to reach the defect.
+
+    `automation.enqueue_autopilot_reply` schedules through
+    `sequences.next_send_time()`, i.e. the quiet-hours clamp, so an evening
+    inquiry under shipped defaults produces exactly this row. The operator is
+    not locked out by it: the escape is the "Don't send" control in section 5,
+    not a guard that lets a second message through.
+    """
     _deal(tenant, "L1")
     _add(tenant, "L1", auto=True, scheduled_at=_shift(8))
-    assert outbox.next_queued(tenant) is None
+    pending = _add(tenant, "L1", auto=False)
+
+    # The blocker is genuinely not deliverable *yet* — which is precisely why
+    # narrowing the guard to "deliverable now" looked reasonable and was not.
+    assert outbox.next_queued(tenant) is None, (
+        "precondition failed: the deferred row is already due")
+
+    released, _ = outbox.release_to_send(pending["id"],
+                                         from_statuses=outbox.APPROVABLE)
+    assert released is False, (
+        "approval released a second message beside a row that will be delivered "
+        f"in 8h (rows now {_statuses(tenant, 'L1')})")
+
+
+def test_a_deferred_queued_sibling_still_blocks_a_new_send(tenant):
+    """Same rule, insert-shaped half — `add(unless_in_flight=True)`.
+
+    This is the `/responder/send` door, and the one where the duplicate is
+    literally the same text twice: `runner.py` gives the autopilot row and the
+    operator's textarea the same draft string.
+    """
+    _deal(tenant, "L1")
+    _add(tenant, "L1", auto=True, scheduled_at=_shift(8))
 
     wrote = outbox.add(tenant, SITE, "L1", sequence="presale", step_id="manual",
                        step_label="Manual reply", body="second", auto=True,
                        unless_in_flight=True)
-    assert wrote is not None, (
-        "the send button refused over a row deferred 8h into the future")
+    assert wrote is None, (
+        "the send button queued a second message beside a deferred row; both "
+        f"come due and both are delivered (rows now {_statuses(tenant, 'L1')})")
 
 
 # --------------------------------------------------------------------------
@@ -192,12 +235,15 @@ def test_a_sending_sibling_blocks_however_it_was_scheduled(tenant):
         f"already delivering (rows now {_statuses(tenant, 'L1')})")
 
 
-def test_missing_scheduled_at_counts_as_due(tenant):
+def test_a_queued_row_with_no_schedule_stamp_still_blocks(tenant):
     """Fail-safe: an unreadable stamp is not evidence that nothing is going out.
 
-    Legacy rows predate the column being written unconditionally. `NULL <= now`
-    is NULL in SQL — i.e. not true — so a naive gate would silently stop
-    treating exactly those rows as blockers.
+    A stampless row is not reachable through the product — `add()` has written
+    `scheduled_at or now` since the column existed, and it was never added by
+    migration, so the "legacy rows" story an earlier round told here was simply
+    false. Kept anyway, and manufactured by raw SQL, because it pins the safe
+    direction of the fail: any predicate that starts reading the stamp again
+    must not let a row it cannot parse slip past the guard.
     """
     _deal(tenant, "L1")
     blocker = _add(tenant, "L1", auto=True)
@@ -221,9 +267,9 @@ def test_missing_scheduled_at_counts_as_due(tenant):
 
 @pytest.mark.parametrize("status,offset,expected", [
     (outbox.QUEUED, -1, True),    # due
-    (outbox.QUEUED, 8, False),    # deferred
+    (outbox.QUEUED, 8, True),     # deferred — still going to be delivered
     (outbox.SENDING, -1, True),
-    (outbox.SENDING, 8, True),    # a held row ignores its stamp
+    (outbox.SENDING, 8, True),
     (outbox.PENDING, -1, False),
     (outbox.SENT, -1, False),
     (outbox.FAILED, -1, False),
@@ -235,6 +281,10 @@ def test_sql_and_python_in_flight_agree(tenant, status, offset, expected):
     Two implementations of one rule is how this module got here in the first
     place, so they are asserted equal row-for-row rather than assumed to be.
     `in_flight_for_item` is the SQL side's observable form.
+
+    The `offset` column is what makes this table load-bearing now: both `queued`
+    rows expect True, so any predicate that starts consulting the stamp to
+    decide *blocking* fails here regardless of which direction it leans.
     """
     _deal(tenant, "L1")
     msg = _add(tenant, "L1", auto=status != outbox.PENDING,
@@ -245,7 +295,7 @@ def test_sql_and_python_in_flight_agree(tenant, status, offset, expected):
     assert row["status"] == status, "precondition: row not in the tested status"
 
     sql_side = outbox.in_flight_for_item(tenant, SITE, "L1") is not None
-    py_side = outbox._row_in_flight(row, timeframe.now())
+    py_side = outbox._row_in_flight(row)
     assert sql_side == py_side == expected, (
         f"{status} at {offset:+}h: SQL said {sql_side}, Python said {py_side}, "
         f"expected {expected}")
@@ -255,16 +305,25 @@ def test_sql_and_python_in_flight_agree(tenant, status, offset, expected):
 # 4. The caption: "Queued to send…" eight hours early is the ticket's own bug
 # --------------------------------------------------------------------------
 
-def test_send_state_does_not_call_a_deferred_row_in_flight(tenant):
+def test_a_deferred_row_is_labelled_honestly_but_still_blocks(tenant):
+    """The two properties, asserted together so neither can be traded away.
+
+    Round 6 read the caption complaint as licence to weaken the guard. It was
+    only ever a complaint about *wording*: the control stays disabled, because
+    the row really is going to be sent — it just stops claiming that is
+    imminent, and carries the time so the operator can check.
+    """
     _deal(tenant, "L1")
     _add(tenant, "L1", auto=True, scheduled_at=_shift(8))
     state = outbox.send_state(outbox.rows_by_item(tenant, SITE).get("L1"))
 
-    assert state["in_flight"] is False, (
-        "the card disabled its send button over a row that cannot send for 8h")
+    assert state["in_flight"] is True, (
+        "a deferred row stopped blocking; a second message can now be released "
+        "beside it and the guest receives both")
     assert state["label"] != "Queued to send…", (
-        "the caption still claims an imminent send 8h early — the same "
-        "misrepresentation this ticket was filed about")
+        "the caption still claims an imminent send 8h early")
+    assert state["scheduled_at"], (
+        "'Scheduled to send' without the time is not checkable by the operator")
 
 
 def test_send_state_still_reports_a_due_row_as_in_flight(tenant):
@@ -334,3 +393,95 @@ def test_cancelling_the_blocker_immediately_unblocks_the_guest(client, tenant):
     assert released is True, (
         "cancelling the blocker did not restore the operator's ability to act "
         f"(rows now {_statuses(tenant, 'L1')})")
+
+
+def test_cancel_is_a_compare_and_set_not_a_read_then_write(tenant, monkeypatch):
+    """The window putting "Don't send" on `queued` rows opened.
+
+    Harmless while that button only sat on `pending_approval` rows, which no
+    drainer can claim — `next_queued` selects `queued`. On a `queued` row the
+    drainer is the other party, and the claim can land between the read and the
+    write. Raced for real, 39 of 40 trials ended wrong, so the claim is injected
+    at exactly that point here rather than left to chance.
+
+    Losing the race must leave the row alone. Overwriting a live `sending` row
+    is the worse half: it lands `canceled` with `sending_at` set, so the guest
+    is written to *and* the row drops out of `sent_bodies()` — the one
+    duplicate-send guard `/responder/send` has.
+    """
+    _deal(tenant, "L1")
+    msg = _add(tenant, "L1", auto=True)
+
+    real_get = outbox.get
+    claimed = {"done": False}
+
+    def racing_get(mid):
+        row = real_get(mid)
+        if not claimed["done"]:          # the drainer, immediately after the read
+            claimed["done"] = True
+            outbox.set_status(mid, outbox.SENDING)
+        return row
+
+    monkeypatch.setattr(outbox, "get", racing_get)
+    outbox.cancel(msg["id"])
+    # Restore just this attribute. `monkeypatch.undo()` would also revert the
+    # `db.DB_PATH` the `tenant` fixture set, pointing the assertion below at a
+    # different database — which reads as the row vanishing.
+    monkeypatch.setattr(outbox, "get", real_get)
+
+    assert outbox.get(msg["id"])["status"] == outbox.SENDING, (
+        "cancel overwrote a row a drainer had already claimed; the guest still "
+        "receives it, and it is no longer in sent_bodies() to stop a second copy")
+
+
+def test_the_drainer_does_not_reclaim_a_row_cancelled_under_it(tenant, monkeypatch):
+    """The other half of the same race, from the drainer's side.
+
+    `send_next` reads with `next_queued` and then claims. The claim used to be
+    an unconditional write, so a cancel landing in that gap was silently undone
+    and the message went to the guest anyway — the comment above it has always
+    said "so a second drainer can't pick up the same row", which was simply not
+    what the code did.
+
+    Written because the CAS was otherwise asserted nowhere: reverting it to the
+    bare write left the whole suite green, which is the failure mode this ticket
+    has already shipped twice.
+    """
+    import automation
+    import runner
+
+    _deal(tenant, "L1")
+    msg = _add(tenant, "L1", auto=True)
+
+    dispatched = []
+    monkeypatch.setattr(runner, "send_reply",
+                        lambda *a, **k: (dispatched.append(a), {"status": "ok"})[1])
+
+    real_next = outbox.next_queued
+
+    def racing_next(*a, **k):
+        row = real_next(*a, **k)
+        if row:                       # the operator cancels, post-read
+            outbox.set_status(row["id"], outbox.CANCELED)
+        return row
+
+    monkeypatch.setattr(outbox, "next_queued", racing_next)
+    automation.send_next(tenant, SITE)
+
+    assert dispatched == [], (
+        "the drainer dispatched a message the operator had already cancelled")
+    assert outbox.get(msg["id"])["status"] == outbox.CANCELED, (
+        "the claim overwrote a cancelled row, so the cancel was silently undone "
+        f"(row now {outbox.get(msg['id'])['status']})")
+
+
+def test_the_cancel_route_reports_the_race_rather_than_a_green_toast(client, tenant):
+    """`{"ok": true}` over a message that ships anyway is the lie to avoid."""
+    _deal(tenant, "L1")
+    msg = _add(tenant, "L1", auto=True)
+    outbox.set_status(msg["id"], outbox.SENDING)
+
+    resp = client.post(f"/outbox/{msg['id']}/cancel", data={})
+    assert resp.status_code == 409, (
+        f"cancel answered {resp.status_code} for a row already being delivered")
+    assert outbox.get(msg["id"])["status"] == outbox.SENDING

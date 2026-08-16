@@ -1138,7 +1138,18 @@ def outbox_cancel(msg_id):
             "ok": False, "already": True,
             "error": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
         }), 409
-    outbox.cancel(msg_id)
+    # The check above is the common case; this one is the race. A drainer can
+    # claim the row between that read and this write, and `cancel` refuses when
+    # it does — so the answer has to come from what was actually written, not
+    # from the earlier read. Reporting `ok` unconditionally is how a message the
+    # operator called off still reached the guest, under a green toast.
+    row = outbox.cancel(msg_id)
+    if not row or row["status"] != outbox.CANCELED:
+        status = (row or {}).get("status")
+        return jsonify({
+            "ok": False, "already": True,
+            "error": outbox.STATUS_LABELS.get(status, status),
+        }), 409
     return jsonify({"ok": True, "counts": outbox.counts(tenant_id, SITE)})
 
 

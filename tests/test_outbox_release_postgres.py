@@ -196,11 +196,12 @@ def test_the_guard_does_not_strand_delivery_on_postgres(pg_outbox):
 # Round 6: the due gate, on the backend that actually runs it
 # --------------------------------------------------------------------------
 #
-# The gate is new SQL — `COALESCE(sib.scheduled_at,'') <= ?` alongside the
-# status test — and SQLite is the wrong place to sign it off for the same
-# reason the rest of this file exists. These cases are cheap; the risk they
-# cover is a predicate that parses on both backends and *means* something
-# different on one of them.
+# Round 6 added `COALESCE(sib.scheduled_at,'') <= ?` to the sibling predicate so
+# a deferred row would stop blocking. That was reverted: a deferred row is not
+# cancelled, it is scheduled, and releasing a second message beside it delivers
+# both. What survives is the assertion that the *broad* predicate holds on the
+# deployed backend — cheap cases, and SQLite is the wrong place to sign them off
+# for the same reason the rest of this file exists.
 
 def _seed_at(outbox, item_id, scheduled_at, *, auto=True):
     msg = outbox.add("t1", SITE, item_id, sequence="presale", step_id="intro",
@@ -216,22 +217,25 @@ def _shift_pg(hours):
             + timedelta(hours=hours)).isoformat(timespec="seconds")
 
 
-def test_a_deferred_sibling_does_not_block_on_postgres(pg_outbox):
-    """The lockout round 5 blocked on, verified on the deployed backend."""
+def test_a_deferred_sibling_still_blocks_on_postgres(pg_outbox):
+    """A deferred row blocks on the deployed backend too.
+
+    The stamp is TEXT and the predicate is now status-only, so there is no
+    lexicographic comparison left to differ between backends — which is the
+    point: this fails loudly if anyone reintroduces one on PG alone.
+    """
     outbox = pg_outbox
     deferred = _seed_at(outbox, "d1", _shift_pg(8))
     assert deferred["status"] == outbox.QUEUED
     assert outbox.next_queued("t1") is None, (
-        "precondition: the deferred row is deliverable, so a refusal would be "
-        "correct and this would prove nothing")
+        "precondition: the deferred row is already due")
 
     pending = _seed(outbox, "d1", outbox.PENDING)
-    released, row = outbox.release_to_send(pending["id"],
-                                           from_statuses=outbox.APPROVABLE)
-    assert released is True, (
-        "Postgres still refused the operator over a row nothing can deliver "
-        "for 8 hours")
-    assert row["status"] == outbox.QUEUED
+    released, _ = outbox.release_to_send(pending["id"],
+                                         from_statuses=outbox.APPROVABLE)
+    assert released is False, (
+        "Postgres released a second message beside a row scheduled 8h out; "
+        "both come due and the guest receives both")
 
 
 def test_a_due_sibling_still_blocks_on_postgres(pg_outbox):
@@ -247,18 +251,19 @@ def test_a_due_sibling_still_blocks_on_postgres(pg_outbox):
         "stopped blocking a second release")
 
 
-def test_racing_approvals_beside_a_deferred_row_still_pick_one(pg_outbox):
-    """The gate must not reopen the race it sits next to.
+def test_racing_approvals_beside_a_deferred_row_both_lose(pg_outbox):
+    """Concurrency must not find a way past a blocker a single caller respects.
 
-    With a deferred row present the guard now lets approvals through, so the
-    advisory lock is doing the work alone: two racing approvals of two *other*
-    rows must still resolve to exactly one delivery. This is the combination
-    the gate creates and neither existing race test covers.
+    Two approvals racing beside a deferred row: the advisory lock and the
+    sibling predicate together have to refuse *both*, leaving the deferred row
+    as the only thing going out. Under the reverted round-6 gate this same
+    shape let one through, and then two messages reached the guest — so this
+    asserts the delivery count, not just the return values.
     """
     outbox = pg_outbox
     for trial in range(6):
         item = f"dr{trial}"
-        _seed_at(outbox, item, _shift_pg(8))          # deferred, not a blocker
+        _seed_at(outbox, item, _shift_pg(8))          # a real blocker
         rows = [_seed(outbox, item, outbox.PENDING) for _ in range(2)]
         won = {}
 
@@ -268,10 +273,9 @@ def test_racing_approvals_beside_a_deferred_row_still_pick_one(pg_outbox):
                 mid, from_statuses=outbox.APPROVABLE)[0]
 
         _race(approve)
-        assert sorted(won.values(), key=str) == [False, True], (
-            f"trial {trial}: both approvals beside a deferred row claimed to "
-            f"have released: {won}")
-        # The deferred row is not in flight, so exactly one of the two winners is.
-        assert _in_flight(outbox, item) == 2, (
-            f"trial {trial}: expected the deferred row plus one winner to be "
-            f"IN_FLIGHT by status, got {_in_flight(outbox, item)}")
+        assert sorted(won.values(), key=str) == [False, False], (
+            f"trial {trial}: an approval got past a deferred blocker under a "
+            f"race: {won}")
+        assert _in_flight(outbox, item) == 1, (
+            f"trial {trial}: expected only the deferred row to be in flight, "
+            f"got {_in_flight(outbox, item)}")

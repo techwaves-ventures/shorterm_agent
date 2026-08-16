@@ -220,7 +220,14 @@ def send_next(tenant_id: str, site: str, timeout: int = 300) -> dict | None:
         outbox.set_status(msg["id"], outbox.FAILED, error="stored item not found")
         return msg
     # Claim it before dispatching so a second drainer can't pick up the same row.
-    outbox.set_status(msg["id"], outbox.SENDING)
+    # The claim has to be a compare-and-set for that sentence to be true:
+    # `next_queued` is a separate read, so two drainers can both see `queued`,
+    # and an unguarded write would let both dispatch. It would also silently
+    # re-claim a row the operator cancelled in the gap. Losing the CAS means
+    # someone else owns this row now — leave it alone.
+    if not outbox.set_status(msg["id"], outbox.SENDING,
+                             only_from=(outbox.QUEUED,)):
+        return None
     state = runner.send_reply(tenant_id, site, item, msg["body"])
     # A busy runner means another run owns the browser; put it back and retry
     # later. Nothing was dispatched, so the claim's attempt is refunded — see

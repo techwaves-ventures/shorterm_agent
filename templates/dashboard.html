@@ -391,13 +391,18 @@
          ticket was filed about. "Don't send" is the escape: `queued` is in
          `outbox.CANCELABLE`, and cancelling one immediately unblocks the guest.
          `sending` is deliberately absent — that row cannot be called off, and
-         offering a button that would 409 is not visibility. -->
+         offering a button that would 409 is not visibility.
+
+         The heading says "Waiting to send" rather than "Queued to send" because
+         a deferred row's own caption reads "Scheduled to send": two names for
+         one row on one page is the same confusion this ticket fixed once
+         already, and this wording covers both without contradicting either. -->
     {% if board.queued_sends %}
     <section>
       <div class="sec-head">
-        <h2>Queued to send</h2>
+        <h2>Waiting to send</h2>
         <span class="sec-count">{{ board.queued_sends|length }}</span>
-        <span class="sec-sub">already approved — cancel here to stop one going out</span>
+        <span class="sec-sub">already approved — each one holds its guest's card until it goes out or you cancel it</span>
       </div>
       <div class="sec-body">
         {% for c in board.queued_sends %}
@@ -604,14 +609,16 @@
           setBusy(btn, false);
           if (btn) { btn.disabled = false; btn.textContent = "Retry send"; }
           setMsg(id, "Send failed: " + (s.error || "unknown error"), "err");
-        } else if (s.status === "canceled" || s.status === "pending_approval"
-                   || s.status === "queued") {
-          // All three are real latest-statuses that matched nothing here,
-          // leaving the button frozen in whatever the previous tick made of it.
-          // `queued` reaches this branch only when it is *not* in flight — a row
-          // deferred past its scheduled time — which the block above used to
-          // swallow. The operator may still act on that guest, so the button has
-          // to come back rather than sit disabled until reload.
+        } else if (s.status === "canceled" || s.status === "pending_approval") {
+          // Both are real latest-statuses that matched nothing here, leaving the
+          // button frozen in whatever the previous tick made of it.
+          //
+          // `queued` deliberately does *not* belong here: it is always
+          // `in_flight`, so it returns above. A round of this ticket gave a
+          // deferred row `in_flight=false` and added `queued` to this branch to
+          // catch the fallout — when that narrowing was reverted (it let a
+          // second message reach the guest) this case became unreachable, and
+          // an unreachable branch in this exact function is what VEN-131 is.
           setBusy(btn, false);
           setMsg(id, s.label, "");
         }

@@ -32,12 +32,11 @@ CANCELED = "canceled"
 OPEN_STATUSES = (PENDING, QUEUED, SENDING, FAILED)
 # States the UI reports back on a card after the user hits send.
 #
-# A *status set*, and no longer the in-flight test — do not reach for it to
-# decide whether something is going out. `queued` alone does not mean deliverable:
-# `next_queued` also requires `scheduled_at` to have arrived, and testing
-# membership here instead is what let a row deferred to tomorrow morning refuse
-# every operator action for that guest. `_in_flight_terms` / `_row_in_flight` are
-# that decision; this stays for counting rows by status, which is all it means.
+# A *status set*. It happens to hold the same two statuses `_in_flight_terms`
+# tests, but go through that helper rather than this tuple when the question is
+# "may a second message be released" — the guard also excludes the row itself
+# (`sib.id<>outbox.id`), and one round of this ticket got the predicate wrong in
+# a way that reached the guest. This stays for counting rows by status.
 IN_FLIGHT = (QUEUED, SENDING)
 # The only states a message may be *released to send* from: still waiting for a
 # human, or a failure the human is retrying. Anything else has already reached
@@ -183,46 +182,66 @@ def _item_key(tenant_id, site, item_id) -> str:
     return f"outbox:{tenant_id}:{site}:{item_id}"
 
 
-def _in_flight_terms(alias: str, now_iso: str | None = None) -> tuple[str, list]:
-    """SQL for "this row is going out *now*" — one definition, every caller.
+def _in_flight_terms(alias: str) -> tuple[str, list]:
+    """SQL for "this item already has a message the guest will receive".
 
-    `status IN (queued, sending)` was too broad, and the gap it left was not
-    academic: a `queued` row is only deliverable once `scheduled_at` has
-    arrived, because that is exactly what `next_queued` gates on. Testing
-    membership alone made a row the drainer would not touch for eight hours
-    block every operator action for that guest — approve, retry and send all
-    answered 409 for the whole window, with `automation.enqueue_autopilot_reply`
-    scheduling through the quiet-hours clamp as the ordinary way to get there.
-    Two definitions of "in flight" inside one module is the defect; this is the
-    one, and `next_queued` is its other half.
+    One definition, every caller. The question this answers is *not* "is
+    something going out this instant" — it is "will this guest be written to",
+    which is what deciding to release a second message actually depends on.
 
-    `sending` is *not* gated on the stamp. A drainer already holds that row and
-    is writing to the guest, so its scheduled time is history — only `queued`
-    is a promise about the future.
+    A round of this ticket narrowed the test to `scheduled_at<=now`, reasoning
+    that a row the drainer will not touch for eight hours is not in flight and
+    should not refuse the operator. That reasoning is wrong in the only way that
+    matters: a deferred row is not *cancelled*, it is *scheduled*. Releasing a
+    second message beside it does not avoid a collision, it guarantees one —
+    both rows come due and both are delivered. Measured through the real routes,
+    it put two messages in front of one guest where the broad test put one, and
+    on the `/responder/send` path the two bodies were byte-identical, because
+    `runner.py` hands the same draft string to `enqueue_autopilot_reply` and to
+    the textarea the operator posts.
 
-    NULL/missing `scheduled_at` counts as due rather than deferred: blocking is
-    the safe side of this test, and a row with no readable stamp is not evidence
-    that nothing is going out.
+    Serializing at drain time does not rescue the narrow test either: spacing
+    the two rows apart still delivers both. Nothing downstream compares bodies —
+    `sent_bodies()` is consulted only by `/responder/send`'s pre-read, never by
+    `send_next` — so "not two at once" is not the guarantee this needs. "One
+    message per guest per exchange" is, and only the broad test provides it.
+
+    The lockout that narrowing was meant to cure is real, and is cured instead
+    by making the refusal *legible*: the blocking row is rendered on the board
+    with a working "Don't send" (`dashboard._board`'s `queued_sends`), so the
+    operator clears it in one click and then sends. A refusal you can see and
+    undo is a different thing from the invisible one this ticket was filed
+    about. `send_state` still *describes* a deferred row honestly — see
+    `_row_deferred` — because how a row is labelled and whether it blocks are
+    two questions, and fusing them is what produced the duplicate.
     """
-    now = now_iso or timeframe.now()
-    return (
-        f"({alias}.status=? OR ({alias}.status=? "
-        f"AND COALESCE({alias}.scheduled_at,'')<=?))",
-        [SENDING, QUEUED, now],
-    )
+    return (f"({alias}.status=? OR {alias}.status=?)", [QUEUED, SENDING])
 
 
-def _row_in_flight(row: dict, now_iso: str) -> bool:
+def _row_in_flight(row: dict) -> bool:
     """`_in_flight_terms` for a row already in hand — same rule, Python side.
 
     `send_state` decides from rows the caller has already fetched, so it cannot
     reuse the SQL. Kept adjacent to its twin, and `tests/test_outbox_due_gate.py`
     asserts the two agree row-for-row rather than trusting that they do.
     """
-    if row.get("status") == SENDING:
-        return True
+    return row.get("status") in (QUEUED, SENDING)
+
+
+def _row_deferred(row: dict, now_iso: str) -> bool:
+    """Is this a `queued` row still waiting on its scheduled time?
+
+    Presentation only — deliberately *not* wired into any guard. A deferred row
+    blocks exactly as hard as a due one (see `_in_flight_terms`); this only lets
+    the page say "Scheduled to send 08:00" instead of "Queued to send…" over a
+    message that is eight hours out, which is its own small dishonesty.
+
+    NULL/missing `scheduled_at` reads as due rather than deferred: a row with no
+    readable stamp is not evidence about the future, and the plainer caption is
+    the safer thing to show.
+    """
     return (row.get("status") == QUEUED
-            and (row.get("scheduled_at") or "") <= now_iso)
+            and (row.get("scheduled_at") or "") > now_iso)
 
 
 def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
@@ -343,9 +362,9 @@ def in_flight_for_item(tenant_id: str, site: str, item_id: str, *,
     browser is already driving that row, which is the stronger claim on the
     thread and the more honest thing to name.
 
-    Due-gated via `_in_flight_terms`, so this keeps explaining the same refusal
-    the UPDATE enforces. It has to move in lockstep with that predicate or it
-    resumes naming a blocker that no longer blocks.
+    Shares `_in_flight_terms` with that UPDATE, so this keeps explaining the
+    same refusal. It has to move in lockstep with that predicate or it resumes
+    naming a blocker that no longer blocks.
     """
     order = "CASE WHEN status=? THEN 0 ELSE 1 END, id ASC"
     terms, term_params = _in_flight_terms("outbox")
@@ -660,11 +679,23 @@ def cancel(msg_id: int) -> dict | None:
     guest. In both of those states the guest is written to whatever this
     returns, so reporting a cancel would be a lie. Callers tell the two apart by
     the status of the row that comes back.
+
+    That test is a WHERE term on the write, not a preceding read. Read-then-write
+    was survivable while the only "Don't send" button sat on `pending_approval`
+    rows, which no drainer can claim — `next_queued` selects `queued`. This
+    ticket puts the button on `queued` rows, which is exactly what a drainer
+    takes, so the window stopped being theoretical: raced through the real
+    route, 39 of 40 trials ended wrong. Half answered a green `{"ok": true}`
+    while the drainer delivered the message anyway; the other half overwrote a
+    live `sending` row, which is worse than it sounds — the row lands `canceled`
+    with `sending_at` set, so the guest receives it *and* it drops out of
+    `sent_bodies()`, the one duplicate-send guard `/responder/send` has. Losing
+    the CAS now leaves the row untouched and the caller reports the truth.
     """
     msg = get(msg_id)
-    if not msg or msg["status"] not in CANCELABLE:
-        return msg
-    set_status(msg_id, CANCELED)
+    if not msg:
+        return None
+    set_status(msg_id, CANCELED, only_from=CANCELABLE)
     return get(msg_id)
 
 
@@ -731,27 +762,32 @@ def send_state(rows: list[dict] | None, now_iso: str | None = None) -> dict | No
     delivering, which reads as "there is still time to stop this" when there is
     not. Same precedence as `in_flight_for_item`.
 
-    "In flight" here is `_row_in_flight`, the same due-gated rule the release
-    guard enforces, because these two disagreeing is the whole of this ticket:
-    the button's disabled state and the server's 409 have to come from one
-    predicate or the page lies about one of them. A `queued` row scheduled for
-    tomorrow is therefore *not* in flight, and says so — captioning it "Queued
-    to send…" over a disabled control, eight hours early, is the same
-    misrepresentation on the other foot.
+    "In flight" here is `_row_in_flight`, the same rule the release guard
+    enforces, because these two disagreeing is the whole of this ticket: the
+    button's disabled state and the server's 409 have to come from one predicate
+    or the page lies about one of them.
+
+    A deferred row is still in flight — it blocks, so the control stays
+    disabled — but it is *labelled* differently, because "Queued to send…" over
+    a message that leaves at 08:00 tomorrow is its own small dishonesty. That
+    split is deliberate: `_row_deferred` decides the caption, `_row_in_flight`
+    decides the refusal, and an earlier round fusing the two is what let a
+    second message reach the guest. The caption carries the time (`scheduled_at`
+    ships in this payload) so "Scheduled to send" is checkable rather than vague.
     """
     rows = [m for m in (rows or []) if m]
     if not rows:
         return None
     now = now_iso or timeframe.now()
     governing = (next((m for m in rows if m["status"] == SENDING), None)
-                 or next((m for m in rows if _row_in_flight(m, now)), rows[-1]))
+                 or next((m for m in rows if _row_in_flight(m)), rows[-1]))
     status = governing["status"]
-    in_flight = _row_in_flight(governing, now)
+    in_flight = _row_in_flight(governing)
     label = STATUS_LABELS.get(status, status)
-    if status == QUEUED and not in_flight:
-        # Approved and waiting on its scheduled time, not on a drainer. The
-        # operator may still act on this guest, and the caption has to stop
-        # implying otherwise.
+    if _row_deferred(governing, now):
+        # Approved and waiting on its scheduled time rather than on a drainer.
+        # Still blocking — the operator's escape is "Don't send" on the board,
+        # not an enabled button here.
         label = "Scheduled to send"
     return {
         "id": governing["id"],
