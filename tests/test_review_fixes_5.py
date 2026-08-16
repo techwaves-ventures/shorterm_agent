@@ -247,12 +247,18 @@ def test_the_capability_gate_decides_whether_a_render_starts_a_drainer(
     Here the row is left genuinely `queued`, so the gate is the deciding
     conjunct and inverting the patch has to change the result.
 
-    Both halves matter. `capable=False` catches the gate being deleted (an
-    incapable host spinning up a drainer that cannot finish); `capable=True`
-    catches it being welded shut, which is the direction nothing else in the
-    suite covers — queued messages would silently stop being delivered from a
-    render on every topology, and a test that only asserts an absence passes
-    that regression happily.
+    Both halves matter. `capable=False` catches the *guard expression* at
+    `dashboard.py:282` being deleted (an incapable host spinning up a drainer
+    that cannot finish); `capable=True` catches that same expression being
+    welded shut — the direction nothing else in the suite covers, because a
+    test that only asserts an absence passes a fail-closed regression happily.
+
+    Scope, precisely: patching `_can_deliver_in_process` pins the *use* of the
+    decision, so this test says nothing about the decision itself — every
+    mutation to the function body at `dashboard.py:177-183` survives it. That
+    body is covered separately, by patching its two inputs, in
+    `test_the_capability_decision_reads_playwright_and_the_worker_queue_flag`
+    below. The two tests are complements: neither alone covers the gate.
     """
     import dashboard
 
@@ -273,3 +279,45 @@ def test_the_capability_gate_decides_whether_a_render_starts_a_drainer(
     assert drainer_spy == [SITE] * expected, (
         f"_can_deliver_in_process()={capable} must yield {expected} drainer "
         f"start(s) for {SITE} from a render with a queued row, got {drainer_spy}")
+
+
+@pytest.mark.parametrize("playwright,forced,expected", [
+    (True, False, True),
+    (True, True, False),
+    (False, False, False),
+    (False, True, False),
+])
+def test_the_capability_decision_reads_playwright_and_the_worker_queue_flag(
+        monkeypatch, playwright, forced, expected):
+    """Cover the capability *decision* itself, not merely its use.
+
+    Every other test that touches `_can_deliver_in_process` monkeypatches the
+    symbol, which is exactly why nothing covered its body: you cannot exercise
+    a function you have replaced. So this patches its two **inputs** —
+    `check_leads.playwright_available` and the `FORCE_WORKER_QUEUE` env var
+    that `_use_worker_queue()` reads — and lets the real body decide.
+
+    The truth table is the contract in `dashboard.py:177-183`: deliver in
+    process only on a host that has Playwright *and* has not handed browser
+    work to the worker queue. The three off-diagonal rows are all false for
+    different reasons, and that asymmetry is what kills a constant-return
+    regression in either direction, plus the one-token `not` drop that would
+    invert the flag's meaning and break both topologies at once.
+
+    Env is set *and* cleared explicitly rather than read ambiently: the result
+    must not depend on whether the host running the suite happens to have
+    Playwright installed, nor on `FORCE_WORKER_QUEUE` residue left behind by
+    an earlier test file.
+    """
+    import check_leads
+    import dashboard
+
+    monkeypatch.setattr(check_leads, "playwright_available", lambda: playwright)
+    if forced:
+        monkeypatch.setenv("FORCE_WORKER_QUEUE", "1")
+    else:
+        monkeypatch.delenv("FORCE_WORKER_QUEUE", raising=False)
+
+    assert dashboard._can_deliver_in_process() is expected, (
+        f"playwright_available()={playwright} and FORCE_WORKER_QUEUE="
+        f"{'1' if forced else 'unset'} must decide {expected}")
