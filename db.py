@@ -289,9 +289,24 @@ def lock_key(conn: Conn, key: str) -> None:
     only cost unrelated serialization, never correctness.
 
     No-op on SQLite, which already gives this for free.
+
+    Refuses an autocommit connection rather than degrading on one.
+    `pg_advisory_xact_lock` releases at the end of its transaction, so under
+    autocommit it is taken and dropped by its own statement — a silent no-op
+    that leaves the caller's predicate as racy as it was before, while every
+    SQLite test stays green. That is precisely the combination that shipped a
+    broken guard here once already (the 14/15 above), and `open_with_schema`
+    documents the same hazard for the schema latch, which is why that one uses a
+    *session* lock. The precondition holds today — psycopg defaults
+    `autocommit=False` — so this is not a live bug; it is what makes the next
+    person's pooled-connection change fail loudly instead of quietly.
     """
     if not conn.pg:
         return
+    if getattr(conn.raw, "autocommit", False):
+        raise RuntimeError(
+            "lock_key needs a transactional connection: pg_advisory_xact_lock "
+            "is a no-op under autocommit, silently un-guarding the caller.")
     # Signed 64-bit, which is what pg_advisory_xact_lock(bigint) accepts.
     digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
     conn.execute("SELECT pg_advisory_xact_lock(?)",

@@ -385,6 +385,43 @@
     </section>
     {% endif %}
 
+    <!-- 2a. Approved and on their way out. Rendered because these rows *block*
+         approve/retry/send for their guest, and a refusal the operator cannot
+         see or undo is the same class of lie as the dead in-flight branch this
+         ticket was filed about. "Don't send" is the escape: `queued` is in
+         `outbox.CANCELABLE`, and cancelling one immediately unblocks the guest.
+         `sending` is deliberately absent — that row cannot be called off, and
+         offering a button that would 409 is not visibility. -->
+    {% if board.queued_sends %}
+    <section>
+      <div class="sec-head">
+        <h2>Queued to send</h2>
+        <span class="sec-count">{{ board.queued_sends|length }}</span>
+        <span class="sec-sub">already approved — cancel here to stop one going out</span>
+      </div>
+      <div class="sec-body">
+        {% for c in board.queued_sends %}
+          {% set msg = c.pending %}
+          <article class="deal">
+            <div class="deal__rail"></div>
+            <div class="deal__main">
+              <div class="deal__top">
+                <span class="deal__name">{{ c.deal.guest_name or 'Guest' }}</span>
+                <span class="badge badge--brand">{{ msg.step_label }}</span>
+                <span class="deal__age">sends {{ msg.scheduled_at|sched_local }}</span>
+              </div>
+              <div class="preview">{{ msg.body }}</div>
+              <div class="actions">
+                <button class="mini danger" onclick="cancelMsg({{ msg.id }})">Don't send</button>
+              </div>
+              <div class="msg" id="msg-ob-{{ msg.id }}"></div>
+            </div>
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
     <!-- 2b. Agent decided these aren't a fit — oversight, not a to-do list -->
     {% if board.reviewable %}
     <section>
@@ -567,9 +604,14 @@
           setBusy(btn, false);
           if (btn) { btn.disabled = false; btn.textContent = "Retry send"; }
           setMsg(id, "Send failed: " + (s.error || "unknown error"), "err");
-        } else if (s.status === "canceled" || s.status === "pending_approval") {
-          // Both are real latest-statuses that matched nothing here, leaving the
-          // button frozen in whatever the previous tick made of it.
+        } else if (s.status === "canceled" || s.status === "pending_approval"
+                   || s.status === "queued") {
+          // All three are real latest-statuses that matched nothing here,
+          // leaving the button frozen in whatever the previous tick made of it.
+          // `queued` reaches this branch only when it is *not* in flight — a row
+          // deferred past its scheduled time — which the block above used to
+          // swallow. The operator may still act on that guest, so the button has
+          // to come back rather than sit disabled until reload.
           setBusy(btn, false);
           setMsg(id, s.label, "");
         }

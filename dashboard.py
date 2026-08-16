@@ -320,6 +320,28 @@ def _board(tenant_id: str) -> dict:
             for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
             if m["item_id"] in by_id
         ],
+        # Approved rows still waiting on a drainer or on their scheduled time.
+        # These were rendered nowhere, which is what made the release guard
+        # indefensible: a `queued` row refuses approve/retry/send for its guest,
+        # and with no row on the page and no cancel control the operator could
+        # neither see what was blocking them nor clear it — the only escape was
+        # hand-POSTing /outbox/<id>/cancel. `queued` is in `outbox.CANCELABLE`
+        # and that route already answers 200, so the affordance was the only
+        # missing piece. It matters most where no drainer runs at all: there the
+        # block is not a window, it is permanent.
+        #
+        # Derived from `send_rows` — already a whole-table read for this tenant —
+        # rather than a seventh `for_tenant` query, because the board's query
+        # count is fixed by design and asserted as such. Ordered as `for_tenant`
+        # orders, so the section reads oldest-due first.
+        "queued_sends": [
+            {**card(by_id[m["item_id"]]), "pending": m}
+            for m in sorted(
+                (m for rows in send_rows.values() for m in rows
+                 if m["status"] == outbox.QUEUED and m["item_id"] in by_id),
+                key=lambda m: (m.get("scheduled_at") or "", m["id"]),
+            )
+        ],
         "outbox_counts": outbox.counts(tenant_id, SITE),
         # `steps` is a set internally (membership tests); listify so the board
         # stays JSON-serializable for /api/board.

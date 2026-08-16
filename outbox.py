@@ -31,6 +31,13 @@ CANCELED = "canceled"
 
 OPEN_STATUSES = (PENDING, QUEUED, SENDING, FAILED)
 # States the UI reports back on a card after the user hits send.
+#
+# A *status set*, and no longer the in-flight test — do not reach for it to
+# decide whether something is going out. `queued` alone does not mean deliverable:
+# `next_queued` also requires `scheduled_at` to have arrived, and testing
+# membership here instead is what let a row deferred to tomorrow morning refuse
+# every operator action for that guest. `_in_flight_terms` / `_row_in_flight` are
+# that decision; this stays for counting rows by status, which is all it means.
 IN_FLIGHT = (QUEUED, SENDING)
 # The only states a message may be *released to send* from: still waiting for a
 # human, or a failure the human is retrying. Anything else has already reached
@@ -176,6 +183,48 @@ def _item_key(tenant_id, site, item_id) -> str:
     return f"outbox:{tenant_id}:{site}:{item_id}"
 
 
+def _in_flight_terms(alias: str, now_iso: str | None = None) -> tuple[str, list]:
+    """SQL for "this row is going out *now*" — one definition, every caller.
+
+    `status IN (queued, sending)` was too broad, and the gap it left was not
+    academic: a `queued` row is only deliverable once `scheduled_at` has
+    arrived, because that is exactly what `next_queued` gates on. Testing
+    membership alone made a row the drainer would not touch for eight hours
+    block every operator action for that guest — approve, retry and send all
+    answered 409 for the whole window, with `automation.enqueue_autopilot_reply`
+    scheduling through the quiet-hours clamp as the ordinary way to get there.
+    Two definitions of "in flight" inside one module is the defect; this is the
+    one, and `next_queued` is its other half.
+
+    `sending` is *not* gated on the stamp. A drainer already holds that row and
+    is writing to the guest, so its scheduled time is history — only `queued`
+    is a promise about the future.
+
+    NULL/missing `scheduled_at` counts as due rather than deferred: blocking is
+    the safe side of this test, and a row with no readable stamp is not evidence
+    that nothing is going out.
+    """
+    now = now_iso or timeframe.now()
+    return (
+        f"({alias}.status=? OR ({alias}.status=? "
+        f"AND COALESCE({alias}.scheduled_at,'')<=?))",
+        [SENDING, QUEUED, now],
+    )
+
+
+def _row_in_flight(row: dict, now_iso: str) -> bool:
+    """`_in_flight_terms` for a row already in hand — same rule, Python side.
+
+    `send_state` decides from rows the caller has already fetched, so it cannot
+    reuse the SQL. Kept adjacent to its twin, and `tests/test_outbox_due_gate.py`
+    asserts the two agree row-for-row rather than trusting that they do.
+    """
+    if row.get("status") == SENDING:
+        return True
+    return (row.get("status") == QUEUED
+            and (row.get("scheduled_at") or "") <= now_iso)
+
+
 def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
         step_label: str, body: str, auto: bool, reason: str = "",
         scheduled_at: str | None = None,
@@ -213,13 +262,14 @@ def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
             # cover it. Two concurrent inserts each found NOT EXISTS true on
             # their own snapshot and both wrote — 15/15 on PG. See `db.lock_key`.
             db.lock_key(c, _item_key(tenant_id, site, item_id))
+            terms, term_params = _in_flight_terms("sib")
             new_id = db.insert_returning_id_maybe(
                 c,
                 f"""{cols} SELECT {','.join('?' * len(vals))}
-                    WHERE NOT EXISTS (SELECT 1 FROM outbox WHERE tenant_id=?
-                        AND site=? AND item_id=?
-                        AND status IN ({','.join('?' * len(IN_FLIGHT))}))""",
-                (*vals, str(tenant_id), site, str(item_id), *IN_FLIGHT),
+                    WHERE NOT EXISTS (SELECT 1 FROM outbox sib
+                        WHERE sib.tenant_id=? AND sib.site=? AND sib.item_id=?
+                        AND {terms})""",
+                (*vals, str(tenant_id), site, str(item_id), *term_params),
             )
         else:
             new_id = db.insert_returning_id(
@@ -292,11 +342,16 @@ def in_flight_for_item(tenant_id: str, site: str, item_id: str, *,
     `sending` outranks `queued` for the same reason `send_state` prefers it: a
     browser is already driving that row, which is the stronger claim on the
     thread and the more honest thing to name.
+
+    Due-gated via `_in_flight_terms`, so this keeps explaining the same refusal
+    the UPDATE enforces. It has to move in lockstep with that predicate or it
+    resumes naming a blocker that no longer blocks.
     """
     order = "CASE WHEN status=? THEN 0 ELSE 1 END, id ASC"
+    terms, term_params = _in_flight_terms("outbox")
     sql = (f"{_SELECT} WHERE tenant_id=? AND site=? AND item_id=? "
-           f"AND status IN ({','.join('?' * len(IN_FLIGHT))})")
-    params: list = [str(tenant_id), site, str(item_id), *IN_FLIGHT]
+           f"AND {terms}")
+    params: list = [str(tenant_id), site, str(item_id), *term_params]
     if exclude_id is not None:
         sql += " AND id<>?"
         params.append(exclude_id)
@@ -524,11 +579,12 @@ def set_status(msg_id: int, status: str, *, error: str | None = None,
         # Correlated on the row being updated, so the sibling test is evaluated
         # by the same statement that does the write. `id<>outbox.id` because a
         # row that is itself in flight is not its own blocker.
+        terms, term_params = _in_flight_terms("sib")
         where.append(
             "NOT EXISTS (SELECT 1 FROM outbox sib WHERE sib.tenant_id=outbox.tenant_id "
             "AND sib.site=outbox.site AND sib.item_id=outbox.item_id "
-            f"AND sib.id<>outbox.id AND sib.status IN ({','.join('?' * len(IN_FLIGHT))}))")
-        vals += list(IN_FLIGHT)
+            f"AND sib.id<>outbox.id AND {terms})")
+        vals += term_params
 
     with _conn() as c:
         if unless_sibling_in_flight:
@@ -655,7 +711,7 @@ def rows_by_item(tenant_id: str, site: str) -> dict[str, list[dict]]:
     return out
 
 
-def send_state(rows: list[dict] | None) -> dict | None:
+def send_state(rows: list[dict] | None, now_iso: str | None = None) -> dict | None:
     """What this item's delivery is doing — the one rule, for every surface.
 
     Any in-flight row wins over a newer row in another state, because the
@@ -674,18 +730,35 @@ def send_state(rows: list[dict] | None) -> dict | None:
     "Queued to send…" for an item whose *other* row a browser was already
     delivering, which reads as "there is still time to stop this" when there is
     not. Same precedence as `in_flight_for_item`.
+
+    "In flight" here is `_row_in_flight`, the same due-gated rule the release
+    guard enforces, because these two disagreeing is the whole of this ticket:
+    the button's disabled state and the server's 409 have to come from one
+    predicate or the page lies about one of them. A `queued` row scheduled for
+    tomorrow is therefore *not* in flight, and says so — captioning it "Queued
+    to send…" over a disabled control, eight hours early, is the same
+    misrepresentation on the other foot.
     """
     rows = [m for m in (rows or []) if m]
     if not rows:
         return None
+    now = now_iso or timeframe.now()
     governing = (next((m for m in rows if m["status"] == SENDING), None)
-                 or next((m for m in rows if m["status"] in IN_FLIGHT), rows[-1]))
+                 or next((m for m in rows if _row_in_flight(m, now)), rows[-1]))
     status = governing["status"]
+    in_flight = _row_in_flight(governing, now)
+    label = STATUS_LABELS.get(status, status)
+    if status == QUEUED and not in_flight:
+        # Approved and waiting on its scheduled time, not on a drainer. The
+        # operator may still act on this guest, and the caption has to stop
+        # implying otherwise.
+        label = "Scheduled to send"
     return {
         "id": governing["id"],
         "status": status,
-        "label": STATUS_LABELS.get(status, status),
+        "label": label,
         "error": governing.get("error"),
         "step": governing.get("step_label"),
-        "in_flight": status in IN_FLIGHT,
+        "scheduled_at": governing.get("scheduled_at"),
+        "in_flight": in_flight,
     }
