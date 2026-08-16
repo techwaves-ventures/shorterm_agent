@@ -413,7 +413,11 @@
               <div class="deal__top">
                 <span class="deal__name">{{ c.deal.guest_name or 'Guest' }}</span>
                 <span class="badge badge--brand">{{ msg.step_label }}</span>
-                <span class="deal__age">sends {{ msg.scheduled_at|sched_local }}</span>
+                {# "sends 07:08" over a row a browser is already driving states a
+                   plan where there is now an outcome, and the stamp it would
+                   print is in the past. The scheduled time stops being the
+                   useful fact the moment the send starts. #}
+                <span class="deal__age">{% if c.cancelable %}sends {{ msg.scheduled_at|sched_local }}{% else %}going out now{% endif %}</span>
               </div>
               <div class="preview">{{ msg.body }}</div>
               <div class="actions">

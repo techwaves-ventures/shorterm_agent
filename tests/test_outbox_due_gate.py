@@ -596,6 +596,9 @@ def test_a_sending_blocker_is_listed_even_though_it_cannot_be_called_off(
     assert "cannot be called off" in html, (
         "listed without saying why it has no cancel, which reads as a missing "
         "button rather than a deliberate refusal")
+    assert "going out now" in html, (
+        "the section's row template states a plan — 'sends <time>' — and the "
+        "stamp it prints for a row already being delivered is in the past")
 
 
 def test_a_sending_blocker_is_not_offered_a_cancel_that_would_409(client, tenant):
