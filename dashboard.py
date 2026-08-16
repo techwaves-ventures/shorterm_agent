@@ -44,6 +44,7 @@ import config
 import crypto
 import ff_account
 import inbound
+import inbound_rejects
 import jobs
 import models
 import outbox
@@ -369,6 +370,21 @@ def inbound_email():
         )
     except inbound.Rejected as e:
         app.logger.warning("Inbound email rejected: %s", e)
+        # Keep the ones that represent a *lost lead*. A rejection that never got
+        # past the provider secret is a probe, not a lead, and this endpoint is
+        # public — persisting those would let a stranger fill the operator's
+        # screen and disk. `inbound.Rejected` carries the distinction.
+        if e.tenant_id and e.code in inbound.RECORDABLE_CODES:
+            try:
+                # No reason text: the row carries operator-facing copy keyed on
+                # the code. `str(e)` is the audit string and it is already in
+                # the log line above — for `sender_not_allowed` it also embeds
+                # the raw sender, which does not belong on the review page.
+                inbound_rejects.record(e.tenant_id, SITE, e.code, "", payload)
+            except Exception:
+                # Never let bookkeeping change the reply: the flat 202 is what
+                # keeps this endpoint from telling a prober which addresses exist.
+                app.logger.exception("Could not record rejected inbound")
         return ("", 202)
     except Exception:
         app.logger.exception("Inbound email handling failed")
@@ -376,9 +392,13 @@ def inbound_email():
 
     try:
         is_new = inbound.store(tenant_id, item, SITE)
+        # Not "duplicate": `store` also returns False when the item was new and
+        # the board write failed, and calling that a duplicate is how a lead
+        # awaiting backfill reads as routine noise in the log. `store` warns
+        # with the item id on that path, so the distinction is one line above.
         app.logger.info(
             "Inbound %s for tenant %s (%s)",
-            item.get("kind"), tenant_id, "new" if is_new else "duplicate",
+            item.get("kind"), tenant_id, "new" if is_new else "not newly ingested",
         )
         if is_new and os.getenv("ANTHROPIC_API_KEY"):
             # Draft immediately — answering fast is the entire point of taking
@@ -387,6 +407,174 @@ def inbound_email():
     except Exception:
         app.logger.exception("Could not store inbound item")
     return ("", 202)
+
+
+def _reject_or_404(tenant_id: str, rid: int) -> dict:
+    """Load a rejected inbound row, refusing anything outside the caller's tenant."""
+    row = inbound_rejects.get(tenant_id, SITE, rid)
+    if not row:
+        abort(404, "No such message.")
+    return row
+
+
+@app.route("/inbound/rejected")
+@login_required
+def inbound_rejected():
+    """Forwarded emails we couldn't read — the operator's recovery queue."""
+    tenant_id = current_user.tenant_id
+    return render_template(
+        "rejected.html",
+        nav_active="dashboard",
+        account=current_user.email,
+        is_operator=current_user.is_operator,
+        rows=inbound_rejects.open_for_tenant(tenant_id, SITE),
+    )
+
+
+@app.route("/inbound/rejected/<int:rid>/retry", methods=["POST"])
+@login_required
+def inbound_rejected_retry(rid):
+    """Re-run the current parser over a stored message.
+
+    The point of this button is the day after a parser fix ships: the leads that
+    were lost to the old gap can be recovered without asking the guest to write
+    again.
+    """
+    tenant_id = current_user.tenant_id
+    row = _reject_or_404(tenant_id, rid)
+    if row["status"] != inbound_rejects.OPEN:
+        # A stale tab still shows rows that have since been handled elsewhere.
+        flash("That message was already handled.")
+        return redirect(url_for("inbound_rejected"))
+
+    from sites import ff_email
+
+    # Pass the mail `Date` the way the webhook does. Without it two sends of the
+    # same words are indistinguishable: a message id hashes a stamp that falls
+    # back to this argument, and the body fingerprint strips quoted history — so
+    # a guest's ordinary re-send ("Any update?" again, with the earlier exchange
+    # quoted underneath) recovered onto the *first* message's deal and was
+    # silently absorbed while the operator was told it had been recovered.
+    #
+    # When there is no stored mail date, pass what the webhook passes: nothing.
+    # `extract_date` returns "" when the payload carries no usable `Date`, so an
+    # empty string is the webhook's own input and matching it is what keeps the
+    # two paths deriving the *same* id. Substituting `received_at` here — our own
+    # write clock, which the webhook never sees — derives a different id for the
+    # same email, so a later re-delivery is no longer recognised as a duplicate
+    # and queues a second autopilot reply to a guest who wrote once.
+    #
+    # It is not a useful fallback anyway: it is second-precision, so the bulk
+    # forward it was meant to separate still collapses onto one id. Rows
+    # predating the column are not the narrow case they were described as
+    # either — a brand-new row stores `mail_date=''` whenever the payload has no
+    # date at all, so this is simply the ordinary no-date shape and it is logged
+    # rather than left silent.
+    if not row.get("mail_date"):
+        app.logger.info(
+            "Retrying rejected inbound row %s with no stored mail date; its "
+            "message id is derived the same way the webhook derived it, so a "
+            "same-subject re-send may share that id", rid,
+        )
+    item = ff_email.parse(row["subject"] or "", row["body"] or "",
+                          received_at=row.get("mail_date") or "")
+    if not item:
+        # Keyed on why the row was captured, not on where this attempt stopped:
+        # a row rejected for its sender is an allowlist problem, and saying only
+        # "still couldn't read this email" would replace the fact the host can
+        # act on with one they can't.
+        inbound_rejects.update_reason(
+            tenant_id, SITE, rid,
+            inbound_rejects.retry_failed_reason(row.get("reason_code", "")),
+        )
+        flash("Still couldn't read that email — it stays on this list.")
+        return redirect(url_for("inbound_rejected"))
+
+    # Claim the row before doing any work. The UPDATE is conditional on the row
+    # still being open, so a double-submit (or two tabs) can't both proceed to
+    # create a deal — the loser sees no rows changed and stops here.
+    if not inbound_rejects.mark_recovered(tenant_id, SITE, rid, item.get("id", "")):
+        flash("That message was already handled.")
+        return redirect(url_for("inbound_rejected"))
+
+    # `inbound.recover`, not `store`: it writes the board first and reports what
+    # it actually did, where `store` records its dedup row first and swallows a
+    # board failure while still returning success. Both of this path's earlier
+    # defects came out of that ordering — a failed recovery told the operator the
+    # lead was safe, and poisoned the dedup so no later retry could ever reach the
+    # board again.
+    #
+    # `already_had_it` matters as much as `on_board`. Re-applying a message that
+    # was ingested earlier is not a harmless no-op: it cancels the deal's queued
+    # follow-up and re-opens drafting, so a second click on a stale row would
+    # queue a second reply to a guest who only wrote once.
+    try:
+        already_had_it, on_board = inbound.recover(tenant_id, item, SITE)
+    except Exception:
+        app.logger.exception("Could not store recovered inbound item")
+        already_had_it, on_board = False, False
+
+    # Hand the row back when the guest didn't reach the board — a message marked
+    # recovered with nothing to show for it is the silent loss this page exists
+    # to end.
+    #
+    # Keyed on why the row was captured, exactly as the parse-failure branch
+    # above is. This attempt stopped somewhere else, but a `sender_not_allowed`
+    # row's actionable fact is still the allowlist, and a hardcoded "try again"
+    # here replaced the one thing the host could do with one they cannot.
+    if not on_board:
+        inbound_rejects.reopen(
+            tenant_id, SITE, rid,
+            inbound_rejects.board_failed_reason(row.get("reason_code", "")),
+        )
+        flash("Read that email, but couldn't open the lead — it stays on this list.")
+        return redirect(url_for("inbound_rejected"))
+
+    # Same follow-through the webhook gives a lead that parsed first time. A
+    # recovered lead is a *late* lead, so it needs the draft more, not less —
+    # and an email-only tenant has no scheduled pass that would pick it up.
+    #
+    # Gated on this attempt having been the one that ingested it, which is the
+    # recovery-path equivalent of the webhook's `is_new`: it drafts a threaded
+    # reply (an existing conversation, so nothing "new" is on screen, but the
+    # guest is waiting on an answer) and stays quiet when the retry found the
+    # item already ingested. A presence test got this backwards and left every
+    # recovered reply undrafted while the identical webhook reply was drafted.
+    # Note this is the full ingest follow-through, so with the scheduler on it
+    # can send, not just draft — which is why the already-ingested case must not
+    # fall through to here.
+    #
+    # A lead gets one more question asked of it. Since `store` keeps its item
+    # through a board failure, `backfill` can put that lead on the board on any
+    # dashboard load — and backfill opens deals without drafting anything. So
+    # "already ingested" stopped implying "already answered", and gating on it
+    # alone left a recovered lead on the board that no path had ever drafted:
+    # the webhook skipped it because the board refused it, and the retry skipped
+    # it because the dedup row had outlived the failure. The response store
+    # answers this directly for a lead, and it is also the safer gate — a second
+    # click cannot double-draft something already drafted.
+    should_draft = not already_had_it or not inbound.already_answered(tenant_id, item, SITE)
+    if should_draft and os.getenv("ANTHROPIC_API_KEY"):
+        try:
+            runner.draft_ingested(tenant_id, SITE, item)
+        except Exception:
+            app.logger.exception("Could not draft recovered inbound item")
+
+    flash("Recovered — %s is on your board." % (item.get("title") or "the lead"))
+    return redirect(url_for("index"))
+
+
+@app.route("/inbound/rejected/<int:rid>/dismiss", methods=["POST"])
+@login_required
+def inbound_rejected_dismiss(rid):
+    """Take a message off the list. The row is kept as a record, not deleted."""
+    tenant_id = current_user.tenant_id
+    _reject_or_404(tenant_id, rid)
+    if inbound_rejects.dismiss(tenant_id, SITE, rid):
+        flash("Dismissed.")
+    else:
+        flash("That message was already handled.")
+    return redirect(url_for("inbound_rejected"))
 
 
 @app.route("/pilot", methods=["POST"])
@@ -564,6 +752,7 @@ def index():
         crypto_ready=crypto.available(),
         board=_board(tenant_id),
         state=_live_state(tenant_id),
+        rejected_count=inbound_rejects.count_open(tenant_id, SITE),
         has_api_key=bool(os.getenv("ANTHROPIC_API_KEY")),
         billing_label=billing.status_label(billing.get_subscription(tenant_id)),
     )
@@ -1254,6 +1443,10 @@ def _settings_context(tenant_id: str, settings: dict, units: list[dict] | None =
         "ingest_mode": config.ingest_mode(tenant_id),
         "inbound_address": inbound.address_for(tenant_id),
         "inbound_ready": inbound.configured(),
+        # Shown even when zero: "nothing was lost" is the answer the host
+        # actually wants, and they can only trust it if it's stated.
+        "rejected_open": inbound_rejects.count_open(tenant_id, SITE),
+        "rejected_total": inbound_rejects.count_all(tenant_id, SITE),
     }
 
 

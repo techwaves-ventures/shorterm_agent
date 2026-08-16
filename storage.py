@@ -158,6 +158,50 @@ def filter_new(tenant_id: str, site: str, kind: str, items: Iterable[dict]) -> l
     return new
 
 
+def already_seen(tenant_id: str, site: str, kind: str, item_id: str) -> bool:
+    """Whether this item has been ingested before — without recording it.
+
+    `filter_new` answers the same question but *records as it asks*, which makes
+    it useless to a caller that needs to know beforehand whether to act: asking
+    is indistinguishable from consuming. Recovery needs to tell "this message was
+    already applied" from "this message is new", and must not mark the second one
+    seen until the board write has actually happened.
+    """
+    if not item_id:
+        return False
+    with _conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM seen WHERE tenant_id=? AND site=? AND kind=? AND item_id=?",
+            (tenant_id, site, kind, str(item_id)),
+        ).fetchone()
+    return row is not None
+
+
+def forget(tenant_id: str, site: str, kind: str, item_id: str) -> bool:
+    """Drop an item's dedup row so it can be ingested again. True if one went.
+
+    The counterpart to `filter_new` recording *before* the work happens. That
+    ordering is deliberate — it is a single atomic claim, so two concurrent
+    deliveries of one item can't both proceed — but it means a caller whose
+    downstream write then fails has already promised the item was handled.
+    Leaving that row is the silent loss the inbound-rejects table exists to end:
+    nothing is on the board, and every later delivery short-circuits at the
+    dedup and never reaches the board either.
+
+    So a caller that records first must be able to take it back. `seen` then
+    carries an invariant worth relying on — an item marked seen actually landed
+    — which is what lets the retry path stop guessing from presence.
+    """
+    if not item_id:
+        return False
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM seen WHERE tenant_id=? AND site=? AND kind=? AND item_id=?",
+            (tenant_id, site, kind, str(item_id)),
+        )
+        return bool(cur.rowcount)
+
+
 def get_recent(tenant_id: str, site: str, kind: str, limit: int = 20) -> list[dict]:
     """Return the most recently seen items of a kind, newest first.
 

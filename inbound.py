@@ -231,7 +231,24 @@ def extract_date(payload: dict) -> str:
 
 
 class Rejected(Exception):
-    """Inbound message failed a check. The reason is for logs, never the caller."""
+    """Inbound message failed a check. The reason is for logs, never the caller.
+
+    `code` and `tenant_id` exist so the route can tell a *lost lead* from a
+    *probe*. Only a rejection that got past the provider secret AND resolved to
+    a real tenant is worth persisting; anything earlier is unauthenticated or
+    unattributable, and storing it would turn this public endpoint into a write
+    amplifier pointed at the operator's own screen.
+    """
+
+    def __init__(self, message, code: str = "other", tenant_id: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.tenant_id = tenant_id
+
+
+# Rejections worth showing an operator: past the provider secret, attributed to
+# a tenant, and representing a lead that was genuinely lost rather than refused.
+RECORDABLE_CODES = ("unparsed", "sender_not_allowed")
 
 
 def accept(payload: dict, webhook_secret: str, raw_size: int = 0) -> tuple[str, dict]:
@@ -240,27 +257,37 @@ def accept(payload: dict, webhook_secret: str, raw_size: int = 0) -> tuple[str, 
     Raises `Rejected` on any failure. The caller returns a flat 202 either way,
     so a probe learns nothing about which tenants or addresses exist.
     """
+    # Everything above `tenant_id` is pre-authentication: the caller could be
+    # anyone, so these carry no tenant and are never persisted.
     if not configured():
-        raise Rejected("inbound email is not configured")
+        raise Rejected("inbound email is not configured", code="not_configured")
     if raw_size and raw_size > MAX_PAYLOAD_BYTES:
-        raise Rejected("payload too large")
+        raise Rejected("payload too large", code="too_large")
     if not verify_webhook(webhook_secret):
-        raise Rejected("bad webhook secret")
+        raise Rejected("bad webhook secret", code="bad_secret")
 
     tenant_id = tenant_for_address(extract_recipient(payload))
     if not tenant_id:
-        raise Rejected("unrecognised recipient")
+        raise Rejected("unrecognised recipient", code="unknown_recipient")
 
     sender = extract_sender(payload)
     if not sender_allowed(sender):
-        raise Rejected(f"sender not allowed: {sender[:80]!r}")
+        raise Rejected(
+            f"sender not allowed: {sender[:80]!r}",
+            code="sender_not_allowed",
+            tenant_id=tenant_id,
+        )
 
     from sites import ff_email
 
     item = ff_email.parse(extract_subject(payload), extract_body(payload),
                           received_at=extract_date(payload))
     if not item:
-        raise Rejected("could not parse a lead from the message")
+        raise Rejected(
+            "could not parse a lead from the message",
+            code="unparsed",
+            tenant_id=tenant_id,
+        )
     return tenant_id, item
 
 
@@ -275,9 +302,26 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
     became a new deal: the owner saw the same person twice, the reply carried
     none of the original's booking facts, and the nurture sequence on the
     original kept chasing someone who had just written back.
+
+    The dedup row is recorded first — one atomic claim, so two concurrent
+    deliveries of the same message can't both go on to apply it — and it is
+    *kept* even when the board then refuses the item. That row is not only a
+    dedup marker: `storage.all_items` reads its payload and the dashboard runs
+    `pipeline.backfill` over that on every load and every board poll, opening a
+    deal for any stored item that has none. A transient board failure — a
+    locked SQLite file while the worker writes, say — therefore heals itself the
+    next time anyone looks at the board, and threading survives with it, because
+    `backfill` joins a reply to its parent exactly as this path does.
+
+    Releasing the claim instead is what would make the loss permanent. The
+    provider is answered 202 and never redelivers, so deleting the row leaves a
+    lead that parsed perfectly with no deal, no stored item and no route back
+    onto the board — and no `inbound_rejects` row either, since that table is
+    only reached from the `except Rejected` branch and this email did not fail
+    to parse. Whether the board took it is still `open_deal`'s to report and the
+    return value below says so honestly; what state to keep is a separate
+    question from what to tell the caller.
     """
-    import config
-    import pipeline
     import storage
 
     kind = item.get("kind", "lead")
@@ -285,16 +329,197 @@ def store(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
     if not new_items:
         return False
     try:
-        parent = None
-        if kind == "message":
-            parent = pipeline.find_thread(
-                tenant_id, site, pipeline.thread_key(item),
-                exclude_item_id=item.get("id"))
-        if parent:
-            pipeline.record_guest_reply(tenant_id, site, parent["item_id"])
-        else:
-            pipeline.ensure(tenant_id, site, item, None,
-                            units=config.get_units(tenant_id))
+        on_board = open_deal(tenant_id, item, site)
     except Exception:
         log.exception("Could not open a deal for ingested item %s", item.get("id"))
+        on_board = False
+    if not on_board:
+        # Report the failure, keep the payload. The stored item is what
+        # `pipeline.backfill` heals from on the next dashboard load or board
+        # poll; dropping the dedup row here would delete the only remaining
+        # route back onto the board, because the 202 already told the provider
+        # not to redeliver.
+        log.warning(
+            "Ingested item %s did not reach the board; kept its stored item so "
+            "the next dashboard load can backfill a deal for it", item.get("id"),
+        )
+        return False
     return True
+
+
+def already_answered(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
+    """Whether a reply has already been drafted for this item.
+
+    For a **lead** the response store answers directly: a lead owns its own
+    response row, so this distinguishes "on the board" from "on the board and
+    already answered" — which `backfill` made two different things, since it
+    opens deals and drafts nothing.
+
+    For a **message** this answers `True`, which is the conservative direction
+    and the one that preserves the existing rule. A threaded reply's draft is
+    stored against the *parent* deal, where that conversation's own introduction
+    already sits, so the store cannot tell "this reply was answered" from "this
+    conversation was ever answered". Answering False here would draft a reply on
+    every click of Try again — a second answer to a guest who wrote once, which
+    is a filed defect on this path. So a message keeps the older rule: it is
+    drafted when this attempt is the one that applied it, and not otherwise.
+    """
+    import storage
+
+    if item.get("kind", "lead") == "message":
+        return True
+    return bool(storage.get_responses(tenant_id, site).get(str(item.get("id", ""))))
+
+
+def _applied(tenant_id: str, item: dict, site: str) -> bool:
+    """Whether a *stored* item's effect is already on the board.
+
+    Only meaningful for an item `storage` has already seen. It answers "did the
+    ingest that recorded this actually finish?", which stopped being the same
+    question as "is it seen?" once `store` began keeping its row through a board
+    failure so `backfill` could heal it.
+
+    A **lead** owns a deal row, so the board answers directly.
+
+    A **message** is answered `True` by policy, not by evidence, and that is the
+    conservative direction on purpose. A threaded reply owns no deal of its own;
+    the only trace it leaves is the stamp on its parent, and that cannot be
+    attributed to *this* reply. Comparing the stored `first_seen` against the
+    parent's `last_guest_reply_at` — the comparison `backfill` uses — is sound
+    there only because `store` writes `first_seen` *before* attempting the board
+    write. `recover` inverts that order, so a reply recovered through here lands
+    its stamp before its row and would read as un-applied on the next click, at
+    second precision, sometimes. Re-applying a reply is not a harmless retry: it
+    cancels the deal's queued follow-up and drafts a second answer to a guest who
+    wrote once, which is a filed defect on this very path. So the ambiguous case
+    stands down and leaves recovery to `backfill`, whose own predicate is
+    evaluated against the ordering it is sound for.
+    """
+    import pipeline
+
+    if item.get("kind", "lead") == "message":
+        return True
+    return bool(pipeline.get(tenant_id, site, str(item.get("id", ""))))
+
+
+def _thread_parent(tenant_id: str, item: dict, site: str):
+    """The open deal this item continues, or None if it starts its own."""
+    import pipeline
+
+    if item.get("kind", "lead") != "message":
+        return None
+    return pipeline.find_thread(
+        tenant_id, site, pipeline.thread_key(item),
+        exclude_item_id=item.get("id"))
+
+
+def open_deal(tenant_id: str, item: dict, site: str = "furnishedfinder") -> bool:
+    """Put an already-deduped item on the board, threading a reply if it is one.
+
+    Split out of `store` so recovery can reach the board without going through
+    the dedup that `store` does first. Recovery cannot simply call
+    `pipeline.ensure`: half of what this does is the *threading*, and a reply
+    that skips it opens a second deal beside the conversation it answers — the
+    duplicate this branching exists to prevent.
+
+    Returns whether the board actually took the item. Reporting it is the point:
+    a threaded reply leaves no deal of its own, so a caller that tries to infer
+    this by looking at the board afterwards cannot tell a reply that landed from
+    one that never did, and telling the operator the wrong one of those is the
+    whole defect this path exists to avoid.
+    """
+    import config
+    import pipeline
+
+    parent = _thread_parent(tenant_id, item, site)
+    if parent:
+        return bool(pipeline.record_guest_reply(tenant_id, site, parent["item_id"]))
+    pipeline.ensure(tenant_id, site, item, None,
+                    units=config.get_units(tenant_id))
+    # Read it back rather than trusting that `ensure` returned: it is the one
+    # case where presence is proof, because a deal under this item's own id can
+    # only have been opened for this item.
+    return bool(pipeline.get(tenant_id, site, item.get("id", "")))
+
+
+def recover(tenant_id: str, item: dict, site: str = "furnishedfinder") -> tuple[bool, bool]:
+    """Put a recovered item on the board. Returns `(already_had_it, on_board)`.
+
+    Deliberately not `store()`. That records the dedup row *before* the board
+    write and swallows the failure while still reporting success, which cost this
+    feature two separate defects: a failed recovery both told the operator the
+    lead was safe and poisoned every later retry, because the next attempt
+    short-circuited at the dedup and never reached the board again.
+
+    Here the order is inverted — the board write happens first and records itself,
+    and the item is marked seen only once it has actually landed. A failed attempt
+    therefore leaves nothing behind and can simply be retried.
+
+    `already_had_it` separates "this message was ingested earlier" from "this
+    attempt ingested it". Re-applying the first is not harmless: `record_guest_reply`
+    cancels the deal's queued follow-up and re-opens the drafting path, so a second
+    click would cancel a scheduled nurture step and queue a *second* reply to a
+    guest who only ever wrote once.
+
+    The cost of that inversion is a race, and it is accepted rather than
+    unnoticed. `store`'s single `filter_new` is one atomic claim; reading first
+    and writing after leaves a window in which a retry and the identical webhook
+    delivery both find the item unseen and both apply it. Two *retries* cannot
+    collide — the route's `mark_recovered` is a conditional UPDATE and the loser
+    stops before reaching here — so it needs a retry racing an ingest of the same
+    message within the board write. Review measured 0 occurrences in 40
+    barrier-synchronised trials; only an injected delay reproduces it.
+
+    Closing it means claiming before the write, which is precisely the ordering
+    that produced the two defects above: a failed claim-first attempt leaves the
+    message unreachable forever, because every later delivery short-circuits at
+    the dedup. That is a permanent silent loss on a common path traded against a
+    duplicated reply on a rare one, so the window stays.
+    """
+    import storage
+
+    kind = item.get("kind", "lead")
+    if storage.already_seen(tenant_id, site, kind, item.get("id", "")):
+        # `seen` does not mean "landed": `store` keeps its dedup row even when
+        # the board refuses the item, so that the stored payload survives for
+        # `pipeline.backfill` to heal from. Reporting on_board from the flag
+        # alone would therefore be a guess, and a wrong one in exactly the case
+        # the operator is clicking Try again for — nothing landed, and this
+        # would clear the row off their list saying it had.
+        if _applied(tenant_id, item, site):
+            # Applied by an earlier delivery, so do not apply it a second time:
+            # re-running a reply cancels the deal's queued follow-up and drafts
+            # a second answer for a guest who only ever wrote once.
+            return (True, True)
+        # Stored, never applied. This attempt is the one that lands it, and it
+        # says so: a lead recovered through here has had no draft queued by any
+        # path (the webhook skipped it too, for the same failure), so reporting
+        # "you already had this" would quietly cost it its answer.
+        try:
+            return (False, open_deal(tenant_id, item, site))
+        except Exception:
+            log.exception("Could not open a deal for stored item %s", item.get("id"))
+            return (False, False)
+
+    try:
+        on_board = open_deal(tenant_id, item, site)
+    except Exception:
+        log.exception("Could not open a deal for recovered item %s", item.get("id"))
+        return (False, False)
+
+    if on_board:
+        try:
+            storage.filter_new(tenant_id, site, kind, [item])
+        except Exception:
+            # The lead is on the board. Failing to write the dedup row afterwards
+            # is a bookkeeping loss, not a lead loss, and reporting it as failure
+            # would hand back a row that is actually resolved, tell the operator
+            # the lead was lost, and invite the click that applies the guest's
+            # reply a second time — cancelling a queued follow-up and drafting
+            # again for someone who wrote once. The cost of the other choice is
+            # only that a later re-delivery of this item may be ingested twice.
+            log.exception(
+                "Recovered item %s reached the board but its dedup row could "
+                "not be written; reporting success", item.get("id"),
+            )
+    return (False, on_board)
