@@ -265,7 +265,7 @@ def _board(tenant_id: str) -> dict:
         m["item_id"]: m
         for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
     }
-    send_states = outbox.latest_by_item(tenant_id, SITE)
+    send_rows = outbox.rows_by_item(tenant_id, SITE)
     # Self-heal on view: requeue sends stranded by a crashed process, and make
     # sure something is draining if messages are waiting (e.g. after a restart).
     #
@@ -289,7 +289,10 @@ def _board(tenant_id: str) -> dict:
             "item": item,
             "response": responses.get(deal["item_id"]),
             "pending": pending.get(deal["item_id"]),
-            "send": send_states.get(deal["item_id"]),
+            # The derived state, not the raw row: the template gates the
+            # in-flight display and the disabled button on `send.in_flight`,
+            # which is not a column.
+            "send": outbox.send_state(send_rows.get(deal["item_id"])),
             "age": pipeline.humanize_age(deal.get("inquiry_at")),
             "age_hours": pipeline.age_hours(deal.get("inquiry_at")),
             "stage_label": pipeline.STAGE_LABELS.get(deal.get("stage"), deal.get("stage")),
@@ -887,10 +890,9 @@ def _sent_state(tenant_id: str, item_id: str, response: dict | None) -> str:
     an enabled Approve & send button over the text that had just gone out:
     a reply that has been delivered, and one that is queued or mid-flight.
     """
-    msgs = [m for m in outbox.for_tenant(tenant_id, SITE, outbox.IN_FLIGHT)
-            if m["item_id"] == item_id]
-    if msgs:
-        return outbox.STATUS_LABELS.get(msgs[0]["status"], "Sending…")
+    state = outbox.send_state(outbox.rows_by_item(tenant_id, SITE).get(item_id))
+    if state and state["in_flight"]:
+        return state["label"]
     if (response or {}).get("status") == "sent":
         at = (response or {}).get("sent_at") or ""
         return f"Sent{' ' + str(at) if at else ''}."
@@ -1062,6 +1064,20 @@ def outbox_approve(msg_id):
         return jsonify({
             "ok": False, "already": True,
             "error": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
+        }), 409
+    # This row may be approvable while a *different* row for the same guest is
+    # already going out — two rows per item is ordinary, not exotic. The check
+    # above only inspects the row being approved, so approving the sibling
+    # released a second message to a thread mid-delivery and answered 200. The
+    # /responder/send guard does not cover this route.
+    others = [
+        m for m in outbox.rows_by_item(tenant_id, SITE).get(msg["item_id"], [])
+        if m["id"] != msg_id and m["status"] in outbox.IN_FLIGHT
+    ]
+    if others:
+        return jsonify({
+            "ok": False, "already": True,
+            "error": outbox.STATUS_LABELS.get(others[0]["status"], others[0]["status"]),
         }), 409
     (text,) = _form("text")
     outbox.approve(msg_id, (text or "").strip() or None)
@@ -1275,14 +1291,16 @@ def api_send_states():
     """Per-item delivery state, polled by the cards after a send is queued."""
     tenant_id = current_user.tenant_id
     states = {}
-    for item_id, msg in outbox.latest_by_item(tenant_id, SITE).items():
-        states[item_id] = {
-            "status": msg["status"],
-            "label": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
-            "error": msg.get("error"),
-            "step": msg.get("step_label"),
-            "in_flight": msg["status"] in outbox.IN_FLIGHT,
-        }
+    # Same rule as the server-rendered card and `_sent_state`. Keyed off the
+    # newest row this used to disagree with both: it reported an item idle
+    # while an older row of its own was still in flight, and the page cannot
+    # recover from that — it re-enables the button on what the poll tells it.
+    for item_id, rows in outbox.rows_by_item(tenant_id, SITE).items():
+        state = outbox.send_state(rows)
+        if state:
+            states[item_id] = {
+                k: state[k] for k in ("status", "label", "error", "step", "in_flight")
+            }
     return jsonify(states)
 
 
