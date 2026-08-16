@@ -518,7 +518,7 @@
         const text = ta ? ta.value.trim() : "";
         if (!text) { setMsg(id, "Draft is empty.", "err"); return; }
         const btn = document.getElementById("send-" + id);
-        setBusy(btn, true, "Queued…");
+        setBusy(btn, true, "Queued to send…");
         setMsg(id, "Queued — sending in the background. You can carry on.", "");
         try {
           const res = await postForm("/responder/send", { item_id: id, text });
@@ -548,7 +548,11 @@
         // this guest is still going out, and both of those branches re-enable
         // the button, i.e. offer a second send over a live one.
         if (s.in_flight) {
-          const label = s.status === "sending" ? "Sending…" : "Queued…";
+          // The server's own label for the status, not a second copy of the
+          // wording: the card rendered "Queued to send…" and this rendered
+          // "Queued…" for one state, so the button changed its mind about what
+          // was happening the moment the first poll landed.
+          const label = s.label;
           setBusy(btn, true, label);
           siblings.forEach(b => setBusy(b, true, label));
           setMsg(id, s.label, "");
@@ -581,6 +585,13 @@
       let idleTicks = 0;
 
       async function trackSends() {
+        // A caller asking to track sends has just started one, so the next tick
+        // must not be skipped. The poll is armed for the life of the page and
+        // never cleared, so this returns early on every call after the first —
+        // and left `idleTicks` at 4, meaning a click made during an idle
+        // stretch showed no state change for up to 15s. Resetting the skip
+        // counter is what the old `clearInterval`-then-rearm did implicitly.
+        idleTicks = 0;
         if (sendPoll) return;
         const tick = async () => {
           if (idleTicks > 0) { idleTicks -= 1; return; }

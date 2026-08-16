@@ -266,6 +266,22 @@ def insert_returning_id(conn: Conn, sql: str, params, id_col: str = "id"):
     return conn.execute(sql, params).lastrowid
 
 
+def insert_returning_id_maybe(conn: Conn, sql: str, params, id_col: str = "id"):
+    """Same, for an INSERT that is allowed to insert nothing. None if it didn't.
+
+    `insert_returning_id` assumes a row was written — on Postgres it subscripts
+    `fetchone()`, and on SQLite `lastrowid` keeps whatever the previous insert
+    on that cursor set. Neither is safe for `INSERT ... SELECT ... WHERE NOT
+    EXISTS`, the shape used to make "write this row only if nothing conflicts"
+    a single statement instead of a read followed by a write.
+    """
+    if conn.pg:
+        row = conn.execute(f"{sql} RETURNING {id_col}", params).fetchone()
+        return row[0] if row else None
+    cur = conn.execute(sql, params)
+    return cur.lastrowid if cur.rowcount else None
+
+
 def sync_serial(conn: Conn, table: str, col: str = "id") -> None:
     """Advance Postgres' identity sequence past the current MAX(id).
 

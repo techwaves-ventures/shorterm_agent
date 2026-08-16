@@ -1050,6 +1050,27 @@ def _own_message_or_404(tenant_id: str, msg_id: int) -> dict:
     return msg
 
 
+def _release_refusal(tenant_id: str, msg: dict | None, msg_id: int,
+                     from_statuses: tuple) -> str:
+    """Word a refusal `outbox.release_to_send` has already decided.
+
+    Read *after* the write refused, never before it: this is the explanation,
+    not the guard. Deciding from a read like this one is exactly the race the
+    CAS closes, and a second copy of the rule here would drift from it.
+    """
+    if not msg:
+        return "That message is no longer there."
+    if msg["status"] not in from_statuses:
+        return outbox.STATUS_LABELS.get(msg["status"], msg["status"])
+    blocker = outbox.in_flight_for_item(tenant_id, SITE, msg["item_id"],
+                                        exclude_id=msg_id)
+    if blocker:
+        return outbox.STATUS_LABELS.get(blocker["status"], blocker["status"])
+    # Refused, yet nothing explains it any more — the blocking row settled
+    # between the UPDATE and this read. Don't invent a reason; say what is true.
+    return "Another send for this guest was already under way."
+
+
 @app.route("/outbox/<int:msg_id>/approve", methods=["POST"])
 @login_required
 def outbox_approve(msg_id):
@@ -1060,27 +1081,21 @@ def outbox_approve(msg_id):
     # actually posts to — this is the primary approval surface, and it had none.
     # A sent message re-approved here went back on the queue and was delivered a
     # second time.
-    if msg["status"] not in outbox.APPROVABLE:
-        return jsonify({
-            "ok": False, "already": True,
-            "error": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
-        }), 409
-    # This row may be approvable while a *different* row for the same guest is
-    # already going out — two rows per item is ordinary, not exotic. The check
-    # above only inspects the row being approved, so approving the sibling
-    # released a second message to a thread mid-delivery and answered 200. The
-    # /responder/send guard does not cover this route.
-    others = [
-        m for m in outbox.rows_by_item(tenant_id, SITE).get(msg["item_id"], [])
-        if m["id"] != msg_id and m["status"] in outbox.IN_FLIGHT
-    ]
-    if others:
-        return jsonify({
-            "ok": False, "already": True,
-            "error": outbox.STATUS_LABELS.get(others[0]["status"], others[0]["status"]),
-        }), 409
     (text,) = _form("text")
-    outbox.approve(msg_id, (text or "").strip() or None)
+    # One statement decides and writes. Both refusals this answers 409 for used
+    # to be reads taken before the write: the row's own status (a sent row
+    # re-approved goes back on the queue and is delivered twice), and a
+    # *different* row of the same guest already going out (two rows per item is
+    # ordinary, not exotic — releasing the quiet one puts a second message into
+    # a thread mid-delivery). Read-then-write let two concurrent approves both
+    # answer 200 with two rows in flight; the guards are now WHERE terms on the
+    # UPDATE, so exactly one call can win. See `outbox.release_to_send`.
+    released, msg = outbox.release_to_send(
+        msg_id, from_statuses=outbox.APPROVABLE, body=(text or "").strip() or None)
+    if not released:
+        return jsonify({"ok": False, "already": True,
+                        "error": _release_refusal(
+                            tenant_id, msg, msg_id, outbox.APPROVABLE)}), 409
     automation.start_drainer(SITE)  # deliver in the background; don't block the click
     return jsonify({"ok": True, "counts": outbox.counts(tenant_id, SITE)})
 
@@ -1277,6 +1292,16 @@ def responder_send():
     if blocked:
         return jsonify({"ok": False, "already": True, "error": blocked}), 409
     msg = automation.enqueue_send(tenant_id, SITE, item_id, text.strip())
+    if msg is None:
+        # The guard above is a read, so it cannot see a send that started
+        # between it and the insert — two clicks both passed it and both queued.
+        # `enqueue_send` now refuses at the write, and this is that refusal:
+        # same 409 as the pre-read, because to the operator it is the same fact.
+        blocker = outbox.in_flight_for_item(tenant_id, SITE, item_id)
+        return jsonify({"ok": False, "already": True, "error": (
+            outbox.STATUS_LABELS.get(blocker["status"], blocker["status"])
+            if blocker else "Another send for this guest was already under way."
+        )}), 409
     return jsonify({
         "ok": True,
         "queued": True,
@@ -1312,7 +1337,17 @@ def outbox_retry(msg_id):
     msg = _own_message_or_404(tenant_id, msg_id)
     if msg["status"] != outbox.FAILED:
         return jsonify({"ok": False, "error": "only failed messages can be retried"}), 400
-    outbox.set_status(msg_id, outbox.QUEUED, error="")
+    # Retrying is releasing a message to a guest, so it takes the same guard as
+    # the approve buttons. It had none: a failed row was re-queued while a
+    # *sibling* row for the same guest was still `sending`, answering 200 with
+    # two messages in flight. The per-route guard next door did not reach here —
+    # which is why the check now lives on the write itself.
+    released, msg = outbox.release_to_send(
+        msg_id, from_statuses=(outbox.FAILED,), error="")
+    if not released:
+        return jsonify({"ok": False, "already": True,
+                        "error": _release_refusal(
+                            tenant_id, msg, msg_id, (outbox.FAILED,))}), 409
     automation.start_drainer(SITE)
     return jsonify({"ok": True})
 

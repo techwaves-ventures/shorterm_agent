@@ -425,7 +425,15 @@ def enqueue_send(tenant_id: str, site: str, item_id: str, body: str,
         step_id=step_id, step_label=step_label, body=body,
         auto=True,  # the human just approved it by clicking send
         reason="Approved by you",
+        # Returns None rather than stacking a second message onto a delivery
+        # already under way. The caller's own "is anything in flight?" read
+        # cannot carry that weight: two clicks both read "nothing" before either
+        # inserted, and both inserted. Same rule as `outbox.release_to_send`,
+        # insert-shaped instead of update-shaped.
+        unless_in_flight=True,
     )
+    if msg is None:
+        return None
     start_drainer(site)
     return msg
 

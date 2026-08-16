@@ -22,7 +22,13 @@ Hence the positive control in `_assert_card_rendered`: assert the card *is*
 there before asserting anything about it, or an empty page proves whatever you
 like.
 
-Every test here fails on `6f62a57` for the filed reason.
+Not every test here fails without the fix, and the earlier claim that they all
+did was measured false: run against a bare `6f62a57`, 15 fail and 7 pass. Five
+of the seven are deliberate settled-state controls and are supposed to pass on
+both trees. The other two were vacuous and are fixed in place — see
+`test_sent_state_agrees_too` and `test_the_board_issues_no_more_queries_than_before`.
+State the number, not the adjective: "every test fails on base" is exactly the
+kind of claim that persuades the next reviewer to skip checking.
 """
 import os
 import re
@@ -274,6 +280,58 @@ def test_the_client_tests_in_flight_before_status(client, tenant):
     )
 
 
+def test_the_two_surfaces_do_not_disagree_about_the_wording(client, tenant):
+    """The server card and the poll are meant to be one rule, and printed two
+    different strings for one state: the card said "Queued to send…" and the
+    first poll rewrote the same button to "Queued…". The label is the server's,
+    so there is one place it can be changed.
+    """
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.QUEUED)
+
+    html = _dashboard_html(client)
+    # Comments stripped: the first version of this test matched the comment that
+    # *explains* the old wording and failed on a correct page.
+    code = re.sub(r"//[^\n]*", "", "\n".join(SCRIPT_RE.findall(html)))
+
+    assert outbox.STATUS_LABELS[outbox.QUEUED] in _server_html(html)
+    assert '"Queued…"' not in code, (
+        "the poll carries its own copy of the wording, which drifted from the "
+        "server's the moment either changed"
+    )
+    assert "s.label" in code, "the poll no longer renders the server's label"
+    assert client.get("/api/send-states").get_json()["s1"]["label"] == (
+        outbox.STATUS_LABELS[outbox.QUEUED])
+
+
+def test_starting_a_send_does_not_wait_out_the_idle_backoff(client, tenant):
+    """`trackSends()` returns early once the poll is armed — and it is armed for
+    the life of the page and never cleared. It left `idleTicks` at 4, so a send
+    started during an idle stretch showed nothing for up to 15s: the tick that
+    would have rendered it was skipped four times first.
+
+    Structural, like the branch-order tripwire: the reset must happen *before*
+    the early return, or arming order decides whether it runs.
+    """
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.QUEUED)
+    scripts = "\n".join(SCRIPT_RE.findall(_dashboard_html(client)))
+
+    body = re.search(r"async function trackSends\(\) \{(.*?)\n      \}",
+                     scripts, re.S)
+    assert body, "trackSends is not in the rendered page"
+    body = body.group(1)
+
+    at_reset = body.find("idleTicks = 0")
+    at_return = body.find("if (sendPoll) return;")
+    assert at_reset != -1, "trackSends never resets the idle-skip counter"
+    assert at_return != -1, "the early return this test guards is gone"
+    assert at_reset < at_return, (
+        "idleTicks is reset after the early return, so every call but the first "
+        "leaves the backoff in place and the send goes unrendered for ~15s"
+    )
+
+
 # --------------------------------------------------------------------------
 # 4: the divergence — what separates the correct fix from the cheap one
 # --------------------------------------------------------------------------
@@ -320,8 +378,17 @@ def test_the_api_agrees_with_the_card_on_the_divergence(client, tenant):
 
 
 def test_sent_state_agrees_too(client, tenant):
-    """AC6 for the third caller — the guard /responder/send and the thread page
-    both read `_sent_state`."""
+    """AC6 for the third caller — /responder/send and the thread page both read
+    `_sent_state`.
+
+    Billed as proof of this change, this was vacuous: base `_sent_state` already
+    filtered `for_tenant(..., IN_FLIGHT)` by item, so it already had any-in-flight
+    semantics and passed on `6f62a57` unchanged. Kept as a regression guard on
+    the agreement, and given the case that does discriminate — an item holding
+    both a `queued` and a `sending` row must be described by the `sending` one.
+    Taking the first in-flight row by id said "Queued to send…" over a message a
+    browser was already delivering, which reads as "there is still time".
+    """
     import dashboard
 
     _deal(tenant, "s1")
@@ -333,6 +400,22 @@ def test_sent_state_agrees_too(client, tenant):
     assert blocked == "Sending…", (
         f"_sent_state offered the send button over an in-flight row: {blocked!r}"
     )
+
+    # The discriminating case: older row `queued`, newer row `sending`.
+    _deal(tenant, "s2")
+    _row(tenant, "s2", outbox.QUEUED, body="first")
+    _row(tenant, "s2", outbox.SENDING, body="second")
+
+    assert dashboard._sent_state(tenant, "s2", None) == "Sending…", (
+        "an item with a live browser send was described by its merely-queued row"
+    )
+    grouped = outbox.rows_by_item(tenant, SITE)["s2"]
+    assert [m["status"] for m in grouped] == [outbox.QUEUED, outbox.SENDING], (
+        "precondition: the seed did not produce queued-then-sending in id order, "
+        "so 'first in-flight row by id' and 'the sending one' would not differ"
+    )
+    assert outbox.send_state(grouped)["status"] == outbox.SENDING
+    assert client.get("/api/send-states").get_json()["s2"]["label"] == "Sending…"
 
 
 # --------------------------------------------------------------------------
@@ -390,6 +473,170 @@ def test_approve_still_works_when_nothing_is_in_flight(client, tenant):
 
 
 # --------------------------------------------------------------------------
+# 6: every remaining way to put a second message in front of one guest
+#
+# The guard was added per route, and per-route missed a route three times on
+# this ticket: the send button, then the second approve button, then
+# `/outbox/<id>/retry`. So these test the *choke point* — for each surface that
+# can move a row into `IN_FLIGHT`, and for the interleaving as well as the
+# sequence, because a check-then-act guard passes every sequential test.
+# --------------------------------------------------------------------------
+
+def _in_flight_count(tenant_id, item_id):
+    return sum(status in outbox.IN_FLIGHT
+               for _id, status in _rows_for(tenant_id, item_id))
+
+
+def test_retrying_beside_an_in_flight_sibling_is_refused(client, tenant):
+    """`/outbox/<id>/retry` re-queued a failed row while a sibling of the same
+    item was still `sending`, and answered 200 — two messages in flight to one
+    guest. It carried no sibling guard at all; the approve route's guard did not
+    reach it, which is the argument for guarding the write instead of the route.
+    """
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING, body="first")
+    failed = _row(tenant, "s1", outbox.FAILED, body="second")
+
+    resp = client.post(f"/outbox/{failed}/retry")
+
+    assert resp.status_code == 409, (
+        f"retry released a second message while one was in flight: "
+        f"{resp.status_code} {resp.get_data(as_text=True)[:200]}"
+    )
+    assert resp.get_json()["error"] == "Sending…", resp.get_json()
+    assert outbox.get(failed)["status"] == outbox.FAILED
+    assert _in_flight_count(tenant, "s1") == 1
+
+
+def test_retry_still_works_when_nothing_is_in_flight(client, tenant):
+    """The control for the test above — refusing every retry is also green."""
+    _deal(tenant, "s1")
+    failed = _row(tenant, "s1", outbox.FAILED, body="only")
+
+    resp = client.post(f"/outbox/{failed}/retry")
+    assert resp.status_code == 200, resp.get_data(as_text=True)[:200]
+    assert outbox.get(failed)["status"] == outbox.QUEUED
+
+
+def test_two_approvals_racing_cannot_both_win(client, tenant):
+    """The guard was a read taken before the write, so two requests that both
+    read "nothing in flight" both released. Driven at the layer the route calls,
+    with both reads forced to complete before either write.
+
+    Measured on the read-then-write shape this replaces: two concurrent approves
+    both returned 200 and left two rows `queued`.
+    """
+    _deal(tenant, "s1")
+    a = _row(tenant, "s1", outbox.PENDING, body="first")
+    b = _row(tenant, "s1", outbox.PENDING, body="second")
+
+    import threading
+    barrier = threading.Barrier(2)
+    won = {}
+
+    def approve(msg_id):
+        barrier.wait()
+        for _ in range(200):      # SQLite serializes writers; retry the lock
+            try:
+                won[msg_id] = outbox.release_to_send(
+                    msg_id, from_statuses=outbox.APPROVABLE)[0]
+                return
+            except Exception as exc:            # pragma: no cover - lock only
+                if "locked" not in str(exc).lower():
+                    raise
+        won[msg_id] = "never got the lock"
+
+    threads = [threading.Thread(target=approve, args=(m,)) for m in (a, b)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(won.values(), key=str) == [False, True], (
+        f"both concurrent approvals were told they had released a message: {won}"
+    )
+    assert _in_flight_count(tenant, "s1") == 1, (
+        f"two messages in flight for one guest: {_rows_for(tenant, 's1')}"
+    )
+
+
+def test_the_send_button_cannot_queue_two_by_racing_itself(client, tenant):
+    """`/responder/send` reads `_sent_state` and then *inserts*. Two clicks that
+    both read before either inserted both queued a message: measured 137 of 150
+    concurrent pairs put two messages in front of one guest, and the button
+    being disabled client-side is not a guard against a stale tab or a replay.
+
+    The insert now carries the same condition, so this is the insert-shaped half
+    of the same rule `release_to_send` applies to updates.
+    """
+    import automation
+
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING, body="already going out")
+
+    assert automation.enqueue_send(tenant, SITE, "s1", "second") is None, (
+        "a second message was queued while one was already in flight"
+    )
+    assert _in_flight_count(tenant, "s1") == 1
+
+    resp = client.post("/responder/send", data={"item_id": "s1", "text": "second"})
+    assert resp.status_code == 409, resp.get_data(as_text=True)[:200]
+    assert _in_flight_count(tenant, "s1") == 1
+
+
+def test_the_send_button_still_queues_when_the_thread_is_idle(client, tenant):
+    """Control: the guard must not refuse the ordinary first send."""
+    import automation
+
+    _deal(tenant, "s1")
+    msg = automation.enqueue_send(tenant, SITE, "s1", "hello")
+    assert msg is not None and msg["status"] == outbox.QUEUED
+    assert _in_flight_count(tenant, "s1") == 1
+
+
+def test_the_guard_lives_on_the_write_not_on_the_route(client, tenant):
+    """The reason the three tests above can be trusted not to rot.
+
+    Each of those drives one route. This asserts the property that makes a
+    *fourth* route safe by construction: `set_status` refuses to move a row into
+    `queued` beside an in-flight sibling, so a new caller cannot reach the write
+    without the check. A route-level guard would leave this passing while the
+    next route is added unguarded.
+    """
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING, body="first")
+    pending = _row(tenant, "s1", outbox.PENDING, body="second")
+
+    assert outbox.set_status(pending, outbox.QUEUED,
+                             unless_sibling_in_flight=True) is False
+    assert outbox.get(pending)["status"] == outbox.PENDING
+
+    # ...and `only_from` is the other half: a settled row cannot be re-released
+    # even with nothing in flight beside it.
+    _deal(tenant, "s2")
+    sent = _row(tenant, "s2", outbox.SENT, body="already read")
+    assert outbox.set_status(sent, outbox.QUEUED,
+                             only_from=outbox.APPROVABLE) is False
+    assert outbox.get(sent)["status"] == outbox.SENT
+
+    # Both guards off is still the old unconditional write, so callers that pass
+    # neither are unaffected.
+    assert outbox.set_status(sent, outbox.CANCELED) is True
+
+
+def test_a_row_is_not_its_own_blocker(client, tenant):
+    """`NOT EXISTS (... id<>outbox.id ...)`: a row already `queued` must still be
+    writable, or the drainer's own `queued`->`sending` claim would deadlock and
+    nothing would ever be delivered."""
+    _deal(tenant, "s1")
+    queued = _row(tenant, "s1", outbox.QUEUED, body="only")
+
+    assert outbox.set_status(queued, outbox.SENDING,
+                             unless_sibling_in_flight=True) is True
+    assert outbox.get(queued)["status"] == outbox.SENDING
+
+
+# --------------------------------------------------------------------------
 # 7: the states that must not change
 # --------------------------------------------------------------------------
 
@@ -424,7 +671,8 @@ def test_a_card_with_no_outbox_row_is_untouched(client, tenant):
 
 def test_send_state_is_pure_and_falls_back_to_the_newest_row():
     """Single-row items — the common case — must read exactly as
-    `latest_by_item` made them read."""
+    reading the newest row alone made them read (`latest_by_item`, since
+    removed as the last caller went away)."""
     assert outbox.send_state(None) is None
     assert outbox.send_state([]) is None
 
@@ -442,29 +690,48 @@ def test_send_state_is_pure_and_falls_back_to_the_newest_row():
 
 
 def test_the_board_issues_no_more_queries_than_before(client, tenant, monkeypatch):
-    """AC8: `latest_by_item` already selected every row for the tenant and
-    collapsed in Python, so grouping is free — but only if the grouped call
-    *replaces* it. Adding it alongside costs a connection per board render,
-    because `_conn()` runs CREATE TABLE IF NOT EXISTS + PRAGMA on every open.
+    """AC8: `rows_by_item` reads every row for the tenant once and groups them in
+    Python, so a card may ask it anything without paying per card.
+
+    This asserted `<= 12` against a measured 6 — 2x slack, which made it vacuous
+    for the regression its own docstring named: adding a second whole-table read
+    alongside the grouped one still passed. Two assertions now, because there are
+    two distinct regressions and a single number catches only one:
+
+    * **constant** in the number of items — a read moved inside `card()` is an
+      N+1, and it is the one that gets worse in production, not in this test;
+    * a **tight** absolute bound, so a second full read added alongside the
+      grouped one has to be a deliberate change to this number rather than
+      slack someone else already paid for.
     """
     import dashboard
 
-    for i in range(5):
-        _deal(tenant, f"q{i}", guest=f"Guest {i}")
-        _row(tenant, f"q{i}", outbox.SENDING)
+    def board_conn_count(n_items, first_item):
+        for i in range(n_items):
+            item = f"{first_item}{i}"
+            _deal(tenant, item, guest=f"Guest {i}")
+            _row(tenant, item, outbox.SENDING)
+        calls = {"n": 0}
+        real_conn = outbox._conn
 
-    calls = {"n": 0}
-    real_conn = outbox._conn
+        def counting_conn(*a, **k):
+            calls["n"] += 1
+            return real_conn(*a, **k)
 
-    def counting_conn(*a, **k):
-        calls["n"] += 1
-        return real_conn(*a, **k)
+        monkeypatch.setattr(outbox, "_conn", counting_conn)
+        dashboard._board(tenant)
+        monkeypatch.setattr(outbox, "_conn", real_conn)
+        return calls["n"]
 
-    monkeypatch.setattr(outbox, "_conn", counting_conn)
-    dashboard._board(tenant)
-    grouped = calls["n"]
+    few = board_conn_count(5, "q")
+    many = board_conn_count(15, "r")   # 20 items on the board by now
 
-    assert grouped <= 12, (
-        f"_board opened {grouped} outbox connections; the per-card N+1 this "
-        f"design exists to avoid would scale with the 5 seeded items"
+    assert few == many, (
+        f"_board opened {few} outbox connections for 5 items and {many} for 20 — "
+        f"it scales with the board, which is the per-card N+1 this design avoids"
+    )
+    assert few <= 6, (
+        f"_board opened {few} outbox connections; 6 is the measured cost of the "
+        f"grouped read. A higher number means a whole-table read was added "
+        f"alongside it rather than replacing it — raise this deliberately."
     )
