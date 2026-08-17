@@ -49,11 +49,13 @@ _FAILURES = []
 def check(cond, msg):
     """Print like the rest of the suite, but actually fail.
 
-    Deliberately *not* the sibling files' `check()`, which only appends to a
-    module-level list. That variant reports correctly when the file is run
-    directly, but under `pytest` the collected `test_*` function returns
-    normally and the failure is swallowed -- a test that cannot fail. This one
-    raises, so it works both ways.
+    Deliberately *not* the record-only `check()` this suite used to carry, which
+    appended to a module-level list. That variant reported correctly when the
+    file was run directly, but under `pytest` the collected `test_*` function
+    returned normally and the failure was swallowed -- a test that cannot fail.
+    This one raises, so it works both ways. `test_ff_connect_flow.check()` was
+    the last record-only holdout and now raises as well (VEN-166); keep any new
+    `check()` helper raising.
     """
     if cond:
         print("  ok  %s" % msg)
@@ -372,12 +374,15 @@ def test_aware_expiry_path_is_exercised():
 def test_expire_worker_helper_writes_an_aware_stamp():
     """`test_ff_connect_flow._expire_worker()` must stamp aware, and this must fail if it stops.
 
-    That helper lives in a file whose own `check()` only appends to a list, so
-    under pytest its assertions cannot fail (see this module's `check`). The
-    helper could therefore silently revert to a naive stamp -- routing every
-    reap/offline test in that file down the legacy compatibility branch and
-    leaving the shipped aware path uncovered -- with the suite fully green.
-    Asserting it from here, where `check()` raises, is what makes it a real pin.
+    A naive stamp there would still expire the worker, so that file's own
+    reap/offline assertions stay green either way -- they would just silently
+    run down `worker_online()`'s legacy naive-compatibility branch, leaving the
+    shipped aware path uncovered. No assertion inside that file can catch this,
+    which is why the stamp is pinned from here by reading the source.
+
+    (Before VEN-166 that file's `check()` only appended to a list, so none of
+    its assertions could fail under pytest at all. It raises now, but this pin
+    is still required for the path-coverage reason above.)
     """
     src = (Path(REPO) / "tests" / "test_ff_connect_flow.py").read_text()
     body = src.split("def _expire_worker(")[1].split("\ndef ")[0]
