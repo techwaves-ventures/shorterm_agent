@@ -31,6 +31,12 @@ CANCELED = "canceled"
 
 OPEN_STATUSES = (PENDING, QUEUED, SENDING, FAILED)
 # States the UI reports back on a card after the user hits send.
+#
+# A *status set*. It happens to hold the same two statuses `_in_flight_terms`
+# tests, but go through that helper rather than this tuple when the question is
+# "may a second message be released" — the guard also excludes the row itself
+# (`sib.id<>outbox.id`), and one round of this ticket got the predicate wrong in
+# a way that reached the guest. This stays for counting rows by status.
 IN_FLIGHT = (QUEUED, SENDING)
 # The only states a message may be *released to send* from: still waiting for a
 # human, or a failure the human is retrying. Anything else has already reached
@@ -171,30 +177,189 @@ def _row(row) -> dict | None:
     return dict(zip(_COLS, row)) if row else None
 
 
+def _item_key(tenant_id, site, item_id) -> str:
+    """The scope every release guard serializes on: one guest's thread."""
+    return f"outbox:{tenant_id}:{site}:{item_id}"
+
+
+def _in_flight_terms(alias: str) -> tuple[str, list]:
+    """SQL for "this item already has a message the guest will receive".
+
+    One definition, every caller. The question this answers is *not* "is
+    something going out this instant" — it is "will this guest be written to",
+    which is what deciding to release a second message actually depends on.
+
+    A round of this ticket narrowed the test to `scheduled_at<=now`, reasoning
+    that a row the drainer will not touch for eight hours is not in flight and
+    should not refuse the operator. That reasoning is wrong in the only way that
+    matters: a deferred row is not *cancelled*, it is *scheduled*. Releasing a
+    second message beside it does not avoid a collision, it guarantees one —
+    both rows come due and both are delivered. Measured through the real routes,
+    it put two messages in front of one guest where the broad test put one, and
+    on the `/responder/send` path the two bodies were byte-identical, because
+    `runner.py` hands the same draft string to `enqueue_autopilot_reply` and to
+    the textarea the operator posts.
+
+    Serializing at drain time does not rescue the narrow test either: spacing
+    the two rows apart still delivers both. Nothing downstream compares bodies —
+    `sent_bodies()` is consulted only by `/responder/send`'s pre-read, never by
+    `send_next` — so "not two at once" is not the guarantee this needs. "One
+    message per guest per exchange" is, and only the broad test provides it.
+
+    The lockout that narrowing was meant to cure is real, and is cured instead
+    by making the refusal *legible*: the blocking row is rendered on the board
+    with a working "Don't send" (`dashboard._board`'s `blocking_sends`, which
+    lists every row this predicate matches — a `sending` one read-only, since
+    `CANCELABLE` rightly excludes it), so the operator clears it in one click and
+    then sends. A refusal you can see and
+    undo is a different thing from the invisible one this ticket was filed
+    about. `send_state` still *describes* a deferred row honestly — see
+    `row_deferred` — because how a row is labelled and whether it blocks are
+    two questions, and fusing them is what produced the duplicate.
+    """
+    return (f"({alias}.status=? OR {alias}.status=?)", [QUEUED, SENDING])
+
+
+def _row_in_flight(row: dict) -> bool:
+    """`_in_flight_terms` for a row already in hand — same rule, Python side.
+
+    `send_state` decides from rows the caller has already fetched, so it cannot
+    reuse the SQL. Kept adjacent to its twin, and `tests/test_outbox_due_gate.py`
+    asserts the two agree row-for-row rather than trusting that they do.
+    """
+    return row.get("status") in (QUEUED, SENDING)
+
+
+def row_deferred(row: dict, now_iso: str | None = None) -> bool:
+    """Is this a `queued` row still waiting on its scheduled time?
+
+    Presentation only — deliberately *not* wired into any guard. A deferred row
+    blocks exactly as hard as a due one (see `_in_flight_terms`); this only lets
+    the page say "Scheduled to send 08:00" instead of "Queued to send…" over a
+    message that is eight hours out, which is its own small dishonesty.
+
+    NULL/missing `scheduled_at` reads as due rather than deferred: a row with no
+    readable stamp is not evidence about the future, and the plainer caption is
+    the safer thing to show.
+
+    **Public because every surface that words a row has to ask this same
+    question**, and the ones that answered it themselves got it wrong. The
+    "Waiting to send" section re-derived tense from the stamp and captioned a
+    due row `sends <a time in the past>`; `_release_refusal` skipped the
+    question entirely and worded a deferred row off `STATUS_LABELS`, so the card
+    said "Scheduled to send" and the 409 for that same row said "Queued to
+    send…". One predicate, imported, or the page contradicts itself.
+    """
+    return (row.get("status") == QUEUED
+            and (row.get("scheduled_at") or "") > (now_iso or timeframe.now()))
+
+
+def row_label(row: dict, now_iso: str | None = None) -> str:
+    """How one row is described to the operator — the only place that decides.
+
+    `STATUS_LABELS` is the raw mapping and is *not* the answer on its own: a
+    deferred row is `queued`, so the mapping calls it "Queued to send…" while
+    the card calls it "Scheduled to send". Callers that reached for the mapping
+    directly are how the same row ended up worded two ways on two surfaces.
+    Take this instead, and the caption and the refusal cannot drift.
+    """
+    if row_deferred(row, now_iso):
+        # Approved and waiting on its scheduled time rather than on a drainer.
+        # Still blocking — the operator's escape is "Don't send" on the board,
+        # not an enabled button here.
+        return "Scheduled to send"
+    status = row.get("status")
+    return STATUS_LABELS.get(status, status)
+
+
+def _governing_rank(row: dict, now_iso: str) -> tuple:
+    """Sort key for "which in-flight row decides what this item is doing".
+
+    A row a browser is already driving outranks a merely queued one; among the
+    rest, the row that goes out first wins. That second half is deliberately
+    the drainer's own order — `next_queued` sorts `scheduled_at ASC, id ASC` —
+    so the card names the message the drainer will actually take next rather
+    than whichever row happens to have the lowest id.
+
+    An earlier round ranked `sending` over `queued` and stopped there, breaking
+    the remaining tie on id. Id order has nothing to do with send order, so for
+    rows `[deferred, due]` a message leaving at 08:00 tomorrow captioned a card
+    whose sibling the drainer takes in seconds: the page read "Scheduled to
+    send" — *there is still time to stop this* — over a send with seconds to
+    live. Ordering on one dimension of a multi-dimensional choice is not a
+    tiebreak, it is a coin flip on the others.
+
+    **`scheduled_at` is what separates due from deferred here** — there is no
+    separate `row_deferred` term, because it would be inert. Deferred means
+    `scheduled_at > now` and due means `<= now`, so every due stamp already
+    sorts before every deferred one, and `SENDING` is split off by the first
+    term and is never deferred. A term restating that was measurably
+    indistinguishable from a constant across 112,944 row-sets — nothing could
+    ever kill it, so it would have rotted unnoticed. Do not "clarify" this by
+    adding one back, and do not drop the stamp term thinking dueness is handled
+    elsewhere: it is handled *here*.
+
+    Ties on the stamp are real, not theoretical — `sequences` clamps quiet-hours
+    sends to a fixed wake time, so two drafts queued at 23:10 and 23:47 both
+    land on exactly 08:00. Id ascending breaks those, matching `next_queued`.
+    """
+    return (
+        0 if row.get("status") == SENDING else 1,
+        str(row.get("scheduled_at") or ""),
+        row.get("id") or 0,
+    )
+
+
 def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
         step_label: str, body: str, auto: bool, reason: str = "",
-        scheduled_at: str | None = None) -> dict | None:
+        scheduled_at: str | None = None,
+        unless_in_flight: bool = False) -> dict | None:
     """Queue a drafted step. `auto=True` skips the approval gate (goes straight
     to `queued`); otherwise it waits for a human in `pending_approval`.
 
     `scheduled_at` is in the schedule frame (see `timeframe`) — callers that
     compute a send time hand one in, and "no particular time" means now.
+
+    `unless_in_flight=True` writes nothing (returns None) if this item already
+    has a `queued` or `sending` row. This is the insert-shaped half of the
+    release guard `release_to_send` enforces on updates — the other way a new
+    message reaches a guest. The dashboard's send button read the item's state
+    and then inserted, and two clicks that read before either wrote both
+    inserted: measured, that put two messages in front of one guest in 149 of
+    150 concurrent pairs. The test and the write are now one statement.
+
+    Left off by default because a drafting caller queueing several steps for one
+    item is ordinary and not a double-send; it is the *release* paths that must
+    not stack.
     """
     now = _now()
     status = QUEUED if auto else PENDING
-    with _conn() as c:
-        new_id = db.insert_returning_id(
-            c,
-            """INSERT INTO outbox (tenant_id, site, item_id, sequence, step_id,
+    cols = ("""INSERT INTO outbox (tenant_id, site, item_id, sequence, step_id,
                    step_label, body, status, auto, reason, scheduled_at,
-                   created_at, approved_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (str(tenant_id), site, str(item_id), sequence, step_id, step_label,
-             body, status, 1 if auto else 0, reason,
-             scheduled_at or timeframe.now(), now,
-             now if auto else None),
-        )
-    return get(new_id)
+                   created_at, approved_at)""")
+    vals = (str(tenant_id), site, str(item_id), sequence, step_id, step_label,
+            body, status, 1 if auto else 0, reason,
+            scheduled_at or timeframe.now(), now, now if auto else None)
+    with _conn() as c:
+        if unless_in_flight:
+            # Same reason as the update-shaped guard, and more sharply: this one
+            # is partly about a row that does not exist yet, so no row lock could
+            # cover it. Two concurrent inserts each found NOT EXISTS true on
+            # their own snapshot and both wrote — 15/15 on PG. See `db.lock_key`.
+            db.lock_key(c, _item_key(tenant_id, site, item_id))
+            terms, term_params = _in_flight_terms("sib")
+            new_id = db.insert_returning_id_maybe(
+                c,
+                f"""{cols} SELECT {','.join('?' * len(vals))}
+                    WHERE NOT EXISTS (SELECT 1 FROM outbox sib
+                        WHERE sib.tenant_id=? AND sib.site=? AND sib.item_id=?
+                        AND {terms})""",
+                (*vals, str(tenant_id), site, str(item_id), *term_params),
+            )
+        else:
+            new_id = db.insert_returning_id(
+                c, f"{cols} VALUES ({','.join('?' * len(vals))})", vals)
+    return get(new_id) if new_id is not None else None
 
 
 def get(msg_id: int) -> dict | None:
@@ -251,23 +416,88 @@ def sent_bodies(tenant_id: str, site: str, item_id: str) -> list[str]:
     return [r[0] for r in rows if r[0]]
 
 
-def latest_by_item(tenant_id: str, site: str) -> dict[str, dict]:
-    """The most recent outbox row per item — the per-card send state the UI polls.
+def in_flight_for_item(tenant_id: str, site: str, item_id: str, *,
+                       exclude_id: int | None = None) -> dict | None:
+    """The row holding this item's delivery, if any — `sending` first.
 
-    Ordered ascending so the last write for an item wins, giving each card its
-    current state (queued / sending / sent / failed) without an N+1 lookup.
+    Readable form of the predicate `release_to_send` enforces inside its UPDATE.
+    Callers use it to *explain* a refusal, never to decide one: deciding from a
+    separate read is the check-then-act race that guard exists to close.
+
+    `sending` outranks `queued` for the same reason `send_state` prefers it: a
+    browser is already driving that row, which is the stronger claim on the
+    thread and the more honest thing to name.
+
+    **The ORDER BY is `_governing_rank` in SQL, and has to stay that way.** It
+    used to stop at `id ASC`, so for an item holding two in-flight rows this
+    named one row while the card named another. That was invisible for as long
+    as both came out of `STATUS_LABELS` as the same string, and became a visible
+    contradiction the moment a deferred row got its own caption: the card read
+    "Queued to send…" off the due row while the refusal read "Scheduled to
+    send" off the deferred one — *there is still time to stop this*, about a
+    guest whose next message the drainer takes immediately. Sharing the
+    labeller is not enough if the two surfaces still choose different rows to
+    label. `COALESCE` because `_governing_rank` reads a missing stamp as `""`,
+    which sorts first in Python and SQLite but last in Postgres.
+
+    Shares `_in_flight_terms` with that UPDATE, so this keeps explaining the
+    same refusal. It has to move in lockstep with that predicate or it resumes
+    naming a blocker that no longer blocks.
     """
-    out: dict[str, dict] = {}
+    order = "CASE WHEN status=? THEN 0 ELSE 1 END, COALESCE(scheduled_at, '') ASC, id ASC"
+    terms, term_params = _in_flight_terms("outbox")
+    sql = (f"{_SELECT} WHERE tenant_id=? AND site=? AND item_id=? "
+           f"AND {terms}")
+    params: list = [str(tenant_id), site, str(item_id), *term_params]
+    if exclude_id is not None:
+        sql += " AND id<>?"
+        params.append(exclude_id)
     with _conn() as c:
-        rows = c.execute(
-            f"{_SELECT} WHERE tenant_id=? AND site=? ORDER BY id ASC",
-            (str(tenant_id), site),
-        ).fetchall()
-    for r in rows:
-        msg = _row(r)
-        if msg:
-            out[msg["item_id"]] = msg
-    return out
+        row = c.execute(f"{sql} ORDER BY {order} LIMIT 1", [*params, SENDING]).fetchone()
+    return _row(row)
+
+
+def release_to_send(msg_id: int, *, from_statuses: tuple, body: str | None = None,
+                    error: str | None = None) -> tuple[bool, dict | None]:
+    """Release exactly one row to the send queue — guard and write in one UPDATE.
+
+    Returns `(released, row_as_it_now_is)`. `released` is True only for the call
+    that actually moved the row, so two racing requests cannot both be told yes.
+
+    This is the release path for every *operator-initiated* send: the approve
+    buttons, `/outbox/<id>/retry`, and (insert-shaped, via `add`) the send
+    button. Guarding per-route missed a route three times on this ticket — the
+    approve button was guarded, then the second approve button, and
+    `/outbox/<id>/retry` was still re-queueing a sibling of a message already
+    going out — so the check moved onto the write.
+
+    Be precise about how far that goes: the guard is **opt-in, not structural**.
+    `set_status(msg_id, QUEUED)` and `add(..., unless_in_flight=False)` remain
+    reachable without it, and `automation.enqueue_autopilot_reply` deliberately
+    takes that path — autopilot can still queue a reply into a thread a browser
+    is mid-delivery on. That is pre-existing behaviour and a product decision
+    (several drafted steps per item is ordinary there), not something this
+    guard closes. A new caller that wants the rule must ask for it.
+
+    Two conditions, both in the WHERE clause rather than in a preceding read:
+
+    * `from_statuses` — the row itself must still be in a state it may be
+      released from. Read-then-write let a double-click release a `sent` row
+      twice: both requests read `pending_approval` before either wrote.
+    * no *sibling* of the same item in flight. One item routinely holds several
+      rows, and releasing the quiet one while a drainer delivers the other puts
+      a second message into a live thread. Read-then-write here was measurably
+      racy: two concurrent approves of two rows both answered 200.
+
+    Transitions that move a row *already in flight* (the drainer claiming
+    `queued`→`sending`, `reclaim_stuck_sending`, `release_unattempted`) do not
+    come through here and must not: they hand back a claim on a delivery that is
+    already underway rather than starting a new one, and a sibling check would
+    strand them.
+    """
+    released = set_status(msg_id, QUEUED, body=body, error=error,
+                          only_from=from_statuses, unless_sibling_in_flight=True)
+    return released, get(msg_id)
 
 
 def queued_tenants() -> list[str]:
@@ -390,7 +620,19 @@ def next_queued(tenant_id: str | None = None,
 
 
 def set_status(msg_id: int, status: str, *, error: str | None = None,
-               body: str | None = None) -> None:
+               body: str | None = None, only_from: tuple | None = None,
+               unless_sibling_in_flight: bool = False) -> bool:
+    """Write one row's status. Returns True iff this call is what wrote it.
+
+    The two optional guards turn the write into a compare-and-set: they are
+    extra WHERE terms on the same UPDATE, so the state they test cannot change
+    between the test and the write. Callers that pass neither keep the old
+    unconditional behaviour and can ignore the return value.
+
+    `only_from` — refuse unless the row is still in one of these statuses.
+    `unless_sibling_in_flight` — refuse if any *other* row for the same item is
+    `queued` or `sending`. See `release_to_send`, which is how routes reach it.
+    """
     sets = ["status=?"]
     vals: list = [status]
     if status == QUEUED:
@@ -424,9 +666,41 @@ def set_status(msg_id: int, status: str, *, error: str | None = None,
     if body is not None:
         sets.append("body=?")
         vals.append(body)
+
+    where = ["id=?"]
     vals.append(msg_id)
+    if only_from is not None:
+        where.append(f"status IN ({','.join('?' * len(only_from))})")
+        vals += list(only_from)
+    if unless_sibling_in_flight:
+        # Correlated on the row being updated, so the sibling test is evaluated
+        # by the same statement that does the write. `id<>outbox.id` because a
+        # row that is itself in flight is not its own blocker.
+        terms, term_params = _in_flight_terms("sib")
+        where.append(
+            "NOT EXISTS (SELECT 1 FROM outbox sib WHERE sib.tenant_id=outbox.tenant_id "
+            "AND sib.site=outbox.site AND sib.item_id=outbox.item_id "
+            f"AND sib.id<>outbox.id AND {terms})")
+        vals += term_params
+
     with _conn() as c:
-        c.execute(f"UPDATE outbox SET {', '.join(sets)} WHERE id=?", vals)
+        if unless_sibling_in_flight:
+            # Serialize against anything else releasing for this same item before
+            # the predicate is evaluated. Reading the row's identity first is
+            # safe: an outbox row never changes item. Whoever loses the race for
+            # the lock blocks here, and because READ COMMITTED gives each
+            # *statement* a fresh snapshot, the UPDATE below then sees the
+            # winner's committed row and correctly refuses. Without this the
+            # sibling test is not a CAS at all on Postgres — see `db.lock_key`.
+            owner = c.execute(
+                "SELECT tenant_id, site, item_id FROM outbox WHERE id=?",
+                (msg_id,)).fetchone()
+            if owner is None:
+                return False
+            db.lock_key(c, _item_key(*owner))
+        cur = c.execute(
+            f"UPDATE outbox SET {', '.join(sets)} WHERE {' AND '.join(where)}", vals)
+        return (cur.rowcount or 0) > 0
 
 
 def approve(msg_id: int, body: str | None = None) -> dict | None:
@@ -438,13 +712,10 @@ def approve(msg_id: int, body: str | None = None) -> dict | None:
     A message outside `APPROVABLE` is returned unchanged rather than released:
     re-approving a `sent` row put a second copy of a message the guest had
     already read back on the queue, and `next_queued` duly served it again.
-    Callers tell the two apart by the status of the row that comes back.
+    Callers tell the two apart by the status of the row that comes back, or —
+    better — by calling `release_to_send` directly, which says so outright.
     """
-    msg = get(msg_id)
-    if not msg or msg["status"] not in APPROVABLE:
-        return msg
-    set_status(msg_id, QUEUED, body=body)
-    return get(msg_id)
+    return release_to_send(msg_id, from_statuses=APPROVABLE, body=body)[1]
 
 
 def release_unattempted(msg_id: int) -> None:
@@ -486,11 +757,23 @@ def cancel(msg_id: int) -> dict | None:
     guest. In both of those states the guest is written to whatever this
     returns, so reporting a cancel would be a lie. Callers tell the two apart by
     the status of the row that comes back.
+
+    That test is a WHERE term on the write, not a preceding read. Read-then-write
+    was survivable while the only "Don't send" button sat on `pending_approval`
+    rows, which no drainer can claim — `next_queued` selects `queued`. This
+    ticket puts the button on `queued` rows, which is exactly what a drainer
+    takes, so the window stopped being theoretical: raced through the real
+    route, 39 of 40 trials ended wrong. Half answered a green `{"ok": true}`
+    while the drainer delivered the message anyway; the other half overwrote a
+    live `sending` row, which is worse than it sounds — the row lands `canceled`
+    with `sending_at` set, so the guest receives it *and* it drops out of
+    `sent_bodies()`, the one duplicate-send guard `/responder/send` has. Losing
+    the CAS now leaves the row untouched and the caller reports the truth.
     """
     msg = get(msg_id)
-    if not msg or msg["status"] not in CANCELABLE:
-        return msg
-    set_status(msg_id, CANCELED)
+    if not msg:
+        return None
+    set_status(msg_id, CANCELED, only_from=CANCELABLE)
     return get(msg_id)
 
 
@@ -507,4 +790,97 @@ def counts(tenant_id: str, site: str) -> dict:
         "queued": by_status.get(QUEUED, 0),
         "sent": by_status.get(SENT, 0),
         "failed": by_status.get(FAILED, 0),
+    }
+
+
+def rows_by_item(tenant_id: str, site: str) -> dict[str, list[dict]]:
+    """Every row per item, oldest first — the input `send_state` decides from.
+
+    Collapsing to the last write — what the removed `latest_by_item` did — is
+    the wrong question to ask before offering a send button. One item routinely holds several rows —
+    `enqueue_autopilot_reply` has no per-item dedupe, so a scrape returning two
+    messages in a thread queues two — and the newest is not necessarily the one
+    that matters: an older row can still be `sending` while a newer one sits
+    `canceled`. Reading only the newest calls that item idle and puts a live
+    Approve & send over a message the browser is already delivering.
+
+    One query and a Python collapse, the same cost the per-item read it
+    replaced already paid; callers that need the newest row take `[-1]`.
+    """
+    out: dict[str, list[dict]] = {}
+    with _conn() as c:
+        rows = c.execute(
+            f"{_SELECT} WHERE tenant_id=? AND site=? ORDER BY id ASC",
+            (str(tenant_id), site),
+        ).fetchall()
+    for r in rows:
+        msg = _row(r)
+        if msg:
+            out.setdefault(msg["item_id"], []).append(msg)
+    return out
+
+
+def send_state(rows: list[dict] | None, now_iso: str | None = None) -> dict | None:
+    """What this item's delivery is doing — the one rule, for every surface.
+
+    Any in-flight row wins over a newer row in another state, because the
+    question every caller is really asking is "may I offer to send?", and the
+    honest answer while a drainer holds *any* row for this item is no. Falling
+    back to the newest row keeps single-row items — the common case — reading
+    exactly as reading the newest row alone made them read.
+
+    `status` is therefore the *effective* status, not necessarily the newest
+    one: callers branch on it to pick an affordance, so a caller that saw the
+    newest `failed` while an older row was `queued` would offer "Retry send"
+    over a live delivery. Returns None for an item with no rows at all.
+
+    Among in-flight rows the governing one is chosen by `_governing_rank`, not
+    by id: `sending` outranks `queued` and a due row outranks a deferred one,
+    because the label is what the operator reads and the id order is unrelated
+    to which message actually leaves first. `sending` first is the same
+    precedence as `in_flight_for_item`.
+
+    "In flight" here is `_row_in_flight`, the same rule the release guard
+    enforces, because these two disagreeing is the whole of this ticket: the
+    button's disabled state and the server's 409 have to come from one predicate
+    or the page lies about one of them.
+
+    A deferred row is still in flight — it blocks, so the control stays
+    disabled — but it is *labelled* differently, because "Queued to send…" over
+    a message that leaves at 08:00 tomorrow is its own small dishonesty. That
+    split is deliberate: `row_deferred` decides the caption, `_row_in_flight`
+    decides the refusal, and an earlier round fusing the two is what let a
+    second message reach the guest.
+
+    **This label is bare wording and carries no time.** An earlier draft of this
+    docstring claimed the time shipped with it, which was never true of any
+    surface: `/api/send-states` projects to
+    `("status","label","error","step","in_flight")` and the card renders only
+    `label`/`in_flight`, so the operator read "Scheduled to send" with nothing to
+    check it against. The stamp reaches them from the *other* surface instead —
+    every in-flight row, including whichever one governs here, is listed in
+    "Waiting to send" with its own `scheduled_at` rendered in the property's
+    timezone by `sched_local` (`dashboard.html:434`). `scheduled_at` and `id`
+    stay in this payload for callers that want the governing row itself; the
+    template deliberately does not word a time out of them, because a second
+    place formatting the same stamp is what this ticket keeps having to unpick.
+    """
+    rows = [m for m in (rows or []) if m]
+    if not rows:
+        return None
+    now = now_iso or timeframe.now()
+    governing = min((m for m in rows if _row_in_flight(m)),
+                    key=lambda m: _governing_rank(m, now),
+                    default=rows[-1])
+    status = governing["status"]
+    in_flight = _row_in_flight(governing)
+    label = row_label(governing, now)
+    return {
+        "id": governing["id"],
+        "status": status,
+        "label": label,
+        "error": governing.get("error"),
+        "step": governing.get("step_label"),
+        "scheduled_at": governing.get("scheduled_at"),
+        "in_flight": in_flight,
     }

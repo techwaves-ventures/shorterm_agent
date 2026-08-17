@@ -261,13 +261,15 @@ def _board(tenant_id: str) -> dict:
     # existing install picks up the lifecycle without a migration step.
     pipeline.backfill(tenant_id, SITE, items, responses, config.get_units(tenant_id))
     deals = pipeline.all_deals(tenant_id, SITE)
-    pending = {
-        m["item_id"]: m
-        for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
-    }
-    send_states = outbox.latest_by_item(tenant_id, SITE)
-    # Self-heal on view: requeue sends stranded by a crashed process, and make
-    # sure something is draining if messages are waiting (e.g. after a restart).
+    # Self-heal on view: requeue sends stranded by a crashed process.
+    #
+    # This runs *before* the outbox reads below, not after. It writes rows the
+    # board then renders — a stranded `sending` row becomes `queued` — so
+    # reading first meant the one render that performed the reclaim described
+    # the state it had just replaced: still "Sending…", still absent from
+    # "Waiting to send", still offering no way to clear it, while an
+    # /api/send-states poll moments later already said `queued`. The render that
+    # fixes something is the render that most needs to show it.
     #
     # The reclaim is deliberately *not* gated on `_can_deliver_in_process()`.
     # It is pure DB work — it drives no browser — and the topology that cannot
@@ -279,6 +281,26 @@ def _board(tenant_id: str) -> dict:
     # `has_open_step` counts it as open, so the agent never re-drafts that step
     # for that guest again.
     outbox.reclaim_stuck_sending()
+
+    pending = {
+        m["item_id"]: m
+        for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
+    }
+    send_rows = outbox.rows_by_item(tenant_id, SITE)
+    # One clock for the whole render. Both surfaces that describe a send read
+    # dueness off it — the card's label via `send_state` and the "Waiting to
+    # send" caption via `row_deferred` — and taking `timeframe.now()` twice lets
+    # a render that straddles a scheduled time caption one row as still upcoming
+    # and label the same row as due, on one page, from one request.
+    now_iso = timeframe.now()
+    # Kept *after* the reads, unlike the reclaim above. This one spawns a thread
+    # that writes the very rows just read, claiming `queued` into `sending`; in
+    # front of the reads it would race its own render, so a board could show
+    # "Sending…" for a row whose claim had not been made when the page was
+    # composed, and the two outbox reads above could straddle the claim and
+    # disagree with each other. The reclaim has no such problem — it is
+    # synchronous and finishes before the reads begin. "Heal before reading"
+    # applies to the write this request completes, not to the one it starts.
     if _can_deliver_in_process() and outbox.queued_tenants():
         automation.start_drainer(SITE)
 
@@ -289,7 +311,10 @@ def _board(tenant_id: str) -> dict:
             "item": item,
             "response": responses.get(deal["item_id"]),
             "pending": pending.get(deal["item_id"]),
-            "send": send_states.get(deal["item_id"]),
+            # The derived state, not the raw row: the template gates the
+            # in-flight display and the disabled button on `send.in_flight`,
+            # which is not a column.
+            "send": outbox.send_state(send_rows.get(deal["item_id"]), now_iso),
             "age": pipeline.humanize_age(deal.get("inquiry_at")),
             "age_hours": pipeline.age_hours(deal.get("inquiry_at")),
             "stage_label": pipeline.STAGE_LABELS.get(deal.get("stage"), deal.get("stage")),
@@ -316,6 +341,59 @@ def _board(tenant_id: str) -> dict:
             {**card(by_id[m["item_id"]]), "pending": m}
             for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
             if m["item_id"] in by_id
+        ],
+        # Every approved row that is holding its guest's card — waiting on a
+        # drainer, on its scheduled time, or already going out. These were
+        # rendered nowhere, which is what made the release guard indefensible: a
+        # row in flight refuses approve/retry/send for its guest, and with no row
+        # on the page and no cancel control the operator could neither see what
+        # was blocking them nor clear it — the only escape was hand-POSTing
+        # /outbox/<id>/cancel. `queued` is in `outbox.CANCELABLE` and that route
+        # already answers 200, so the affordance was the only missing piece. It
+        # matters most where no drainer runs at all: there the block is not a
+        # window, it is permanent.
+        #
+        # The set is `IN_FLIGHT`, not `QUEUED`, because it has to match the
+        # predicate that does the refusing (`_in_flight_terms`). Listing only the
+        # clearable half meant an operator could cancel every blocker the page
+        # showed and still be 409'd with nothing left to click — a page that is
+        # complete about what it can fix and silent about what it cannot. A
+        # `sending` row renders read-only (see `outbox.CANCELABLE`: an in-flight
+        # browser send genuinely cannot be called off, and a button that would
+        # 409 is not an affordance), so the section answers "what is holding this
+        # guest" completely and is honest about which of it you can act on.
+        #
+        # Derived from `send_rows` — already a whole-table read for this tenant —
+        # rather than a seventh `for_tenant` query, because the board's query
+        # count is fixed by design and asserted as such. Ordered as `for_tenant`
+        # orders, so the section reads oldest-due first.
+        #
+        # Three flags, not one. `cancelable` decides whether a control is offered
+        # at all and has to track the predicate the route enforces; `sending` and
+        # `deferred` decide the wording. `cancelable` and `sending` coincide
+        # today only because `CANCELABLE` excludes exactly `SENDING`, and a
+        # caption reading itself off an unrelated permission is the shape of this
+        # ticket's original defect.
+        #
+        # `deferred` is the one the caption was missing. Without it the section
+        # had a single "is it sending" bit and wrote the *stamp* for everything
+        # else, so a due `queued` row — the common case, since deferral is the
+        # quiet-hours exception — was captioned "sends <a time already past>".
+        # It comes from `outbox.row_deferred`, the same predicate `send_state`
+        # uses for the card, so the two surfaces cannot describe one row in two
+        # tenses. Computed against a single `now` for the whole render: taken
+        # per row, a board straddling the boundary could caption two identically
+        # scheduled rows differently.
+        "blocking_sends": [
+            {**card(by_id[m["item_id"]]), "pending": m,
+             "cancelable": m["status"] in outbox.CANCELABLE,
+             "sending": m["status"] == outbox.SENDING,
+             "deferred": outbox.row_deferred(m, now_iso)}
+            for m in sorted(
+                (m for rows in send_rows.values() for m in rows
+                 if m["status"] in outbox.IN_FLIGHT and m["item_id"] in by_id),
+                key=lambda m: (m.get("scheduled_at") or "", m["id"]),
+            )
         ],
         "outbox_counts": outbox.counts(tenant_id, SITE),
         # `steps` is a set internally (membership tests); listify so the board
@@ -887,10 +965,9 @@ def _sent_state(tenant_id: str, item_id: str, response: dict | None) -> str:
     an enabled Approve & send button over the text that had just gone out:
     a reply that has been delivered, and one that is queued or mid-flight.
     """
-    msgs = [m for m in outbox.for_tenant(tenant_id, SITE, outbox.IN_FLIGHT)
-            if m["item_id"] == item_id]
-    if msgs:
-        return outbox.STATUS_LABELS.get(msgs[0]["status"], "Sending…")
+    state = outbox.send_state(outbox.rows_by_item(tenant_id, SITE).get(item_id))
+    if state and state["in_flight"]:
+        return state["label"]
     if (response or {}).get("status") == "sent":
         at = (response or {}).get("sent_at") or ""
         return f"Sent{' ' + str(at) if at else ''}."
@@ -1048,6 +1125,33 @@ def _own_message_or_404(tenant_id: str, msg_id: int) -> dict:
     return msg
 
 
+def _release_refusal(tenant_id: str, msg: dict | None, msg_id: int,
+                     from_statuses: tuple) -> str:
+    """Word a refusal `outbox.release_to_send` has already decided.
+
+    Read *after* the write refused, never before it: this is the explanation,
+    not the guard. Deciding from a read like this one is exactly the race the
+    CAS closes, and a second copy of the rule here would drift from it.
+
+    Worded through `outbox.row_label`, not `STATUS_LABELS`. The raw mapping has
+    no deferred branch, so for one row the card said "Scheduled to send" while
+    clicking its sibling popped `already "Queued to send…"` — the same row named
+    two ways on two surfaces, which is this ticket's own defect one layer up.
+    The refusal is still decided by the write; only the wording is shared.
+    """
+    if not msg:
+        return "That message is no longer there."
+    if msg["status"] not in from_statuses:
+        return outbox.row_label(msg)
+    blocker = outbox.in_flight_for_item(tenant_id, SITE, msg["item_id"],
+                                        exclude_id=msg_id)
+    if blocker:
+        return outbox.row_label(blocker)
+    # Refused, yet nothing explains it any more — the blocking row settled
+    # between the UPDATE and this read. Don't invent a reason; say what is true.
+    return "Another send for this guest was already under way."
+
+
 @app.route("/outbox/<int:msg_id>/approve", methods=["POST"])
 @login_required
 def outbox_approve(msg_id):
@@ -1058,13 +1162,21 @@ def outbox_approve(msg_id):
     # actually posts to — this is the primary approval surface, and it had none.
     # A sent message re-approved here went back on the queue and was delivered a
     # second time.
-    if msg["status"] not in outbox.APPROVABLE:
-        return jsonify({
-            "ok": False, "already": True,
-            "error": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
-        }), 409
     (text,) = _form("text")
-    outbox.approve(msg_id, (text or "").strip() or None)
+    # One statement decides and writes. Both refusals this answers 409 for used
+    # to be reads taken before the write: the row's own status (a sent row
+    # re-approved goes back on the queue and is delivered twice), and a
+    # *different* row of the same guest already going out (two rows per item is
+    # ordinary, not exotic — releasing the quiet one puts a second message into
+    # a thread mid-delivery). Read-then-write let two concurrent approves both
+    # answer 200 with two rows in flight; the guards are now WHERE terms on the
+    # UPDATE, so exactly one call can win. See `outbox.release_to_send`.
+    released, msg = outbox.release_to_send(
+        msg_id, from_statuses=outbox.APPROVABLE, body=(text or "").strip() or None)
+    if not released:
+        return jsonify({"ok": False, "already": True,
+                        "error": _release_refusal(
+                            tenant_id, msg, msg_id, outbox.APPROVABLE)}), 409
     automation.start_drainer(SITE)  # deliver in the background; don't block the click
     return jsonify({"ok": True, "counts": outbox.counts(tenant_id, SITE)})
 
@@ -1085,7 +1197,18 @@ def outbox_cancel(msg_id):
             "ok": False, "already": True,
             "error": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
         }), 409
-    outbox.cancel(msg_id)
+    # The check above is the common case; this one is the race. A drainer can
+    # claim the row between that read and this write, and `cancel` refuses when
+    # it does — so the answer has to come from what was actually written, not
+    # from the earlier read. Reporting `ok` unconditionally is how a message the
+    # operator called off still reached the guest, under a green toast.
+    row = outbox.cancel(msg_id)
+    if not row or row["status"] != outbox.CANCELED:
+        status = (row or {}).get("status")
+        return jsonify({
+            "ok": False, "already": True,
+            "error": outbox.STATUS_LABELS.get(status, status),
+        }), 409
     return jsonify({"ok": True, "counts": outbox.counts(tenant_id, SITE)})
 
 
@@ -1261,6 +1384,20 @@ def responder_send():
     if blocked:
         return jsonify({"ok": False, "already": True, "error": blocked}), 409
     msg = automation.enqueue_send(tenant_id, SITE, item_id, text.strip())
+    if msg is None:
+        # The guard above is a read, so it cannot see a send that started
+        # between it and the insert — two clicks both passed it and both queued.
+        # `enqueue_send` now refuses at the write, and this is that refusal:
+        # same 409 as the pre-read, because to the operator it is the same fact.
+        # Worded through `row_label`, like the pre-read guard above it — this
+        # route carries the same refusal twice, and reaching for the raw
+        # mapping here meant it answered one fact with two different strings
+        # depending on which of its two guards happened to fire.
+        blocker = outbox.in_flight_for_item(tenant_id, SITE, item_id)
+        return jsonify({"ok": False, "already": True, "error": (
+            outbox.row_label(blocker)
+            if blocker else "Another send for this guest was already under way."
+        )}), 409
     return jsonify({
         "ok": True,
         "queued": True,
@@ -1275,14 +1412,16 @@ def api_send_states():
     """Per-item delivery state, polled by the cards after a send is queued."""
     tenant_id = current_user.tenant_id
     states = {}
-    for item_id, msg in outbox.latest_by_item(tenant_id, SITE).items():
-        states[item_id] = {
-            "status": msg["status"],
-            "label": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
-            "error": msg.get("error"),
-            "step": msg.get("step_label"),
-            "in_flight": msg["status"] in outbox.IN_FLIGHT,
-        }
+    # Same rule as the server-rendered card and `_sent_state`. Keyed off the
+    # newest row this used to disagree with both: it reported an item idle
+    # while an older row of its own was still in flight, and the page cannot
+    # recover from that — it re-enables the button on what the poll tells it.
+    for item_id, rows in outbox.rows_by_item(tenant_id, SITE).items():
+        state = outbox.send_state(rows)
+        if state:
+            states[item_id] = {
+                k: state[k] for k in ("status", "label", "error", "step", "in_flight")
+            }
     return jsonify(states)
 
 
@@ -1294,7 +1433,17 @@ def outbox_retry(msg_id):
     msg = _own_message_or_404(tenant_id, msg_id)
     if msg["status"] != outbox.FAILED:
         return jsonify({"ok": False, "error": "only failed messages can be retried"}), 400
-    outbox.set_status(msg_id, outbox.QUEUED, error="")
+    # Retrying is releasing a message to a guest, so it takes the same guard as
+    # the approve buttons. It had none: a failed row was re-queued while a
+    # *sibling* row for the same guest was still `sending`, answering 200 with
+    # two messages in flight. The per-route guard next door did not reach here —
+    # which is why the check now lives on the write itself.
+    released, msg = outbox.release_to_send(
+        msg_id, from_statuses=(outbox.FAILED,), error="")
+    if not released:
+        return jsonify({"ok": False, "already": True,
+                        "error": _release_refusal(
+                            tenant_id, msg, msg_id, (outbox.FAILED,))}), 409
     automation.start_drainer(SITE)
     return jsonify({"ok": True})
 

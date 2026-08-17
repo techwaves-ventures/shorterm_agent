@@ -22,6 +22,7 @@ the caller's own connection. On SQLite the lazy-every-time behavior is kept
 exactly; on Postgres running DDL inside the caller's transaction deadlocks two
 concurrent writers. See open_with_schema for the full reasoning.
 """
+import hashlib
 import os
 import re
 import sqlite3
@@ -264,6 +265,68 @@ def insert_returning_id(conn: Conn, sql: str, params, id_col: str = "id"):
         cur = conn.execute(f"{sql} RETURNING {id_col}", params)
         return cur.fetchone()[0]
     return conn.execute(sql, params).lastrowid
+
+
+def lock_key(conn: Conn, key: str) -> None:
+    """Serialize this transaction against any other touching the same key.
+
+    Needed because a guard whose predicate spans *rows* cannot be enforced by
+    row-level MVCC. Under Postgres' default READ COMMITTED, two transactions
+    each evaluate `NOT EXISTS (...)` against their own snapshot, neither sees
+    the other's uncommitted row, and when they update *different* rows there is
+    no row lock to serialize them and no EvalPlanQual recheck. Measured on
+    PG 16.14 before this lock: 14/15 concurrent pairs released two messages for
+    one guest, and 15/15 for the insert-shaped guard. SQLite hid it completely —
+    its single writer lock serializes everything, so the same code measured
+    0/150 there. A guard verified only on SQLite is a guard verified on the
+    wrong backend: `DATABASE_URL` is required on the deployed target.
+
+    An advisory lock rather than `SELECT ... FOR UPDATE` because the condition
+    is partly about rows that do not exist yet (insert vs insert), which no row
+    lock can cover. Taken inside the caller's transaction and released when it
+    ends. The hash is computed here rather than with Postgres' `hashtext()` so
+    the key does not depend on an undocumented internal function; collisions
+    only cost unrelated serialization, never correctness.
+
+    No-op on SQLite, which already gives this for free.
+
+    Refuses an autocommit connection rather than degrading on one.
+    `pg_advisory_xact_lock` releases at the end of its transaction, so under
+    autocommit it is taken and dropped by its own statement — a silent no-op
+    that leaves the caller's predicate as racy as it was before, while every
+    SQLite test stays green. That is precisely the combination that shipped a
+    broken guard here once already (the 14/15 above), and `open_with_schema`
+    documents the same hazard for the schema latch, which is why that one uses a
+    *session* lock. The precondition holds today — psycopg defaults
+    `autocommit=False` — so this is not a live bug; it is what makes the next
+    person's pooled-connection change fail loudly instead of quietly.
+    """
+    if not conn.pg:
+        return
+    if getattr(conn.raw, "autocommit", False):
+        raise RuntimeError(
+            "lock_key needs a transactional connection: pg_advisory_xact_lock "
+            "is a no-op under autocommit, silently un-guarding the caller.")
+    # Signed 64-bit, which is what pg_advisory_xact_lock(bigint) accepts.
+    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+    conn.execute("SELECT pg_advisory_xact_lock(?)",
+                 (int.from_bytes(digest, "big", signed=True),))
+
+
+def insert_returning_id_maybe(conn: Conn, sql: str, params, id_col: str = "id"):
+    """Same, for an INSERT that is allowed to insert nothing. None if it didn't.
+
+    `insert_returning_id` assumes a row was written — on Postgres it subscripts
+    `fetchone()`, and on SQLite `lastrowid` keeps whatever the previous insert
+    on that cursor set. Neither is safe for `INSERT ... SELECT ... WHERE NOT
+    EXISTS`, the shape used to make "write this row only if nothing conflicts"
+    a single statement instead of a read followed by a write.
+    """
+    if conn.pg:
+        row = conn.execute(f"{sql} RETURNING {id_col}", params).fetchone()
+        return row[0] if row else None
+    cur = conn.execute(sql, params)
+    return cur.lastrowid if cur.rowcount else None
 
 
 def sync_serial(conn: Conn, table: str, col: str = "id") -> None:

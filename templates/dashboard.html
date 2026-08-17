@@ -314,7 +314,15 @@
                 <textarea class="draft-text" id="ta-{{ c.id }}">{{ r.draft }}</textarea>
               </details>
               <div class="actions">
-                <button class="mini primary" id="send-{{ c.id }}" onclick="sendReply('{{ c.id }}')">Approve &amp; send</button>
+                {# Rendered disabled by the server, not by JS: the poll needs a
+                   round-trip, and until it lands the button is live over a send
+                   that is already going out. A failed fetch never lands. #}
+                {# `data-label` carries the resting caption because `setBusy`
+                   caches `innerHTML` the first time it makes a button busy, and
+                   that innerHTML is now the server-rendered "Sending…". Without
+                   it, a completed send hands the button back live and still
+                   captioned "Sending…". #}
+                <button class="mini primary" id="send-{{ c.id }}" data-label="Approve &amp; send" onclick="sendReply('{{ c.id }}')"{% if c.send and c.send.in_flight %} disabled{% endif %}>{% if c.send and c.send.in_flight %}{{ c.send.label }}{% else %}Approve &amp; send{% endif %}</button>
                 <button class="mini" id="draft-{{ c.id }}" onclick="draftItem('{{ c.id }}')">Re-draft</button>
                 <button class="mini" onclick="markBooked('{{ c.id }}')">Mark booked</button>
                 <button class="mini danger" onclick="markLost('{{ c.id }}')">Lost</button>
@@ -327,7 +335,7 @@
                 <button class="mini danger" onclick="markLost('{{ c.id }}')">Lost</button>
               </div>
               {% endif %}
-              <div class="msg" id="msg-{{ c.id }}"></div>
+              <div class="msg" id="msg-{{ c.id }}">{% if c.send and c.send.in_flight %}{{ c.send.label }}{% endif %}</div>
             </div>
           </article>
         {% else %}
@@ -362,8 +370,109 @@
               </details>
               <div class="preview">{{ msg.body }}</div>
               <div class="actions">
-                <button class="mini primary" onclick="approveMsg({{ msg.id }})">Approve &amp; send</button>
+                {# This card's *own* row is awaiting approval, but a sibling row
+                   for the same guest can be in flight; approving then releases
+                   a second message mid-delivery. The id is what lets the poll
+                   reach this button at all — it had none. #}
+                <button class="mini primary" id="approve-ob-{{ msg.id }}" data-item="{{ c.id }}" data-label="Approve &amp; send" onclick="approveMsg({{ msg.id }})"{% if c.send and c.send.in_flight %} disabled{% endif %}>{% if c.send and c.send.in_flight %}{{ c.send.label }}{% else %}Approve &amp; send{% endif %}</button>
                 <button class="mini danger" onclick="cancelMsg({{ msg.id }})">Don't send</button>
+              </div>
+              <div class="msg" id="msg-ob-{{ msg.id }}"></div>
+            </div>
+          </article>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+    <!-- 2a. Approved and on their way out. Rendered because these rows *block*
+         approve/retry/send for their guest, and a refusal the operator cannot
+         see or undo is the same class of lie as the dead in-flight branch this
+         ticket was filed about. "Don't send" is the escape: `queued` is in
+         `outbox.CANCELABLE`, and cancelling one immediately unblocks the guest.
+
+         `sending` rows are listed too, read-only. Leaving them out made this
+         section complete about what the operator can fix and silent about what
+         they cannot: cancel every blocker shown and the guest could still be
+         409'd, with nothing left to click. The section answers "what is holding
+         this guest", so it has to list the whole set and be honest about which
+         half is actionable — `outbox.CANCELABLE` excludes `sending` because a
+         browser is already driving it, and a button that answers 409 is not an
+         affordance.
+
+         The heading says "Waiting to send" rather than "Queued to send" because
+         a deferred row's own caption reads "Scheduled to send": two names for
+         one row on one page is the same confusion this ticket fixed once
+         already, and this wording covers both without contradicting either. -->
+    {% if board.blocking_sends %}
+    <section>
+      <div class="sec-head">
+        <h2>Waiting to send</h2>
+        <span class="sec-count">{{ board.blocking_sends|length }}</span>
+        {# The "cancel the ones that have not started" half is conditional
+           because the section can now legitimately contain zero cancelable
+           rows. Widening it to every `IN_FLIGHT` row made an all-`sending`
+           section reachable, and that sentence then sits above no buttons at
+           all — telling the operator to do something the page is not offering,
+           which is the same class of lie as the dead branch this ticket was
+           filed about, pointed the other way. #}
+        <span class="sec-sub">already approved — each one holds its guest's card until it goes out{% if board.blocking_sends|selectattr('cancelable')|list %}; cancel the ones that have not started{% endif %}</span>
+      </div>
+      <div class="sec-body">
+        {% for c in board.blocking_sends %}
+          {% set msg = c.pending %}
+          <article class="deal">
+            <div class="deal__rail"></div>
+            <div class="deal__main">
+              <div class="deal__top">
+                <span class="deal__name">{{ c.deal.guest_name or 'Guest' }}</span>
+                <span class="badge badge--brand">{{ msg.step_label }}</span>
+                {# Three captions, because the row's send time can be in three
+                   relations to now and each needs a different tense.
+
+                   "sends 07:08" over a row a browser is already driving states a
+                   plan where there is now an outcome, and the stamp it would
+                   print is in the past. The scheduled time stops being the
+                   useful fact the moment the send starts.
+
+                   The *same objection* applies to a due `queued` row, which is
+                   the common case here — deferral is the quiet-hours exception,
+                   so most rows in this section are due. Its stamp is by
+                   definition past, and "sends <yesterday 20:07>" under a heading
+                   that says "Waiting to send" is the identical lie one state
+                   earlier. It gets `due`, matching the wording the approval
+                   section already uses for this very filter (line 364) — that
+                   word is tense-neutral and reads correctly on a past stamp.
+
+                   `deferred` comes from `outbox.row_deferred`, the predicate
+                   `send_state` uses to caption the card, rather than being
+                   re-derived from the stamp here. `send_state` deliberately
+                   splits due from deferred and gives a due row no schedule
+                   wording at all; a section that re-decided dueness for itself
+                   is how one page came to describe one row in two frames.
+
+                   Keyed on `sending`/`deferred`, not on `cancelable`: sending
+                   and not-cancelable coincide only because `CANCELABLE` happens
+                   to exclude exactly `SENDING`. Keyed on cancelability, any
+                   future change to that tuple would silently retitle a `queued`
+                   row "going out now" — a caption deciding itself from an
+                   unrelated permission is how this ticket's original defect read
+                   the wrong field. #}
+                <span class="deal__age">{% if c.sending %}going out now{% elif c.deferred %}sends {{ msg.scheduled_at|sched_local }}{% else %}due {{ msg.scheduled_at|sched_local }}{% endif %}</span>
+              </div>
+              <div class="preview">{{ msg.body }}</div>
+              <div class="actions">
+                {# The button is gated on `cancelable` — the real predicate the
+                   route enforces — so it can never offer a control that 409s.
+                   The wording is chosen separately, for the same reason as the
+                   caption above. #}
+                {% if c.cancelable %}
+                <button class="mini danger" onclick="cancelMsg({{ msg.id }})">Don't send</button>
+                {% elif c.sending %}
+                <span class="muted">Sending… — cannot be called off</span>
+                {% else %}
+                <span class="muted">Cannot be called off</span>
+                {% endif %}
               </div>
               <div class="msg" id="msg-ob-{{ msg.id }}"></div>
             </div>
@@ -506,7 +615,7 @@
         const text = ta ? ta.value.trim() : "";
         if (!text) { setMsg(id, "Draft is empty.", "err"); return; }
         const btn = document.getElementById("send-" + id);
-        setBusy(btn, true, "Queued…");
+        setBusy(btn, true, "Queued to send…");
         setMsg(id, "Queued — sending in the background. You can carry on.", "");
         try {
           const res = await postForm("/responder/send", { item_id: id, text });
@@ -527,6 +636,26 @@
 
       function renderSendState(id, s) {
         const btn = document.getElementById("send-" + id);
+        // Approve buttons for *other* rows of this same guest. They follow the
+        // in-flight flag only — whether they may be pressed once nothing is in
+        // flight depends on their own row, which `s` does not describe.
+        const siblings = Array.from(document.querySelectorAll('[data-item="' + CSS.escape(id) + '"]'));
+        // `in_flight` is tested before `status` on purpose. The effective status
+        // can be `failed` or `canceled` — a newer row — while an older row for
+        // this guest is still going out, and both of those branches re-enable
+        // the button, i.e. offer a second send over a live one.
+        if (s.in_flight) {
+          // The server's own label for the status, not a second copy of the
+          // wording: the card rendered "Queued to send…" and this rendered
+          // "Queued…" for one state, so the button changed its mind about what
+          // was happening the moment the first poll landed.
+          const label = s.label;
+          setBusy(btn, true, label);
+          siblings.forEach(b => setBusy(b, true, label));
+          setMsg(id, s.label, "");
+          return;
+        }
+        siblings.forEach(b => setBusy(b, false));
         if (s.status === "sent") {
           setBusy(btn, false);
           if (btn) { btn.disabled = true; btn.textContent = "Sent ✓"; }
@@ -535,24 +664,52 @@
           setBusy(btn, false);
           if (btn) { btn.disabled = false; btn.textContent = "Retry send"; }
           setMsg(id, "Send failed: " + (s.error || "unknown error"), "err");
-        } else if (s.in_flight) {
-          setBusy(btn, true, s.status === "sending" ? "Sending…" : "Queued…");
+        } else if (s.status === "canceled" || s.status === "pending_approval") {
+          // Both are real latest-statuses that matched nothing here, leaving the
+          // button frozen in whatever the previous tick made of it.
+          //
+          // `queued` deliberately does *not* belong here: it is always
+          // `in_flight`, so it returns above. A round of this ticket gave a
+          // deferred row `in_flight=false` and added `queued` to this branch to
+          // catch the fallout — when that narrowing was reverted (it let a
+          // second message reach the guest) this case became unreachable, and
+          // an unreachable branch in this exact function is what VEN-131 is.
+          setBusy(btn, false);
           setMsg(id, s.label, "");
         }
       }
 
+      // While something is in flight, watch closely; otherwise keep watching
+      // slowly rather than stopping. A send can begin with no click in this tab
+      // (autopilot queues one, or another tab approves), and the poll used to
+      // clear itself the first time nothing was in flight — after which the
+      // buttons in this tab stayed live over every later send for the life of
+      // the page.
+      const IDLE_SKIP = 4;   // → re-check every 5th tick, i.e. 15s, when idle
+      let idleTicks = 0;
+
       async function trackSends() {
+        // A caller asking to track sends has just started one, so the next tick
+        // must not be skipped. The poll is armed for the life of the page and
+        // never cleared, so this returns early on every call after the first —
+        // and left `idleTicks` at 4, meaning a click made during an idle
+        // stretch showed no state change for up to 15s. Resetting the skip
+        // counter is what the old `clearInterval`-then-rearm did implicitly.
+        idleTicks = 0;
         if (sendPoll) return;
         const tick = async () => {
+          if (idleTicks > 0) { idleTicks -= 1; return; }
+          let anyInFlight = false;
           try {
             const states = await (await fetch("/api/send-states")).json();
-            let anyInFlight = false;
             for (const [id, s] of Object.entries(states)) {
               renderSendState(id, s);
               if (s.in_flight) anyInFlight = true;
             }
-            if (!anyInFlight) { clearInterval(sendPoll); sendPoll = null; }
-          } catch (e) { /* transient */ }
+          } catch (e) {
+            anyInFlight = false;  // transient — back off, don't hammer
+          }
+          idleTicks = anyInFlight ? 0 : IDLE_SKIP;
         };
         sendPoll = setInterval(tick, 3000);
         tick();
@@ -661,18 +818,10 @@
 
       // Resume tracking on load so a send that's still in flight (or failed
       // while the page was closed) shows its state without any user action.
-      {% if board.all | selectattr('send') | selectattr('send.in_flight') | list %}
+      // Armed unconditionally: the old else-branch fetched once and started no
+      // interval, so a send beginning later in the session was never seen. The
+      // first tick always fetches, and the result picks the cadence from there.
       trackSends();
-      {% else %}
-      (async () => {
-        try {
-          const states = await (await fetch("/api/send-states")).json();
-          for (const [id, s] of Object.entries(states)) {
-            if (s.status === "failed" || s.status === "sent") renderSendState(id, s);
-          }
-        } catch (e) { /* transient */ }
-      })();
-      {% endif %}
     </script>
   {% endif %}
   </main>
