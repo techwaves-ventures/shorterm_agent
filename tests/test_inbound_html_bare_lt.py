@@ -369,37 +369,99 @@ def test_block_boundaries_still_become_newlines(html, expected):
     assert expected in inbound.extract_body({"HtmlBody": html})
 
 
-def _growth_ratio(make):
-    """Median-of-3 wall time at n and 2n. Ratio ~2 is linear, ~4 is quadratic."""
+# VEN-164: these two guards used to time a 2x doubling on `perf_counter` and
+# require a ratio under 3.0. That is a wall-clock assertion, and it flaked on a
+# loaded runner while the implementation was still perfectly linear — measured
+# at 3.85 for the `<script>` shape under an 8-way CPU load, against a linear
+# truth of 1.99. Three things were wrong and all three are fixed below.
+#
+# 1. `perf_counter` counts time this process spent *descheduled*. `process_time`
+#    counts only CPU it actually consumed, which is the quantity the complexity
+#    claim is about. Same load, same shape: 3.85 wall vs 1.99 CPU.
+# 2. Median-of-3 treats noise as symmetric. It is not — scheduling and GC only
+#    ever *add* time, so the fastest run is the best estimate of the true cost.
+# 3. A 2x lever barely separates the hypotheses: linear lands at ~2 and
+#    quadratic at ~3.2-4, so the old 3.0 ceiling sat *5% under* its own positive
+#    control. An 8x lever spreads them to ~8 vs ~30-65.
+#
+# Measured on this box (min-of-3 CPU seconds, 8x lever), idle and under an
+# 8-way CPU load, against the pre-VEN-144 substitution chain as the quadratic
+# control:
+#
+#     shape      linear (idle -> load)   quadratic       ceiling margin
+#     <script>       7.12 -> 8.02           64.7         2.0x / 4.0x
+#     bare `<`       7.73 -> 8.02        29.4 - 31.9     2.0x / 1.8x
+#
+# So 16.0 sits a clear factor of two above every linear reading and a factor of
+# 1.8 below the *closest* quadratic one. Keep that headroom in mind before
+# lowering it to make some other shape fit.
+_LINEAR_RATIO_CEILING = 16.0
+
+# Below this the measurement is noise, not signal. `process_time` resolves to a
+# nanosecond and the linear path spends ~200us at the small end, so this is 20x
+# clear of anything real — it fires only if the payload stopped reaching the
+# extractor at all. The old code clamped the denominator with `max(t, 1e-6)`
+# instead, which silently turned an unmeasurable run into a *passing* ratio.
+_MEASURABLE_SECONDS = 1e-5
+
+
+def _growth_ratio(make, lo=2000, hi=16000, runs=3):
+    """Fastest-of-`runs` CPU seconds at `lo` and `hi`. ~8 is linear, ~64 quadratic.
+
+    CPU time, not wall time, and the minimum, not the median — see the note above
+    `_LINEAR_RATIO_CEILING` for why each of those matters.
+    """
     timings = {}
-    for n in (4000, 8000):
+    for n in (lo, hi):
         payload = make(n)
-        runs = []
-        for _ in range(3):
-            start = time.perf_counter()
+        best = None
+        for _ in range(runs):
+            start = time.process_time()
             inbound.extract_body({"HtmlBody": payload})
-            runs.append(time.perf_counter() - start)
-        timings[n] = sorted(runs)[1]
-    return timings[8000] / max(timings[4000], 1e-6)
+            elapsed = time.process_time() - start
+            best = elapsed if best is None else min(best, elapsed)
+        timings[n] = best
+    assert timings[lo] > _MEASURABLE_SECONDS, (
+        f"baseline at n={lo} was {timings[lo]:.2e}s, too small to build a ratio on; "
+        "this guard is not measuring the extractor any more")
+    return timings[hi] / timings[lo]
+
+
+def _assert_stays_linear(make, shape, attempts=3):
+    """Re-measure before failing. A ratio is a sample, and one bad sample on a
+    contended runner should not condemn the implementation.
+
+    This cannot rescue a genuinely quadratic extractor: the control shapes come
+    back at 29-65 on every attempt, nowhere near the 16.0 ceiling. It only
+    absorbs the case where a single measurement got stepped on.
+    """
+    seen = []
+    for _ in range(attempts):
+        ratio = _growth_ratio(make)
+        seen.append(ratio)
+        if ratio < _LINEAR_RATIO_CEILING:
+            return
+    raise AssertionError(
+        f"{shape} scaling looks quadratic: {', '.join(f'{r:.2f}x' for r in seen)} "
+        f"per 8x of input over {attempts} attempts, ceiling {_LINEAR_RATIO_CEILING}")
 
 
 def test_html_fallback_stays_linear_on_bare_less_than_prose():
     """Base's `<[^>]+>` is itself super-linear here — 5.5s on a 512KB payload.
 
-    The threshold is loose on purpose: this is a shape tripwire for a quadratic
-    regression, not a benchmark, and CI timing is noisy.
+    This is a shape tripwire for a quadratic regression, not a benchmark.
     """
-    ratio = _growth_ratio(
-        lambda n: "<p>" + ("budget < 2400 and more text here " * (n // 30)) + "</p>")
-    assert ratio < 3.0, f"bare-< prose scaling looks quadratic: {ratio:.2f}x per doubling"
+    _assert_stays_linear(
+        lambda n: "<p>" + ("budget < 2400 and more text here " * (n // 30)) + "</p>",
+        "bare-< prose")
 
 
 def test_unclosed_script_openers_stay_linear():
     """The worst shape on base: `<(script|style).*?</\\1>` backtracks over every
     opener looking for a close that never comes. Base exceeds 30s at the 512KB
     payload cap; a parser is unaffected because it never backtracks."""
-    ratio = _growth_ratio(lambda n: "<p>hi</p>" + ("<script>" * n))
-    assert ratio < 3.0, f"unclosed-opener scaling looks quadratic: {ratio:.2f}x per doubling"
+    _assert_stays_linear(
+        lambda n: "<p>hi</p>" + ("<script>" * n), "unclosed-opener")
 
 
 def test_extraction_never_raises_on_malformed_markup():
