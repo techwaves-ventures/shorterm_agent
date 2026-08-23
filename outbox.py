@@ -400,12 +400,21 @@ def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
                 clauses.append(_t)
                 term_params += _p
             terms = " OR ".join(clauses)
+            # The parentheses around `{terms}` are the guard's scope, not
+            # punctuation. SQL binds AND tighter than OR, so without them the
+            # predicate parses as `(tenant AND site AND item AND in_flight) OR
+            # (already_sent)` and the already-sent half is evaluated against
+            # every row in the table — every item, every tenant. Measured: one
+            # delivered body then refused that exact text for every other guest
+            # in the install, permanently, with the "already under way" sentence
+            # this ticket exists to stop showing. Both flags are set together on
+            # the `/responder/send` path, so the two-clause join is the live one.
             new_id = db.insert_returning_id_maybe(
                 c,
                 f"""{cols} SELECT {','.join('?' * len(vals))}
                     WHERE NOT EXISTS (SELECT 1 FROM outbox sib
                         WHERE sib.tenant_id=? AND sib.site=? AND sib.item_id=?
-                        AND {terms})""",
+                        AND ({terms}))""",
                 (*vals, str(tenant_id), site, str(item_id), *term_params),
             )
         else:

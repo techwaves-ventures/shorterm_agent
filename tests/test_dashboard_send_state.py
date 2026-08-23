@@ -1033,3 +1033,125 @@ def _bodies_for(tenant_id, item_id):
             "AND item_id=? ORDER BY id ASC",
             (str(tenant_id), SITE, str(item_id)),
         ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# VEN-170 review finding: the add()-side guard escaped its tenant/item scope
+# ---------------------------------------------------------------------------
+#
+# `outbox.add` interpolates its two optional clauses into
+#
+#     WHERE sib.tenant_id=? AND sib.site=? AND sib.item_id=? AND {terms}
+#
+# and `terms` OR-joins them when both flags are set. SQL binds AND tighter than
+# OR, so unparenthesized that reads `(tenant AND site AND item AND in_flight)
+# OR (already_sent)` — the already-sent half escapes the scope and is evaluated
+# against every row in the table. `automation.enqueue_send` sets both flags, so
+# it was live on the send button: one delivered body locked that exact text out
+# for every other guest and every other tenant, permanently, behind the very
+# "already under way" sentence this ticket exists to stop showing.
+#
+# The tests above could not see it, and the reason is structural rather than an
+# oversight: every one of them varies the *body* on a single item, where the
+# over-broad predicate and the correct one give the same answer. These hold the
+# body FIXED and vary the item and the tenant, which is the only pair of axes
+# that tells the two predicates apart. The 548-test suite and the 7-mutation
+# battery both ran green on the unfixed tree — the battery because every mutant
+# in it *weakens* the guard, and this defect over-broadens it.
+#
+# Measured one at a time against the unparenthesized head `f8307f1`:
+#   test_a_reply_sent_to_one_guest_does_not_lock_out_another   FAILS
+#   test_the_add_flags_together_stay_inside_their_scope         FAILS
+#   test_the_scoped_replay_is_still_refused                     passes (inverse)
+
+CANNED = "Hi! Yes, the unit is available for those dates. Let me know."
+
+
+def test_a_reply_sent_to_one_guest_does_not_lock_out_another(client, tenant):
+    """AC2 ("a genuinely new reply is still accepted") across two guests.
+
+    The existing AC2 test varies the body on one item. This one holds the body
+    fixed and varies the item, which is where an unscoped predicate shows.
+    """
+    _deal(tenant, "lockout-a", guest="Dana R.")
+    _deal(tenant, "lockout-b", guest="Sam T.")
+
+    assert client.post("/responder/send",
+                       data={"item_id": "lockout-a", "text": CANNED}
+                       ).status_code == 200, "precondition: first send refused"
+    _deliver(tenant, "lockout-a", CANNED)
+
+    # Preconditions: rule out the sibling guards, or a pass proves nothing
+    # about scope. Counted in SQL because `for_tenant` is not item-scoped.
+    assert outbox.in_flight_for_item(tenant, SITE, "lockout-b") is None
+    assert _bodies_for(tenant, "lockout-b") == [], (
+        "precondition: the second guest has no outbox rows at all")
+
+    resp = client.post("/responder/send",
+                       data={"item_id": "lockout-b", "text": CANNED})
+
+    assert resp.status_code == 200, (
+        "a guest who has received nothing was refused the host's standard "
+        f"reply because another guest got it: {resp.status_code} "
+        f"{resp.get_json()}")
+
+
+def test_the_scoped_replay_is_still_refused(client, tenant, monkeypatch):
+    """The inverse: scoping the guard must not defang it.
+
+    Same fixed body as the test above, same delivered state — only the item is
+    the same one. This is the case the guard exists for, and it is what stops
+    "just widen the scope until nothing is refused" from passing as a fix.
+
+    `_sent_state` is stubbed for the reason this ticket already recorded once:
+    it is scoped per-item, so it answers this replay first (with `Sent
+    <stamp>.`) and the write-side predicate — the one whose scoping this whole
+    section is about — is never reached. Measured: without the stub this test
+    passes even on a tree with the guarded branch deleted outright.
+    """
+    import dashboard
+
+    _deal(tenant, "lockout-a", guest="Dana R.")
+    assert client.post("/responder/send",
+                       data={"item_id": "lockout-a", "text": CANNED}
+                       ).status_code == 200
+    _deliver(tenant, "lockout-a", CANNED)
+    assert outbox.in_flight_for_item(tenant, SITE, "lockout-a") is None, (
+        "precondition: nothing in flight, so the in-flight half of the OR "
+        "cannot account for the refusal below")
+    monkeypatch.setattr(dashboard, "_sent_state", lambda *a, **k: "")
+
+    resp = client.post("/responder/send",
+                       data={"item_id": "lockout-a", "text": CANNED})
+
+    assert resp.status_code == 409
+    assert resp.get_json()["error"] == outbox.ALREADY_SENT_LABEL, (
+        "the duplicate refusal must name the duplicate, not a phantom send")
+
+
+def test_the_add_flags_together_stay_inside_their_scope(tenant):
+    """Both flags at the unit level — the only combination that was broken.
+
+    Either flag alone is a single clause with nothing to OR against, so it was
+    always correctly scoped; asserting the single-flag cases would pass on both
+    trees and prove nothing. All three axes are asserted in one test on purpose:
+    the same delivered row must refuse the replay *and* permit the other two,
+    and a fix that trades one for the other is what this is watching for.
+    """
+    def _add(tid, item, body):
+        return outbox.add(tid, SITE, item, sequence="presale", step_id="intro",
+                          step_label="Reply", body=body, reason="r", auto=True,
+                          unless_in_flight=True, unless_body_sent=True)
+
+    first = _add(tenant, "scope-a", CANNED)
+    assert first is not None
+    outbox.set_status(first["id"], outbox.SENDING)
+    outbox.set_status(first["id"], outbox.SENT)
+
+    replay = _add(tenant, "scope-a", CANNED)
+    other_guest = _add(tenant, "scope-b", CANNED)
+    other_tenant = _add("a-different-tenant", "scope-c", CANNED)
+
+    assert replay is None, "precondition: the duplicate guard still holds"
+    assert other_guest is not None, "another guest of this host was locked out"
+    assert other_tenant is not None, "ANOTHER TENANT was locked out"
