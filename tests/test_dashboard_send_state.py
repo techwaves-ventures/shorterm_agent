@@ -973,6 +973,54 @@ def test_duplicate_refusal_does_not_claim_a_send_in_flight(client, tenant):
         f"the duplicate refusal is worded off-script: {error!r}")
 
 
+def test_the_write_refuses_a_replay_the_preread_let_through(client, tenant,
+                                                            monkeypatch):
+    """The guarantee, not the courtesy in front of it.
+
+    Every other test here is answered by the `_sent_state` pre-read, which is
+    the fast legible refusal — and which, being a read, cannot see a send that
+    lands between it and the insert. Measured: with the pre-read left in place,
+    deleting the write-side guard outright (`unless_body_sent` off in
+    `enqueue_send`, or its clause dropped from `add`) broke *nothing* in this
+    file. Those mutations survived a full battery until this test existed.
+
+    Stubbing the pre-read is the only honest way to reach the write from a
+    single-threaded test, and it is the same device the in-flight sibling case
+    next door uses: in production the pre-read passes because the competing send
+    had not landed yet, which is exactly why the insert has to refuse for itself.
+
+    Also the only test standing on the *wording* of the post-write refusal.
+    `in_flight_for_item` returns None for a body duplicate, so this branch fell
+    through to "another send ... was already under way" — about a send that had
+    finished, which is why the replay reached the write at all.
+    """
+    import dashboard
+
+    _deal(tenant, "v7")
+    assert client.post("/responder/send",
+                       data={"item_id": "v7", "text": T2}).status_code == 200
+    _deliver(tenant, "v7", T2)
+    _redraft(tenant, "v7", T3)
+    assert outbox.in_flight_for_item(tenant, SITE, "v7") is None, (
+        "precondition: nothing in flight, so neither the sibling guard nor an "
+        "in-flight wording can account for what this asserts")
+    monkeypatch.setattr(dashboard, "_sent_state", lambda *a, **k: "")
+
+    resp = client.post("/responder/send", data={"item_id": "v7", "text": T2})
+
+    assert resp.status_code == 409, (
+        f"with the pre-read disabled the write let a duplicate through: "
+        f"{resp.status_code} {resp.get_json()}")
+    bodies = [b for _, b in _bodies_for(tenant, "v7")]
+    assert bodies.count(T2) == 1, (
+        f"{bodies.count(T2)} copies queued for one guest: {bodies}")
+    error = resp.get_json()["error"]
+    assert "under way" not in error.lower(), (
+        f"the post-write refusal explained a duplicate as a live send: {error!r}")
+    assert error == outbox.ALREADY_SENT_LABEL, (
+        f"the two refusal sites word one fact differently: {error!r}")
+
+
 def _bodies_for(tenant_id, item_id):
     """Rows for one item read straight from SQL — see `_rows_for`.
 
