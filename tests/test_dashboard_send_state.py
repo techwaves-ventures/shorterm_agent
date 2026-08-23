@@ -767,3 +767,221 @@ def test_the_board_issues_no_more_queries_than_before(client, tenant, monkeypatc
         f"grouped read. A higher number means a whole-table read was added "
         f"alongside it rather than replacing it — raise this deliberately."
     )
+
+
+# ---------------------------------------------------------------------------
+# VEN-170: the guard read the stored draft and the route shipped the posted text
+# ---------------------------------------------------------------------------
+#
+# `_sent_state` promised in its docstring to answer "have these exact words gone
+# out before". Its parameters could not: it was handed `response.draft`, while
+# `/responder/send` delivered the operator's posted `text`. Those two strings are
+# equal right up until a guest reply swaps the stored draft out — which is
+# exactly the moment a tab left open from the previous send is still holding the
+# old one. Replay it and the guard compared the *new* draft against the delivered
+# set, found a difference, and released a byte-identical second copy.
+#
+# So the tests below are all built around one shape: make the proxy diverge from
+# the operand, then act. A test that sends and replays without re-drafting in
+# between passes on the base commit — the accidental agreement of the two is why
+# this survived certification (see `test_replay_before_a_redraft_was_never_the_gap`,
+# which is that control, and is supposed to pass on both trees).
+#
+# Measured against `ce16ee7`, one at a time, in a clean worktree:
+#   test_stale_tab_replay_after_redraft_is_refused          FAILS on base
+#   test_thread_reopens_for_genuinely_new_words             passes on base (inverse)
+#   test_retry_refuses_a_body_already_delivered             FAILS on base
+#   test_approve_with_edited_text_matching_a_sent_body      FAILS on base
+#   test_duplicate_refusal_does_not_claim_a_send_in_flight  FAILS on base
+#   test_replay_before_a_redraft_was_never_the_gap          passes on base (control)
+
+
+def _deliver(tenant_id, item_id, body, *, sent_at="2026-08-23T10:00:00"):
+    """Finish a send the way `runner._send_worker` finishes one.
+
+    Both halves matter. The outbox row going `sent` is what `sent_bodies` reads;
+    the response row being re-stamped `status="sent", draft=<body>` is what made
+    the old guard *look* right, because it left the stored draft equal to the
+    text just delivered.
+    """
+    rows = [r for r in outbox.rows_by_item(tenant_id, SITE)[item_id]
+            if r["body"] == body and r["status"] != outbox.SENT]
+    assert rows, f"precondition: no unsent row carrying {body[:30]!r} to deliver"
+    outbox.set_status(rows[0]["id"], outbox.SENT)
+    storage.update_response(tenant_id, SITE, item_id, status="sent", draft=body,
+                            sent_at=sent_at)
+
+
+def _redraft(tenant_id, item_id, body):
+    """The guest replied, so a fresh draft replaces the delivered one.
+
+    This is the ordinary, *correct* reopening of a thread — not an edge case.
+    It is also the only step that separates the stored draft from the words the
+    guest actually has, which is the whole of the defect.
+    """
+    storage.update_response(tenant_id, SITE, item_id, status="draft", draft=body,
+                            sent_at="")
+
+
+T2 = "Hi Dana, yes the unit is free from June 1. Rent is $2,400/mo."
+T3 = "Hi Dana, parking is included and there's a spot out front."
+
+
+def test_stale_tab_replay_after_redraft_is_refused(client, tenant):
+    """The filed defect, through the real routes.
+
+    Send edited text, deliver it, let a guest reply produce a new draft, then
+    replay the old text from a tab that never saw any of that. The guest must
+    not receive the same words twice.
+    """
+    _deal(tenant, "v1")
+    assert client.post("/responder/send",
+                       data={"item_id": "v1", "text": T2}).status_code == 200, (
+        "precondition: the first send must be accepted")
+    _deliver(tenant, "v1", T2)
+    _redraft(tenant, "v1", T3)
+    assert storage.get_responses(tenant, SITE)["v1"]["draft"] == T3, (
+        "precondition: the stored draft has moved on, so the old guard's proxy "
+        "and its real operand now disagree — without this the test is vacuous")
+
+    resp = client.post("/responder/send", data={"item_id": "v1", "text": T2})
+
+    assert resp.status_code == 409, (
+        f"a stale tab replayed text the guest already had and was answered "
+        f"{resp.status_code}: {resp.get_json()}")
+    bodies = [b for _, b in _bodies_for(tenant, "v1")]
+    assert bodies.count(T2) == 1, (
+        f"{bodies.count(T2)} copies of the same message queued for one guest: "
+        f"{bodies}")
+
+
+def test_thread_reopens_for_genuinely_new_words(client, tenant):
+    """The inverse, and the release gate.
+
+    A guard keyed on "has this guest ever been sent something" would pass the
+    test above and silently stop the product from ever answering a lead twice.
+    That failure is worse than the duplicate — it is invisible to the operator,
+    and it looks like nothing happening. Different words must still go out.
+    """
+    _deal(tenant, "v2")
+    assert client.post("/responder/send",
+                       data={"item_id": "v2", "text": T2}).status_code == 200
+    _deliver(tenant, "v2", T2)
+    _redraft(tenant, "v2", T3)
+
+    resp = client.post("/responder/send", data={"item_id": "v2", "text": T3})
+
+    assert resp.status_code == 200, (
+        f"the thread could not reopen: a genuinely new reply was refused "
+        f"{resp.status_code} {resp.get_json()} — this is a lockout, not a fix")
+    bodies = [b for _, b in _bodies_for(tenant, "v2")]
+    assert T3 in bodies, f"the new reply was not queued: {bodies}"
+
+
+def test_replay_before_a_redraft_was_never_the_gap(client, tenant):
+    """Control: this one passes on the base commit too, and must keep passing.
+
+    Replay the delivered text *without* a guest reply in between and the stored
+    draft still happens to equal it, so even the old proxy-based guard refuses.
+    Kept explicitly so nobody reads the test above as "replays were unguarded" —
+    they were guarded exactly while the proxy and the operand agreed, which is
+    the general shape worth remembering: a guard reading a stand-in for the real
+    operand passes every test that never makes the two diverge.
+    """
+    _deal(tenant, "v3")
+    assert client.post("/responder/send",
+                       data={"item_id": "v3", "text": T2}).status_code == 200
+    _deliver(tenant, "v3", T2)
+    assert storage.get_responses(tenant, SITE)["v3"]["draft"] == T2, (
+        "precondition: no re-draft, so the stored draft still equals the "
+        "delivered text — that agreement is what this control is about")
+
+    resp = client.post("/responder/send", data={"item_id": "v3", "text": T2})
+    assert resp.status_code == 409, f"unexpected {resp.status_code}"
+
+
+def test_retry_refuses_a_body_already_delivered(client, tenant):
+    """`/outbox/<id>/retry` releases to a guest too, so it takes the same rule.
+
+    A failed row whose text a *sibling* already delivered — the send that
+    succeeded on a later attempt while this row's error was still on screen.
+    Retrying it re-delivers words the guest has.
+    """
+    _deal(tenant, "v4")
+    delivered_id = _row(tenant, "v4", outbox.SENT, body=T2)
+    failed_id = _row(tenant, "v4", outbox.FAILED, body=T2)
+    assert outbox.get(delivered_id)["status"] == outbox.SENT
+    assert outbox.in_flight_for_item(tenant, SITE, "v4") is None, (
+        "precondition: nothing in flight, so only the body guard can refuse — "
+        "otherwise the sibling guard answers this and the test proves nothing")
+
+    resp = client.post(f"/outbox/{failed_id}/retry")
+
+    assert resp.status_code == 409, (
+        f"a failed row was re-queued with words the guest already had: "
+        f"{resp.status_code} {resp.get_json()}")
+    assert outbox.get(failed_id)["status"] == outbox.FAILED, (
+        "the row was released despite the 409 — the refusal is not on the write")
+
+
+def test_approve_with_edited_text_matching_a_sent_body_is_refused(client, tenant):
+    """The `COALESCE` branch: approve carries its own body, retry does not.
+
+    One guard term serves both, so the edited text — not the row's stored body —
+    has to be what the UPDATE compares. Seeded so the row's own body is *new*
+    and only the operator's edit is a duplicate: if the guard read the row
+    instead of the edit, this would pass while the guest got two copies.
+    """
+    _deal(tenant, "v5")
+    _row(tenant, "v5", outbox.SENT, body=T2)
+    pending_id = _row(tenant, "v5", outbox.PENDING, body=T3)
+    assert outbox.get(pending_id)["body"] == T3, (
+        "precondition: the row's own body is not the duplicate; only the edit is")
+    assert outbox.in_flight_for_item(tenant, SITE, "v5") is None
+
+    resp = client.post(f"/outbox/{pending_id}/approve", data={"text": T2})
+
+    assert resp.status_code == 409, (
+        f"approve released an operator edit the guest already had: "
+        f"{resp.status_code} {resp.get_json()}")
+    assert outbox.get(pending_id)["status"] == outbox.PENDING
+
+
+def test_duplicate_refusal_does_not_claim_a_send_in_flight(client, tenant):
+    """The refusal has to name the real reason.
+
+    With the guard in place the replay is correctly refused — and then explained
+    by `in_flight_for_item`, which returns None for a body duplicate, so the
+    route fell through to a hardcoded "another send ... was already under way".
+    Nothing is under way; the send finished, which is *why* the replay got this
+    far. This is the only test standing on that sentence.
+    """
+    _deal(tenant, "v6")
+    assert client.post("/responder/send",
+                       data={"item_id": "v6", "text": T2}).status_code == 200
+    _deliver(tenant, "v6", T2)
+    _redraft(tenant, "v6", T3)
+    assert outbox.in_flight_for_item(tenant, SITE, "v6") is None, (
+        "precondition: nothing is in flight, so any in-flight wording is false")
+
+    error = client.post("/responder/send",
+                        data={"item_id": "v6", "text": T2}).get_json()["error"]
+
+    assert "under way" not in error.lower(), (
+        f"a duplicate was explained as a send still in progress: {error!r}")
+    assert error == outbox.ALREADY_SENT_LABEL, (
+        f"the duplicate refusal is worded off-script: {error!r}")
+
+
+def _bodies_for(tenant_id, item_id):
+    """Rows for one item read straight from SQL — see `_rows_for`.
+
+    Deliberately not `rows_by_item`: these tests must fail on the base commit
+    for the filed reason, not with an AttributeError on an API base lacks.
+    """
+    with outbox._conn() as c:
+        return c.execute(
+            "SELECT id, body FROM outbox WHERE tenant_id=? AND site=? "
+            "AND item_id=? ORDER BY id ASC",
+            (str(tenant_id), SITE, str(item_id)),
+        ).fetchall()

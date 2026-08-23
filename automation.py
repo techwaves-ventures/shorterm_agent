@@ -438,6 +438,14 @@ def enqueue_send(tenant_id: str, site: str, item_id: str, body: str,
         # inserted, and both inserted. Same rule as `outbox.release_to_send`,
         # insert-shaped instead of update-shaped.
         unless_in_flight=True,
+        # And nothing rather than words this guest already has. The flag above
+        # only sees a delivery still under way, so it is blind to a replay that
+        # arrives once the first send has settled: a stale tab re-POSTs the text
+        # it was opened with, and the caller's pre-read compares that against a
+        # stored draft which has since moved on. Same rule, different axis — not
+        # "two at once" but "the same words twice". See
+        # `outbox._already_sent_terms`.
+        unless_body_sent=True,
     )
     if msg is None:
         return None

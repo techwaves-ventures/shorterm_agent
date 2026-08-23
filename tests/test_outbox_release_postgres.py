@@ -85,9 +85,9 @@ def pg_outbox(monkeypatch):
     importlib.reload(outbox)
 
 
-def _seed(outbox, item_id, status):
+def _seed(outbox, item_id, status, body="b"):
     msg = outbox.add("t1", SITE, item_id, sequence="presale", step_id="intro",
-                     step_label="Intro", body="b", auto=False)
+                     step_label="Intro", body=body, auto=False)
     if msg["status"] != status:
         outbox.set_status(msg["id"], status)
     return outbox.get(msg["id"])
@@ -146,6 +146,63 @@ def test_two_approvals_racing_on_postgres_cannot_both_win(pg_outbox):
     )
 
 
+def test_replays_of_a_delivered_body_race_and_none_get_through(pg_outbox):
+    """VEN-170's guard on the backend that runs it — both shapes, 4 racing each.
+
+    The stale-tab replay is not itself a race: the send it duplicates has long
+    since settled, so a single-threaded check would find the guard. Racing it
+    anyway is what proves the *predicate* survives concurrency on Postgres,
+    where under READ COMMITTED each statement gets its own snapshot and a
+    `NOT EXISTS` evaluated outside `db.lock_key` is not a compare-and-set at
+    all — the failure mode that breached the sibling guard 15/15.
+
+    SQLite cannot answer this question; its writer lock serialises these anyway,
+    so a green run there says nothing about the deployed backend.
+    """
+    outbox = pg_outbox
+    delivered = "the words the guest already has"
+
+    # --- insert-shaped: four tabs replaying the same posted text -------------
+    sent = _seed(pg_outbox, "r1", outbox.SENT, body=delivered)
+    assert outbox.get(sent["id"])["status"] == outbox.SENT
+    assert outbox.in_flight_for_item("t1", SITE, "r1") is None, (
+        "precondition: the earlier send has settled, so nothing is in flight "
+        "and only the body guard can refuse these replays")
+    made = {}
+
+    def replay(i):
+        made[i] = outbox.add("t1", SITE, "r1", sequence="presale",
+                             step_id="intro", step_label="Reply",
+                             body=delivered, auto=True,
+                             unless_in_flight=True, unless_body_sent=True)
+
+    _race(replay, n=4)
+    got_through = [i for i, v in made.items() if v is not None]
+    assert not got_through, (
+        f"{len(got_through)}/4 racing replays queued a message this guest had "
+        f"already received: {made}")
+
+    # --- update-shaped: four retries of failed rows carrying that body ------
+    sent2 = _seed(pg_outbox, "r2", outbox.SENT, body=delivered)
+    assert outbox.get(sent2["id"])["status"] == outbox.SENT
+    failed = [_seed(pg_outbox, "r2", outbox.FAILED, body=delivered)
+              for _ in range(4)]
+    assert outbox.in_flight_for_item("t1", SITE, "r2") is None, (
+        "precondition: failed rows are not in flight")
+    released = {}
+
+    def retry(i):
+        released[i] = outbox.release_to_send(
+            failed[i]["id"], from_statuses=(outbox.FAILED,))[0]
+
+    _race(retry, n=4)
+    assert not any(released.values()), (
+        f"{sum(bool(v) for v in released.values())}/4 racing retries re-queued a "
+        f"body already delivered to this guest: {released}")
+    assert _in_flight(outbox, "r2") == 0, (
+        f"{_in_flight(outbox, 'r2')} rows in flight after four refused retries")
+
+
 def test_two_sends_racing_on_postgres_cannot_both_queue(pg_outbox):
     """The INSERT-shaped guard — the `/responder/send` path. 15/15 breached."""
     outbox = pg_outbox
@@ -185,11 +242,33 @@ def test_the_guard_does_not_strand_delivery_on_postgres(pg_outbox):
     outbox.set_status(lone["id"], outbox.SENT)
     assert outbox.get(lone["id"])["status"] == outbox.SENT
 
-    # With nothing in flight, a fresh message is released normally.
-    nxt = _seed(pg_outbox, "s1", outbox.PENDING)
+    # With nothing in flight, a fresh message is released normally. "Fresh" now
+    # has to mean different *words*, not merely a different row: VEN-170 added a
+    # body guard, and this fixture seeded every row with the same body, so the
+    # message this line calls fresh was byte-for-byte the one already delivered.
+    # Left at "b" the assertion would have gone on passing only while the guard
+    # was absent — and the stranding it is here to catch would look identical.
+    nxt = _seed(pg_outbox, "s1", outbox.PENDING, body="b2")
     released, row = outbox.release_to_send(nxt["id"],
                                            from_statuses=outbox.APPROVABLE)
     assert released is True and row["status"] == outbox.QUEUED
+
+    # ...and the other half of that distinction, so narrowing the guard back to
+    # "nothing in flight" cannot pass this file: same words as a delivered row
+    # is refused, on the backend where the predicate is a real CAS.
+    #
+    # Settle that release first. Left queued it would block the next one all by
+    # itself through `unless_sibling_in_flight`, and the assertion below would
+    # hold with no body guard in the code at all — a green test measuring the
+    # wrong predicate. State the precondition rather than trusting it.
+    outbox.set_status(nxt["id"], outbox.SENT)
+    assert outbox.in_flight_for_item("t1", SITE, "s1") is None, (
+        "precondition: nothing in flight, so only the body guard can refuse")
+    dup = _seed(pg_outbox, "s1", outbox.PENDING, body="b")
+    released, _ = outbox.release_to_send(dup["id"],
+                                         from_statuses=outbox.APPROVABLE)
+    assert released is False, (
+        "a body already delivered to this guest was released a second time")
 
 
 # --------------------------------------------------------------------------

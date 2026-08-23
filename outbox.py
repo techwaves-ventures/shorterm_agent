@@ -220,6 +220,41 @@ def _in_flight_terms(alias: str) -> tuple[str, list]:
     return (f"({alias}.status=? OR {alias}.status=?)", [QUEUED, SENDING])
 
 
+def _already_sent_terms(alias: str, body: str | None,
+                        body_expr: str = "?") -> tuple[str, list]:
+    """SQL for "this guest already has these exact words".
+
+    The twin of `_in_flight_terms`, and deliberately a *different* question.
+    That one answers "will this guest be written to", which is about a delivery
+    still to come; this one answers "does this guest already have these words",
+    which is about one that has landed. A thread legitimately reopens — a guest
+    replies, a fresh draft goes out — so "has ever sent" is the wrong test and
+    would be a lockout. Only the body identifies a duplicate.
+
+    Enforced on the write for the reason every other guard here moved onto the
+    write: the route that owned this rule kept it as a pre-read, and a pre-read
+    can only see the operand it is handed. `/responder/send` handed it the
+    *stored* draft while shipping the operator's *posted* text, so a stale tab
+    replaying text the guest already had was compared against a draft that had
+    since moved on, found different, and released a byte-identical second copy.
+    A guard whose docstring names one operand and whose parameters name another
+    passes every test where the two coincide — which is every test that does
+    not re-draft in between.
+
+    `body_expr` is how one term serves both shapes. Retry releases a row with no
+    new text, so its comparand is the row's own body; approve-with-edit supplies
+    one. `set_status` passes `COALESCE(?, outbox.body)` and gets both from a
+    single definition rather than two that can drift.
+
+    Compares the body exactly as stored. Do not reach for SQL `TRIM()` to make
+    this forgiving: it strips spaces only, where Python's `.strip()` also takes
+    newlines and tabs, and a guard normalising one way against text normalised
+    the other is a guard that silently misses. `/responder/send` strips before
+    it queues, so both copies of a replay are already byte-identical.
+    """
+    return (f"({alias}.status=? AND {alias}.body={body_expr})", [SENT, body])
+
+
 def _row_in_flight(row: dict) -> bool:
     """`_in_flight_terms` for a row already in hand — same rule, Python side.
 
@@ -313,7 +348,8 @@ def _governing_rank(row: dict, now_iso: str) -> tuple:
 def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
         step_label: str, body: str, auto: bool, reason: str = "",
         scheduled_at: str | None = None,
-        unless_in_flight: bool = False) -> dict | None:
+        unless_in_flight: bool = False,
+        unless_body_sent: bool = False) -> dict | None:
     """Queue a drafted step. `auto=True` skips the approval gate (goes straight
     to `queued`); otherwise it waits for a human in `pending_approval`.
 
@@ -328,6 +364,12 @@ def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
     inserted: measured, that put two messages in front of one guest in 149 of
     150 concurrent pairs. The test and the write are now one statement.
 
+    `unless_body_sent=True` writes nothing if this item already has a `sent` row
+    carrying this exact body — the insert-shaped half of the duplicate guard
+    (`_already_sent_terms`), covering the send button's stale-tab replay. Both
+    flags are separate questions and either one arms the guarded branch; they
+    are OR'd, so asking for both refuses on either.
+
     Left off by default because a drafting caller queueing several steps for one
     item is ordinary and not a double-send; it is the *release* paths that must
     not stack.
@@ -341,13 +383,23 @@ def add(tenant_id: str, site: str, item_id: str, *, sequence: str, step_id: str,
             body, status, 1 if auto else 0, reason,
             scheduled_at or timeframe.now(), now, now if auto else None)
     with _conn() as c:
-        if unless_in_flight:
+        if unless_in_flight or unless_body_sent:
             # Same reason as the update-shaped guard, and more sharply: this one
             # is partly about a row that does not exist yet, so no row lock could
             # cover it. Two concurrent inserts each found NOT EXISTS true on
             # their own snapshot and both wrote — 15/15 on PG. See `db.lock_key`.
             db.lock_key(c, _item_key(tenant_id, site, item_id))
-            terms, term_params = _in_flight_terms("sib")
+            clauses: list[str] = []
+            term_params: list = []
+            if unless_in_flight:
+                _t, _p = _in_flight_terms("sib")
+                clauses.append(_t)
+                term_params += _p
+            if unless_body_sent:
+                _t, _p = _already_sent_terms("sib", body)
+                clauses.append(_t)
+                term_params += _p
+            terms = " OR ".join(clauses)
             new_id = db.insert_returning_id_maybe(
                 c,
                 f"""{cols} SELECT {','.join('?' * len(vals))}
@@ -457,6 +509,34 @@ def in_flight_for_item(tenant_id: str, site: str, item_id: str, *,
     return _row(row)
 
 
+ALREADY_SENT_LABEL = "This guest already received this message."
+
+
+def body_already_sent(tenant_id: str, site: str, item_id: str, body: str, *,
+                      exclude_id: int | None = None) -> bool:
+    """Has this guest already been sent these exact words?
+
+    `in_flight_for_item`'s counterpart, with the same standing order: callers
+    use it to *explain* a refusal, never to decide one. Deciding from a read is
+    the check-then-act race the write-side guard exists to close, and this
+    ticket is what happens when a route decides from a read anyway.
+
+    Shares `_already_sent_terms` with the writes it explains, so it cannot start
+    describing a refusal the guard no longer makes. `exclude_id` mirrors that
+    predicate's `sib.id<>outbox.id` — a retried row is not its own duplicate,
+    and without this a failed row would be reported as blocking itself.
+    """
+    terms, term_params = _already_sent_terms("outbox", body)
+    sql = (f"SELECT 1 FROM outbox WHERE tenant_id=? AND site=? AND item_id=? "
+           f"AND {terms}")
+    params: list = [str(tenant_id), site, str(item_id), *term_params]
+    if exclude_id is not None:
+        sql += " AND id<>?"
+        params.append(exclude_id)
+    with _conn() as c:
+        return c.execute(f"{sql} LIMIT 1", params).fetchone() is not None
+
+
 def release_to_send(msg_id: int, *, from_statuses: tuple, body: str | None = None,
                     error: str | None = None) -> tuple[bool, dict | None]:
     """Release exactly one row to the send queue — guard and write in one UPDATE.
@@ -479,7 +559,7 @@ def release_to_send(msg_id: int, *, from_statuses: tuple, body: str | None = Non
     (several drafted steps per item is ordinary there), not something this
     guard closes. A new caller that wants the rule must ask for it.
 
-    Two conditions, both in the WHERE clause rather than in a preceding read:
+    Three conditions, all in the WHERE clause rather than in a preceding read:
 
     * `from_statuses` — the row itself must still be in a state it may be
       released from. Read-then-write let a double-click release a `sent` row
@@ -488,6 +568,11 @@ def release_to_send(msg_id: int, *, from_statuses: tuple, body: str | None = Non
       rows, and releasing the quiet one while a drainer delivers the other puts
       a second message into a live thread. Read-then-write here was measurably
       racy: two concurrent approves of two rows both answered 200.
+    * no *sent* sibling already carrying the body this would deliver. The two
+      tests above are about collisions between deliveries; this one is about the
+      guest reading the same words twice, which neither of them sees — a replay
+      that arrives after the earlier send has settled finds nothing in flight.
+      See `_already_sent_terms`.
 
     Transitions that move a row *already in flight* (the drainer claiming
     `queued`→`sending`, `reclaim_stuck_sending`, `release_unattempted`) do not
@@ -496,7 +581,8 @@ def release_to_send(msg_id: int, *, from_statuses: tuple, body: str | None = Non
     strand them.
     """
     released = set_status(msg_id, QUEUED, body=body, error=error,
-                          only_from=from_statuses, unless_sibling_in_flight=True)
+                          only_from=from_statuses, unless_sibling_in_flight=True,
+                          unless_body_sent=True)
     return released, get(msg_id)
 
 
@@ -621,7 +707,8 @@ def next_queued(tenant_id: str | None = None,
 
 def set_status(msg_id: int, status: str, *, error: str | None = None,
                body: str | None = None, only_from: tuple | None = None,
-               unless_sibling_in_flight: bool = False) -> bool:
+               unless_sibling_in_flight: bool = False,
+               unless_body_sent: bool = False) -> bool:
     """Write one row's status. Returns True iff this call is what wrote it.
 
     The two optional guards turn the write into a compare-and-set: they are
@@ -632,6 +719,11 @@ def set_status(msg_id: int, status: str, *, error: str | None = None,
     `only_from` — refuse unless the row is still in one of these statuses.
     `unless_sibling_in_flight` — refuse if any *other* row for the same item is
     `queued` or `sending`. See `release_to_send`, which is how routes reach it.
+    `unless_body_sent` — refuse if any *other* row for the same item is `sent`
+    carrying the body this release would deliver: `body` when the caller supplies
+    one (approve-with-edit), otherwise the row's own (retry). See
+    `_already_sent_terms`, and note the comparand is resolved in SQL rather than
+    here, so the choice cannot drift from the guard.
     """
     sets = ["status=?"]
     vals: list = [status]
@@ -682,9 +774,22 @@ def set_status(msg_id: int, status: str, *, error: str | None = None,
             "AND sib.site=outbox.site AND sib.item_id=outbox.item_id "
             f"AND sib.id<>outbox.id AND {terms})")
         vals += term_params
+    if unless_body_sent:
+        # Correlated the same way, and for the same reason: a preceding read
+        # cannot answer "may these words go out" for the statement that sends
+        # them. `COALESCE(?, outbox.body)` reads the row's *pre-update* body —
+        # WHERE is evaluated before SET — so retry compares the text it is about
+        # to re-deliver, not whatever a concurrent write left behind.
+        terms, term_params = _already_sent_terms(
+            "sib", body, "COALESCE(?, outbox.body)")
+        where.append(
+            "NOT EXISTS (SELECT 1 FROM outbox sib WHERE sib.tenant_id=outbox.tenant_id "
+            "AND sib.site=outbox.site AND sib.item_id=outbox.item_id "
+            f"AND sib.id<>outbox.id AND {terms})")
+        vals += term_params
 
     with _conn() as c:
-        if unless_sibling_in_flight:
+        if unless_sibling_in_flight or unless_body_sent:
             # Serialize against anything else releasing for this same item before
             # the predicate is evaluated. Reading the row's identity first is
             # safe: an outbox row never changes item. Whoever loses the race for
