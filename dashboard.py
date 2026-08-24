@@ -958,12 +958,28 @@ def _entry_text(item: dict) -> str:
     return ""
 
 
-def _sent_state(tenant_id: str, item_id: str, response: dict | None) -> str:
+def _sent_state(tenant_id: str, item_id: str, response: dict | None,
+                text: str | None = None) -> str:
     """Why the approve-and-send control must not be offered, or "" if it may be.
 
     Two distinct "already handled" cases, both of which previously still showed
     an enabled Approve & send button over the text that had just gone out:
     a reply that has been delivered, and one that is queued or mid-flight.
+
+    Two callers asking two different questions, so they must hand in two
+    different operands. The renderer asks *"should I offer the button?"* about
+    the draft on screen and passes nothing, so this falls back to the stored
+    draft — the right answer for a page that is showing exactly that text. The
+    send route asks *"may these words go out?"* and must pass `text`, because
+    the words that reach the guest are the ones in the operator's textarea,
+    which the stored draft stops tracking the moment a guest reply produces a
+    fresh one. Reading the draft for both is this ticket's defect: a stale tab
+    replaying delivered text was compared against a draft that had moved on,
+    found different, and released a second copy of a message the guest had.
+
+    This stays a pre-read, and it is not the guarantee — it is the fast, legible
+    refusal in front of one. The guarantee is `outbox._already_sent_terms`, on
+    the write, where a concurrent send cannot slip between the test and the act.
     """
     state = outbox.send_state(outbox.rows_by_item(tenant_id, SITE).get(item_id))
     if state and state["in_flight"]:
@@ -980,12 +996,20 @@ def _sent_state(tenant_id: str, item_id: str, response: dict | None) -> str:
     # whether these exact words have gone out before. Comparing the text rather
     # than merely "has ever sent" is what still lets the thread reopen: a fresh
     # draft for the guest's new question is different text, and is offered.
-    draft = ((response or {}).get("draft") or "").strip()
+    words = ((response or {}).get("draft") if text is None else text) or ""
+    words = words.strip()
     delivered = [b.strip() for b in outbox.sent_bodies(tenant_id, SITE, item_id)]
-    if delivered and (not draft or draft in set(delivered)):
-        # Either these exact words already went out, or a reply went out and
-        # there is no new draft to put in its place (a failed re-draft clears
-        # it). Neither is something to offer a send button for.
+    if delivered and words and words in set(delivered):
+        # These exact words already went out. Worded through the same constant
+        # the write-side refusal uses, so the route cannot answer one fact two
+        # ways depending on which of its guards happened to fire first.
+        return outbox.ALREADY_SENT_LABEL
+    if delivered and not words:
+        # A reply went out and there is no new draft to put in its place (a
+        # failed re-draft clears it) — nothing to offer a send button *for*.
+        # Only the renderer can reach this: the send route rejects empty text
+        # before it gets here, and having been handed words explicitly, an empty
+        # stored draft says nothing about whether they may go out.
         return "Sent."
     return ""
 
@@ -1125,8 +1149,35 @@ def _own_message_or_404(tenant_id: str, msg_id: int) -> dict:
     return msg
 
 
+def _send_refusal(tenant_id: str, item_id: str, body: str | None, *,
+                  exclude_id: int | None = None) -> str:
+    """Why a release the write already refused was refused — in the one place.
+
+    Every operator-initiated send path carries the same two guards, so it must
+    carry the same two explanations; the send button reaching for its own
+    sentence is how a body-duplicate refusal came to announce that "another send
+    for this guest was already under way" when nothing was under way at all —
+    the send had finished, which is precisely why the replay got this far.
+
+    Order is deliberate. An in-flight blocker is named first because it is the
+    one the operator can act on: it is rendered on the board with a working
+    "Don't send", so naming it points at the way out. A duplicate has no such
+    escape and saying so is the whole of the answer.
+    """
+    blocker = outbox.in_flight_for_item(tenant_id, SITE, item_id,
+                                        exclude_id=exclude_id)
+    if blocker:
+        return outbox.row_label(blocker)
+    if body and outbox.body_already_sent(tenant_id, SITE, item_id, body,
+                                         exclude_id=exclude_id):
+        return outbox.ALREADY_SENT_LABEL
+    # Refused, yet nothing explains it any more — the blocking row settled
+    # between the write and this read. Don't invent a reason; say what is true.
+    return "Another send for this guest was already under way."
+
+
 def _release_refusal(tenant_id: str, msg: dict | None, msg_id: int,
-                     from_statuses: tuple) -> str:
+                     from_statuses: tuple, body: str | None = None) -> str:
     """Word a refusal `outbox.release_to_send` has already decided.
 
     Read *after* the write refused, never before it: this is the explanation,
@@ -1138,18 +1189,18 @@ def _release_refusal(tenant_id: str, msg: dict | None, msg_id: int,
     clicking its sibling popped `already "Queued to send…"` — the same row named
     two ways on two surfaces, which is this ticket's own defect one layer up.
     The refusal is still decided by the write; only the wording is shared.
+
+    `body` is the text this release would have delivered — the edited text where
+    the caller supplied one, otherwise None, meaning the row's own. It mirrors
+    the `COALESCE` in the guard, so the sentence resolves the same comparand the
+    UPDATE did rather than a second guess at it.
     """
     if not msg:
         return "That message is no longer there."
     if msg["status"] not in from_statuses:
         return outbox.row_label(msg)
-    blocker = outbox.in_flight_for_item(tenant_id, SITE, msg["item_id"],
-                                        exclude_id=msg_id)
-    if blocker:
-        return outbox.row_label(blocker)
-    # Refused, yet nothing explains it any more — the blocking row settled
-    # between the UPDATE and this read. Don't invent a reason; say what is true.
-    return "Another send for this guest was already under way."
+    return _send_refusal(tenant_id, msg["item_id"], body or msg.get("body"),
+                         exclude_id=msg_id)
 
 
 @app.route("/outbox/<int:msg_id>/approve", methods=["POST"])
@@ -1171,12 +1222,14 @@ def outbox_approve(msg_id):
     # a thread mid-delivery). Read-then-write let two concurrent approves both
     # answer 200 with two rows in flight; the guards are now WHERE terms on the
     # UPDATE, so exactly one call can win. See `outbox.release_to_send`.
+    body = (text or "").strip() or None
     released, msg = outbox.release_to_send(
-        msg_id, from_statuses=outbox.APPROVABLE, body=(text or "").strip() or None)
+        msg_id, from_statuses=outbox.APPROVABLE, body=body)
     if not released:
         return jsonify({"ok": False, "already": True,
                         "error": _release_refusal(
-                            tenant_id, msg, msg_id, outbox.APPROVABLE)}), 409
+                            tenant_id, msg, msg_id, outbox.APPROVABLE,
+                            body=body)}), 409
     automation.start_drainer(SITE)  # deliver in the background; don't block the click
     return jsonify({"ok": True, "counts": outbox.counts(tenant_id, SITE)})
 
@@ -1379,8 +1432,12 @@ def responder_send():
     # Hiding the button is not a guard: a double-click, a stale tab or a
     # back-button replay all re-POST this, and every one of them used to put a
     # second copy of the same message in front of the guest.
+    # Ask about the text being *posted*, not the one in storage. They are the
+    # same string right up until a guest reply swaps the draft out, and that is
+    # exactly when the stale tab this guards against still holds the old one.
     blocked = _sent_state(tenant_id, item_id,
-                          storage.get_responses(tenant_id, SITE).get(item_id))
+                          storage.get_responses(tenant_id, SITE).get(item_id),
+                          text=text.strip())
     if blocked:
         return jsonify({"ok": False, "already": True, "error": blocked}), 409
     msg = automation.enqueue_send(tenant_id, SITE, item_id, text.strip())
@@ -1389,15 +1446,14 @@ def responder_send():
         # between it and the insert — two clicks both passed it and both queued.
         # `enqueue_send` now refuses at the write, and this is that refusal:
         # same 409 as the pre-read, because to the operator it is the same fact.
-        # Worded through `row_label`, like the pre-read guard above it — this
-        # route carries the same refusal twice, and reaching for the raw
-        # mapping here meant it answered one fact with two different strings
-        # depending on which of its two guards happened to fire.
-        blocker = outbox.in_flight_for_item(tenant_id, SITE, item_id)
-        return jsonify({"ok": False, "already": True, "error": (
-            outbox.row_label(blocker)
-            if blocker else "Another send for this guest was already under way."
-        )}), 409
+        # Worded through `_send_refusal`, like every other release path — this
+        # route carries the same refusal twice, and answering it here on its own
+        # meant a duplicate got explained as a send still under way, about a
+        # send that had already finished.
+        return jsonify({
+            "ok": False, "already": True,
+            "error": _send_refusal(tenant_id, item_id, text.strip()),
+        }), 409
     return jsonify({
         "ok": True,
         "queued": True,
