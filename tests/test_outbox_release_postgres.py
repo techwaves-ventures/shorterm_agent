@@ -433,3 +433,137 @@ def test_add_guard_does_not_escape_its_tenant_item_scope(pg_outbox):
     assert add("t1", "A") is None, "precondition: the duplicate guard still holds"
     assert add("t1", "B") is not None, "another guest was locked out on PG"
     assert add("t2", "A") is not None, "ANOTHER TENANT was locked out on PG"
+
+
+# --------------------------------------------------------------------------
+# VEN-181: the axes the batteries above never varied, on the deployed backend
+# --------------------------------------------------------------------------
+#
+# Mirrors of the three tests added to `tests/test_dashboard_send_state.py`.
+# They are asserted here for the reason the whole file exists: the predicates
+# these pin are the ones `DEPLOY.md` says run on Postgres, and the correlated
+# `NOT EXISTS` in `set_status` is evaluated under `db.lock_key` on this backend
+# and under a writer lock on SQLite. "Identical on both" is worth measuring.
+#
+# The tenant axis of `unless_sibling_in_flight` is the one that bites; the site
+# axis is a term proven before a second slug is live (both site modules report
+# `SITE_NAME = "furnishedfinder"` today).
+
+OTHER_SITE = "a-second-site"
+
+
+def _sent_row_count(ob):
+    with ob._conn() as c:
+        return c.execute("SELECT COUNT(*) FROM outbox WHERE status=?",
+                         (ob.SENT,)).fetchone()[0]
+
+
+def test_in_flight_guard_stays_inside_its_tenant_item_site_scope_on_postgres(
+        pg_outbox):
+    """The sibling guard crosses one axis at a time on real Postgres."""
+    ob = pg_outbox
+    with ob._conn() as c:
+        assert c.pg, "positive control: this fixture is not actually on Postgres"
+
+    body = "Hi! Yes, the unit is available for those dates."
+    blocker_body = "Hi! Checking with my co-host, will confirm tonight."
+
+    def pending(tid, site, item, text):
+        return ob.add(tid, site, item, sequence="presale", step_id="intro",
+                      step_label="Reply", body=text, auto=False)
+
+    blocker = ob.add("t1", SITE, "if-scope-a", sequence="presale",
+                     step_id="intro", step_label="Reply", body=blocker_body,
+                     auto=True)
+    replay = pending("t1", SITE, "if-scope-a", body)
+    other_item = pending("t1", SITE, "if-scope-b", body)
+    other_tenant = pending("t2", SITE, "if-scope-a", body)
+    other_site = pending("t1", OTHER_SITE, "if-scope-a", body)
+
+    assert ob.get(blocker["id"])["status"] == ob.QUEUED, (
+        "precondition: the blocker is not in flight on PG")
+    assert _sent_row_count(ob) == 0, (
+        "precondition: a delivered row would let `unless_body_sent` answer "
+        "these releases and all three in-flight axes would go unpinned")
+    assert ob.in_flight_for_item("t1", SITE, "if-scope-b") is None
+    assert ob.in_flight_for_item("t2", SITE, "if-scope-a") is None
+    assert ob.in_flight_for_item("t1", OTHER_SITE, "if-scope-a") is None
+
+    replay_released, _ = ob.release_to_send(
+        replay["id"], from_statuses=ob.APPROVABLE)
+    other_item_released, _ = ob.release_to_send(
+        other_item["id"], from_statuses=ob.APPROVABLE)
+    other_tenant_released, _ = ob.release_to_send(
+        other_tenant["id"], from_statuses=ob.APPROVABLE)
+    other_site_released, _ = ob.release_to_send(
+        other_site["id"], from_statuses=ob.APPROVABLE)
+
+    assert replay_released is False, (
+        "precondition: PG released a second message beside one already in "
+        "flight for the same guest")
+    assert other_item_released is True, (
+        "the in-flight guard escaped its item scope on PG")
+    assert other_tenant_released is True, (
+        "the in-flight guard escaped its TENANT scope on PG — another host's "
+        "queued row locked this host out of their own guest")
+    assert other_site_released is True, (
+        "the in-flight guard escaped its site scope on PG")
+
+
+def test_add_guard_stays_inside_its_site_scope_on_postgres(pg_outbox):
+    """The third scope term of the insert guard, on the deployed backend."""
+    ob = pg_outbox
+    with ob._conn() as c:
+        assert c.pg, "positive control: this fixture is not actually on Postgres"
+
+    body = "Hi! Yes, the unit is available for those dates."
+
+    def add(tid, site, item):
+        return ob.add(tid, site, item, sequence="presale", step_id="intro",
+                      step_label="Reply", body=body, reason="r", auto=True,
+                      unless_in_flight=True, unless_body_sent=True)
+
+    first = add("t1", SITE, "site-scope-a")
+    assert first is not None
+    ob.set_status(first["id"], ob.SENDING)
+    ob.set_status(first["id"], ob.SENT)
+    assert ob.in_flight_for_item("t1", OTHER_SITE, "site-scope-a") is None, (
+        "precondition: nothing in flight on the second site")
+
+    assert add("t1", SITE, "site-scope-a") is None, (
+        "precondition: the duplicate guard still holds on the delivered site")
+    assert add("t1", OTHER_SITE, "site-scope-a") is not None, (
+        "the insert guard escaped its SITE scope on PG")
+
+
+def test_release_body_guard_stays_inside_its_site_scope_on_postgres(pg_outbox):
+    """The site term of `unless_body_sent`, on the deployed backend."""
+    ob = pg_outbox
+    with ob._conn() as c:
+        assert c.pg, "positive control: this fixture is not actually on Postgres"
+
+    body = "Hi! Yes, the unit is available for those dates."
+
+    def pending(tid, site, item):
+        return ob.add(tid, site, item, sequence="presale", step_id="intro",
+                      step_label="Reply", body=body, auto=False)
+
+    delivered = pending("t1", SITE, "body-site-a")
+    ob.set_status(delivered["id"], ob.SENT)
+    replay = pending("t1", SITE, "body-site-a")
+    other_site = pending("t1", OTHER_SITE, "body-site-a")
+
+    assert ob.get(delivered["id"])["status"] == ob.SENT
+    assert ob.in_flight_for_item("t1", SITE, "body-site-a") is None, (
+        "precondition: nothing in flight, so only the body guard can refuse")
+    assert ob.in_flight_for_item("t1", OTHER_SITE, "body-site-a") is None
+
+    replay_released, _ = ob.release_to_send(
+        replay["id"], from_statuses=ob.APPROVABLE)
+    other_site_released, _ = ob.release_to_send(
+        other_site["id"], from_statuses=ob.APPROVABLE)
+
+    assert replay_released is False, (
+        "precondition: the same tenant/site/item replay was released on PG")
+    assert other_site_released is True, (
+        "the sent-body guard escaped its site scope on PG")

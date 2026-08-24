@@ -103,14 +103,19 @@ def _deal(tenant_id, item_id, *, guest="Dana R."):
     return item
 
 
-def _row(tenant_id, item_id, status, *, body="hello"):
+def _row(tenant_id, item_id, status, *, body="hello", site=SITE):
     """One outbox row driven into `status` the way the app drives it.
 
     `auto=True` lands straight in `queued` with `approved_at` stamped, which is
     what keeps trap 2 shut: a `sending` row with an empty `approved_at` is
     silently requeued by the reclaim on the dashboard read path.
+
+    `site` is a parameter because it is the third leg of the outbox key and the
+    third term of all three send guards, and every row in this file used to
+    pass the one `SITE` constant — which is exactly why deleting `sib.site`
+    from any of the three survived the whole suite.
     """
-    msg = outbox.add(tenant_id, SITE, item_id, sequence="presale",
+    msg = outbox.add(tenant_id, site, item_id, sequence="presale",
                      step_id="intro", step_label="First reply",
                      body=body, auto=status != outbox.PENDING)
     msg_id = msg["id"]
@@ -1192,3 +1197,165 @@ def test_the_add_flags_together_stay_inside_their_scope(tenant):
     assert replay is None, "precondition: the duplicate guard still holds"
     assert other_guest is not None, "another guest of this host was locked out"
     assert other_tenant is not None, "ANOTHER TENANT was locked out"
+
+
+# --------------------------------------------------------------------------
+# VEN-181: the axes the batteries above never varied
+# --------------------------------------------------------------------------
+#
+# VEN-179 pinned tenant and item on `add()` and on `unless_body_sent`. Three
+# scope terms times three guards is nine correlations; that ticket's acceptance
+# named four of them. Extending its mutation battery past its own list found
+# these surviving the *whole* suite, not just the two send-state files:
+#
+#   delete `sib.tenant_id=outbox.tenant_id` from `unless_sibling_in_flight`
+#   delete `sib.site=?`                     from `add()`
+#   delete `sib.site=outbox.site`           from `unless_sibling_in_flight`
+#   delete `sib.site=outbox.site`           from `unless_body_sent`
+#
+# Nothing here is a regression — the production predicates are correct at every
+# site. This is the coverage debt, paid in the same shape VEN-179 used: one row
+# per axis, varying exactly one key, with the sibling guard ruled out by a
+# precondition first so a pass cannot be somebody else's answer.
+#
+# A second site slug is not live today: `sites/furnishedfinder.py` and
+# `sites/ff_email.py` both report `SITE_NAME = "furnishedfinder"`. So the site
+# assertions pin a term before a second channel makes it reachable, and are
+# deliberately ranked below the tenant one — which *is* reachable now, for the
+# reason VEN-179 recorded: `item_id` is a content hash with no tenant
+# component, and `seed_demo.py` hands every tenant the same `lead-1001`.
+
+OTHER_SITE = "a-second-site"
+BLOCKER = "Hi! I'm checking with my co-host and will confirm tonight."
+
+
+def _sent_row_count():
+    """Delivered rows anywhere in the table, read without the app's helpers.
+
+    The in-flight test needs `unless_body_sent` provably inert. Counting in SQL
+    across every tenant/site/item is the only version of that precondition that
+    a mis-scoped guard cannot itself satisfy.
+    """
+    with outbox._conn() as c:
+        return c.execute("SELECT COUNT(*) FROM outbox WHERE status=?",
+                         (outbox.SENT,)).fetchone()[0]
+
+
+def test_the_in_flight_guard_stays_inside_its_tenant_item_site_scope(tenant):
+    """The sibling guard crosses one scope axis at a time. The tenant one bites.
+
+    Twin of `test_release_body_guard_stays_inside_its_tenant_item_scope`, for
+    the *other* guard on the same UPDATE. `release_to_send` sets both flags, so
+    the seed has to leave this one as the only guard that can answer: the
+    blocker is `queued` — in flight, never delivered — and no row in the table
+    is `sent`, which makes `unless_body_sent` inert by construction rather than
+    by assumption.
+
+    With `sib.tenant_id=outbox.tenant_id` deleted, tenant A holding a queued
+    row for `lead-1001` makes tenant B's release of *B's own* `lead-1001`
+    refuse with the "already under way" sentence — a cross-tenant lockout on
+    `release_to_send`, live behind `/outbox/<id>/retry` and both approve
+    routes. That is the defect class VEN-170 already shipped once, one guard
+    above the one VEN-179 fixed.
+    """
+    blocker_id = _row(tenant, "inflight-scope-a", outbox.QUEUED, body=BLOCKER)
+    replay_id = _row(tenant, "inflight-scope-a", outbox.PENDING, body=CANNED)
+    other_item_id = _row(tenant, "inflight-scope-b", outbox.PENDING,
+                         body=CANNED)
+    other_tenant_id = _row("a-different-tenant", "inflight-scope-a",
+                           outbox.PENDING, body=CANNED)
+    other_site_id = _row(tenant, "inflight-scope-a", outbox.PENDING,
+                         body=CANNED, site=OTHER_SITE)
+
+    assert outbox.get(blocker_id)["status"] == outbox.QUEUED, (
+        "precondition: the blocker is not in flight, so the refusal below "
+        "would not be this guard's to give")
+    assert _sent_row_count() == 0, (
+        "precondition: a delivered row lets `unless_body_sent` answer these "
+        "releases, and all three in-flight axes would go unpinned")
+    assert outbox.in_flight_for_item(tenant, SITE, "inflight-scope-b") is None
+    assert outbox.in_flight_for_item(
+        "a-different-tenant", SITE, "inflight-scope-a") is None
+    assert outbox.in_flight_for_item(
+        tenant, OTHER_SITE, "inflight-scope-a") is None
+
+    replay, _ = outbox.release_to_send(
+        replay_id, from_statuses=outbox.APPROVABLE)
+    other_item, _ = outbox.release_to_send(
+        other_item_id, from_statuses=outbox.APPROVABLE)
+    other_tenant, _ = outbox.release_to_send(
+        other_tenant_id, from_statuses=outbox.APPROVABLE)
+    other_site, _ = outbox.release_to_send(
+        other_site_id, from_statuses=outbox.APPROVABLE)
+
+    assert replay is False, (
+        "precondition: a second message was released beside one already in "
+        "flight for the same guest — the guard is not holding at all")
+    assert other_item is True, "the in-flight guard escaped its item scope"
+    assert other_tenant is True, (
+        "the in-flight guard escaped its TENANT scope — another host's queued "
+        "row locked this host out of their own guest")
+    assert other_site is True, "the in-flight guard escaped its site scope"
+
+
+def test_the_add_guard_stays_inside_its_site_scope(tenant):
+    """The third scope term of the insert guard, which no test varied.
+
+    `test_the_add_flags_together_stay_inside_their_scope` pins tenant and item
+    and holds `site` at the one constant every row in this file used, so
+    deleting `sib.site=?` from `add()` survived the whole suite. Both flags are
+    set together here for the same reason that test gives: a single clause has
+    nothing to OR against, and the joined pair is the live shape.
+    """
+    def _add(tid, site, item, body):
+        return outbox.add(tid, site, item, sequence="presale", step_id="intro",
+                          step_label="Reply", body=body, reason="r", auto=True,
+                          unless_in_flight=True, unless_body_sent=True)
+
+    first = _add(tenant, SITE, "site-scope-a", CANNED)
+    assert first is not None
+    outbox.set_status(first["id"], outbox.SENDING)
+    outbox.set_status(first["id"], outbox.SENT)
+
+    assert outbox.in_flight_for_item(
+        tenant, OTHER_SITE, "site-scope-a") is None, (
+        "precondition: nothing in flight on the second site, so only the site "
+        "term of the guard can decide the last assertion")
+
+    assert _add(tenant, SITE, "site-scope-a", CANNED) is None, (
+        "precondition: the duplicate guard still holds on the delivered site")
+    assert _add(tenant, OTHER_SITE, "site-scope-a", CANNED) is not None, (
+        "the insert guard escaped its SITE scope — one guest reached on a "
+        "second channel was locked out by what the first channel delivered")
+
+
+def test_the_release_body_guard_stays_inside_its_site_scope(tenant):
+    """The site term of `unless_body_sent` — the axis VEN-179 left open.
+
+    Its tenant and item terms are pinned by
+    `test_release_body_guard_stays_inside_its_tenant_item_scope`; that test
+    holds `site` fixed, so deleting `sib.site=outbox.site` from this guard
+    survived. Nothing is in flight, so the sibling guard cannot account for
+    either result.
+    """
+    delivered_id = _row(tenant, "body-site-a", outbox.SENT, body=CANNED)
+    replay_id = _row(tenant, "body-site-a", outbox.PENDING, body=CANNED)
+    other_site_id = _row(tenant, "body-site-a", outbox.PENDING, body=CANNED,
+                         site=OTHER_SITE)
+
+    assert outbox.get(delivered_id)["status"] == outbox.SENT
+    assert outbox.in_flight_for_item(tenant, SITE, "body-site-a") is None, (
+        "precondition: nothing in flight, so only the body guard can refuse")
+    assert outbox.in_flight_for_item(
+        tenant, OTHER_SITE, "body-site-a") is None
+
+    replay, _ = outbox.release_to_send(
+        replay_id, from_statuses=outbox.APPROVABLE)
+    other_site, _ = outbox.release_to_send(
+        other_site_id, from_statuses=outbox.APPROVABLE)
+
+    assert replay is False, (
+        "precondition: the same tenant/site/item replay was released")
+    assert other_site is True, (
+        "the sent-body guard escaped its site scope — words delivered on one "
+        "channel refused the same words on another")
