@@ -271,6 +271,46 @@ def test_the_guard_does_not_strand_delivery_on_postgres(pg_outbox):
         "a body already delivered to this guest was released a second time")
 
 
+def test_release_body_guard_stays_inside_its_tenant_item_scope_on_postgres(
+        pg_outbox):
+    """The update guard crosses one scope axis at a time on real Postgres."""
+    ob = pg_outbox
+    with ob._conn() as c:
+        assert c.pg, "positive control: this fixture is not actually on Postgres"
+
+    body = "Hi! Yes, the unit is available for those dates."
+
+    def pending(tid, item):
+        return ob.add(tid, SITE, item, sequence="presale", step_id="intro",
+                      step_label="Reply", body=body, auto=False)
+
+    delivered = pending("t1", "release-scope-a")
+    assert delivered is not None
+    ob.set_status(delivered["id"], ob.SENT)
+    replay = pending("t1", "release-scope-a")
+    other_item = pending("t1", "release-scope-b")
+    other_tenant = pending("t2", "release-scope-a")
+
+    assert ob.get(delivered["id"])["status"] == ob.SENT
+    assert ob.in_flight_for_item("t1", SITE, "release-scope-a") is None
+    assert ob.in_flight_for_item("t1", SITE, "release-scope-b") is None
+    assert ob.in_flight_for_item("t2", SITE, "release-scope-a") is None
+
+    replay_released, _ = ob.release_to_send(
+        replay["id"], from_statuses=ob.APPROVABLE)
+    other_item_released, _ = ob.release_to_send(
+        other_item["id"], from_statuses=ob.APPROVABLE)
+    other_tenant_released, _ = ob.release_to_send(
+        other_tenant["id"], from_statuses=ob.APPROVABLE)
+
+    assert replay_released is False, (
+        "precondition: the same tenant/item/body replay was released on PG")
+    assert other_item_released is True, (
+        "the sent-body guard escaped its item scope on PG")
+    assert other_tenant_released is True, (
+        "the sent-body guard escaped its tenant scope on PG")
+
+
 # --------------------------------------------------------------------------
 # Round 6: the due gate, on the backend that actually runs it
 # --------------------------------------------------------------------------
@@ -367,7 +407,8 @@ def test_add_guard_does_not_escape_its_tenant_item_scope(pg_outbox):
     does not need the concurrency harness above — but it is asserted here
     anyway because the predicate it checks is the one `DEPLOY.md` says runs on
     Postgres, and "identical on both backends" is worth measuring rather than
-    reasoning about. The three axes match the SQLite test of the same name in
+    reasoning about. The three axes match
+    `test_the_add_flags_together_stay_inside_their_scope` in
     `tests/test_dashboard_send_state.py`.
     """
     ob = pg_outbox
@@ -387,8 +428,8 @@ def test_add_guard_does_not_escape_its_tenant_item_scope(pg_outbox):
     ob.set_status(first["id"], ob.SENT)
     assert ob.in_flight_for_item("t1", SITE, "B") is None, (
         "precondition: nothing in flight for the other guest")
-    assert ob.in_flight_for_item("t2", SITE, "C") is None
+    assert ob.in_flight_for_item("t2", SITE, "A") is None
 
     assert add("t1", "A") is None, "precondition: the duplicate guard still holds"
     assert add("t1", "B") is not None, "another guest was locked out on PG"
-    assert add("t2", "C") is not None, "ANOTHER TENANT was locked out on PG"
+    assert add("t2", "A") is not None, "ANOTHER TENANT was locked out on PG"
