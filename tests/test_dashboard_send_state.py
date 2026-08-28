@@ -947,6 +947,43 @@ def test_approve_with_edited_text_matching_a_sent_body_is_refused(client, tenant
     assert outbox.get(pending_id)["status"] == outbox.PENDING
 
 
+def test_release_body_guard_stays_inside_its_tenant_item_scope(tenant):
+    """The update guard must cross one scope axis at a time.
+
+    A sent body refuses a replay for the same tenant/item, but the same body is
+    valid for another item or another tenant. Holding every other key fixed is
+    what makes the latter two assertions pin the item and tenant correlations.
+    """
+    delivered_id = _row(tenant, "release-scope-a", outbox.SENT, body=CANNED)
+    replay_id = _row(tenant, "release-scope-a", outbox.PENDING, body=CANNED)
+    other_item_id = _row(
+        tenant, "release-scope-b", outbox.PENDING, body=CANNED)
+    other_tenant_id = _row(
+        "a-different-tenant", "release-scope-a", outbox.PENDING, body=CANNED)
+
+    assert outbox.get(delivered_id)["status"] == outbox.SENT
+    assert outbox.in_flight_for_item(
+        tenant, SITE, "release-scope-a") is None
+    assert outbox.in_flight_for_item(
+        tenant, SITE, "release-scope-b") is None
+    assert outbox.in_flight_for_item(
+        "a-different-tenant", SITE, "release-scope-a") is None
+
+    replay_released, _ = outbox.release_to_send(
+        replay_id, from_statuses=outbox.APPROVABLE)
+    other_item_released, _ = outbox.release_to_send(
+        other_item_id, from_statuses=outbox.APPROVABLE)
+    other_tenant_released, _ = outbox.release_to_send(
+        other_tenant_id, from_statuses=outbox.APPROVABLE)
+
+    assert replay_released is False, (
+        "precondition: the same tenant/item/body replay was released")
+    assert other_item_released is True, (
+        "the sent-body guard escaped its item scope")
+    assert other_tenant_released is True, (
+        "the sent-body guard escaped its tenant scope")
+
+
 def test_duplicate_refusal_does_not_claim_a_send_in_flight(client, tenant):
     """The refusal has to name the real reason.
 
@@ -1150,7 +1187,7 @@ def test_the_add_flags_together_stay_inside_their_scope(tenant):
 
     replay = _add(tenant, "scope-a", CANNED)
     other_guest = _add(tenant, "scope-b", CANNED)
-    other_tenant = _add("a-different-tenant", "scope-c", CANNED)
+    other_tenant = _add("a-different-tenant", "scope-a", CANNED)
 
     assert replay is None, "precondition: the duplicate guard still holds"
     assert other_guest is not None, "another guest of this host was locked out"
