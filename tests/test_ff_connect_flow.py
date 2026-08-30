@@ -40,8 +40,12 @@ def check(cond, msg):
     This raises rather than recording the failure. An earlier version appended
     to a module-level list that only the `__main__` runner below inspected, so
     under pytest every test in this file returned normally no matter what the
-    code under test did — 13 tests that were counted as green while asserting
-    nothing (VEN-166).
+    code under test did — ~66 checks across 13 tests that were counted as green
+    while asserting nothing (VEN-166).
+
+    Raising does not cost the standalone runner its full report: the `__main__`
+    block below catches AssertionError per test, so one failing check ends that
+    test rather than the run.
 
     Raises AssertionError explicitly instead of using a bare `assert` so the
     check survives `python -O`, which strips assert statements; `msg` is a
@@ -343,12 +347,14 @@ def test_ff_login_dialog_invalidates_session_probe():
 
 
 def _expire_worker():
-    # Offset-aware, matching what `jobs.heartbeat()` actually writes (VEN-137).
-    # A naive stamp here would still expire the worker, but it would route every
-    # reap/offline test in this file down the legacy-naive compatibility branch
-    # in `worker_online()`, leaving the real shipped path with no coverage.
+    # Offset-aware, matching what `jobs.heartbeat()` actually writes (VEN-137,
+    # VEN-142). A naive stamp expires the worker just as well, so this looks
+    # inert — but it routes every reap/offline assertion in this file down the
+    # legacy-naive compatibility branch of `_age_seconds`, leaving the shipped
+    # path with no coverage here at all.
     from datetime import datetime, timedelta, timezone
-    old = (datetime.now(timezone.utc) - timedelta(seconds=jobs.WORKER_TTL_SECONDS + 60)).isoformat(timespec="seconds")
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=jobs.WORKER_TTL_SECONDS + 60)).isoformat(timespec="seconds")
     with jobs._conn() as c:
         c.execute("UPDATE ff_worker SET last_seen=? WHERE id=1", (old,))
 
@@ -404,12 +410,15 @@ def test_worker_restart_recovery():
 
 def test_hard_cap_backstop():
     print("test_hard_cap_backstop")
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     t = "t-wedged"
     jobs.enqueue(t)
     jobs.heartbeat("worker-wedged")           # worker ONLINE the whole time
     job = _claim_for("worker-wedged", t)
-    old = (datetime.now() - timedelta(seconds=jobs.MAX_ACTIVE_JOB_SECONDS + 60)).isoformat(timespec="seconds")
+    # Aware, matching what `jobs.enqueue()` writes (VEN-142) — a naive value ages
+    # the same but routes this check down the legacy compatibility branch.
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=jobs.MAX_ACTIVE_JOB_SECONDS + 60)).isoformat(timespec="seconds")
     with jobs._conn() as c:
         c.execute("UPDATE ff_jobs SET created_at=? WHERE id=?", (old, job["id"]))
     check(jobs.reap_stale(active_worker_id="worker-wedged") >= 1,
@@ -431,7 +440,7 @@ def test_magic_link_required_error():
 
 def test_retry_cooldown_blocks_burst():
     print("test_retry_cooldown_blocks_burst")
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     t = "t-cooldown"
     j = jobs.enqueue(t)
     jobs.set_status(j["id"], jobs.ERROR, "Couldn't verify your FurnishedFinder login.")
@@ -440,7 +449,9 @@ def test_retry_cooldown_blocks_burst():
           "retry within cooldown coalesces onto the errored job (no burst)")
     ps = jobs.public_state(t)
     check("wait" in ps["message"].lower(), "cooldown surfaces a wait message in the banner")
-    old = (datetime.now() - timedelta(seconds=jobs.ERROR_RETRY_COOLDOWN_SECONDS + 5)).isoformat(timespec="seconds")
+    # Aware, matching what `jobs.set_status()` writes (VEN-142).
+    old = (datetime.now(timezone.utc)
+           - timedelta(seconds=jobs.ERROR_RETRY_COOLDOWN_SECONDS + 5)).isoformat(timespec="seconds")
     with jobs._conn() as c:
         c.execute("UPDATE ff_jobs SET updated_at=? WHERE id=?", (old, j["id"]))
     fresh = jobs.enqueue(t)
