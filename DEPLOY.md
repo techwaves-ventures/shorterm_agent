@@ -25,6 +25,7 @@ scoped by `tenant_id`).
 | `PUBLIC_BASE_URL` | for Stripe | Public URL used in Stripe redirect callbacks (e.g. `https://<app>.vercel.app`). |
 | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_STARTER`, `STRIPE_PRICE_PRO` | optional | Enable live billing. **Omit all to run billing in safe demo mode.** |
 | `DASHBOARD_HOST=0.0.0.0` | disk hosts only | Bind all interfaces (not used on Vercel). |
+| `DISABLE_BACKGROUND_AGENTS=1` | tests/CI only | Stops this process starting the autopilot scheduler and the outbox drainer. **Leave unset on every deploy** — setting it means autopilot never runs and approved replies are never delivered by this process. |
 
 Generate the two keys:
 
