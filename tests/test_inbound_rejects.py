@@ -469,8 +469,47 @@ def test_stored_body_is_truncated(client):
     tid = _tenant()
     _post(client, tid, body=DIGEST + ("A" * 40_000))
 
-    row = inbound_rejects.open_for_tenant(tid, SITE)[0]
+    # Read through `get`, not the review list: the list returns a short preview,
+    # so asserting the storage bound there would pass on any preview length and
+    # stop guarding storage at all.
+    rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+    row = inbound_rejects.get(tid, SITE, rid)
     assert len(row["body"]) <= inbound_rejects.MAX_STORED_BODY
+    assert len(row["body"]) > inbound_rejects._LIST_BODY, (
+        "precondition: the stored body must exceed the preview, or this test "
+        "would pass without the truncation it is checking"
+    )
+
+
+def test_the_review_list_previews_the_body_but_get_still_returns_it_whole(client):
+    """The list is bounded by row count x body, and nothing paginates it.
+
+    With evidence retained up to `MAX_UNREVIEWED`, rendering every body in full
+    made the recovery page ~9 MB exactly when the queue is full — i.e. when the
+    operator must be able to open it. Retry re-parses the stored message, so the
+    preview must not reach into storage.
+    """
+    tid = _tenant()
+    long_body = DIGEST + ("A" * 40_000)
+    _post(client, tid, body=long_body)
+
+    listed = inbound_rejects.open_for_tenant(tid, SITE)[0]
+    assert len(listed["body"]) == inbound_rejects._LIST_BODY
+    assert listed["body_truncated"] is True
+
+    whole = inbound_rejects.get(tid, SITE, listed["id"])["body"]
+    assert len(whole) > len(listed["body"]), "the list preview replaced the stored body"
+    assert whole.startswith(listed["body"]), "the preview is not a prefix of the message"
+
+
+def test_a_short_body_is_not_marked_truncated(client):
+    """A flag that is always true would label every email as clipped."""
+    tid = _tenant()
+    _post(client, tid, body="short enough to show whole")
+
+    listed = inbound_rejects.open_for_tenant(tid, SITE)[0]
+    assert listed["body_truncated"] is False
+    assert listed["body"] == inbound_rejects.get(tid, SITE, listed["id"])["body"]
 
 
 def test_received_at_is_absolute_and_carries_an_offset(client):

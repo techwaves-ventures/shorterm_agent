@@ -146,6 +146,26 @@ _COLS = (
 
 _SELECT = f"SELECT {', '.join(_COLS)} FROM inbound_rejects"
 
+# How much of each body the review *list* renders. The stored body stays
+# `MAX_STORED_BODY`; this bounds only what one page load carries.
+#
+# Load-bearing because of the retention ceiling above, not as a nicety. The list
+# has no pagination, so its weight is `rows x body`: raising the evidence bound
+# from 200 rows to `MAX_UNREVIEWED` took the worst case from ~1.9 MB to a
+# measured 9.26 MB of HTML — and it peaks exactly when the queue is full, which
+# is the one moment the operator has to be able to open this page to clear it.
+# Refusing to delete a lead is only an improvement if the page that recovers it
+# still loads. The full body is untouched on disk and is what Retry re-parses;
+# `get` still reads it whole.
+_LIST_BODY = 600
+# Built from `_COLS` so a column added later cannot silently drift the two
+# projections apart — `_row` zips positionally. One extra character is selected
+# so the caller can tell "exactly at the limit" from "cut short".
+_SELECT_LIST = "SELECT {} FROM inbound_rejects".format(", ".join(
+    f"SUBSTR(body, 1, {_LIST_BODY + 1}) AS body" if col == "body" else col
+    for col in _COLS
+))
+
 
 def _now() -> str:
     """Absolute, offset-carrying UTC.
@@ -554,14 +574,25 @@ def record(tenant_id: str, site: str, reason_code: str, reason: str,
 
 @_repairs_schema
 def open_for_tenant(tenant_id: str, site: str) -> list[dict]:
-    """Unresolved rejections, newest first — what the review page lists."""
+    """Unresolved rejections, newest first — what the review page lists.
+
+    `body` is a `_LIST_BODY` preview, not the stored text, and `body_truncated`
+    says which. Use `get` when the whole message matters (retry does).
+    """
     tenant_id = str(tenant_id)
     with _conn() as c:
         rows = c.execute(
-            f"{_SELECT} WHERE tenant_id=? AND site=? AND status=? ORDER BY id DESC",
+            f"{_SELECT_LIST} WHERE tenant_id=? AND site=? AND status=? ORDER BY id DESC",
             (tenant_id, site, OPEN),
         ).fetchall()
-    return [_row(r) for r in rows]
+    out = []
+    for r in rows:
+        row = _row(r)
+        body = row["body"] or ""
+        row["body_truncated"] = len(body) > _LIST_BODY
+        row["body"] = body[:_LIST_BODY]
+        out.append(row)
+    return out
 
 
 @_repairs_schema
