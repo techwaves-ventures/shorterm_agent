@@ -2073,3 +2073,152 @@ def test_a_retry_during_a_live_outage_keeps_the_row_on_the_list(client, monkeypa
         "the row must stay on the list while the lead is not on the board"
     )
     assert inbound_rejects.count_open(tid, SITE) == 1
+
+
+# --- VEN-205: five guards from VEN-147 that the suite did not pin ---------------
+
+
+def test_count_unreviewed_excludes_sender_not_allowed_rows(client):
+    """count_unreviewed is the evidence predicate, not count_open.
+
+    Its entire reason for existing is that it must use the *same* predicate as
+    the ceiling gate in `record`: only open+unparsed rows count. A
+    `sender_not_allowed` row is non-evidence shed by the cap, not protected by it.
+    Replacing `count_unreviewed` with a plain open-row count leaves the suite
+    green, because every other test that touches it seeds only `unparsed` rows.
+    """
+    tid = _tenant()
+    _post(client, tid, body="A guest wrote and we could not read it.",
+          subject="unparsed lead")
+    assert inbound_rejects.count_unreviewed(tid, SITE) == 1, "precondition"
+
+    _post(client, tid, body="Newsletter", subject="Weekly roundup",
+          sender="news@newsletter.com")  # produces a sender_not_allowed row
+    assert inbound_rejects.count_open(tid, SITE) == 2, "precondition: both rows are open"
+    assert inbound_rejects.count_unreviewed(tid, SITE) == 1, (
+        "a sender_not_allowed row must not count as evidence — the ceiling "
+        "gates only unparsed rows, so these two counts must diverge here"
+    )
+
+
+def test_review_page_shows_truncation_note_for_long_bodies(client):
+    """Nothing asserts the 'Showing the first part' note actually renders.
+
+    Guarding the template block with {%% if False %%} leaves the suite green:
+    body_truncated is covered but its rendering is not. A silently clipped email
+    would have the operator judge a lead on text they were never meant to see.
+    """
+    tid = _tenant_with_login(client)
+    _post(client, tid, body=DIGEST + ("A" * 40_000))
+
+    row = inbound_rejects.open_for_tenant(tid, SITE)[0]
+    assert row["body_truncated"], "precondition: the preview really is cut short"
+
+    page = client.get("/inbound/rejected").get_data(as_text=True)
+    assert "Showing the first part of this email" in page, (
+        "the truncation note must render when the body is cut — the operator "
+        "must know they are seeing a preview, or they judge the lead on "
+        "incomplete text"
+    )
+
+
+def test_open_for_tenant_projects_body_in_sql_not_just_in_python():
+    """Swapping _SELECT_LIST back to _SELECT leaves the suite green.
+
+    Python still slices the body afterwards, so the rendered HTML is identical.
+    What is lost is the DB-to-app transfer: at the 1000-row evidence ceiling
+    that is ~8 MB per page load, exactly when the operator must be able to open
+    the recovery page. Assert the projection, not just the result.
+    """
+    stmts = _executed_sql()
+    substr_list_stmts = [
+        s for s in stmts
+        if "SUBSTR" in s.upper() and "status" in s.lower()
+    ]
+    assert substr_list_stmts, (
+        "open_for_tenant must project SUBSTR(body, ...) in SQL via _SELECT_LIST; "
+        "reverting to _SELECT fetches ~8 MB of full bodies from the DB at the ceiling"
+    )
+
+
+def test_all_repairs_schema_decorated_readers_self_heal_after_table_drop(monkeypatch):
+    """@_repairs_schema on count_unreviewed is unguarded — and the decorator generally.
+
+    There is no @_repairs_schema test anywhere in this suite. A single table-drop
+    covers every decorated reader at once and validates the merge resolution
+    VEN-147 explicitly flagged for review.
+    """
+    import db
+
+    # Set the memo so the decorator's re-check fires when the table is absent.
+    monkeypatch.setattr(inbound_rejects, "_schema_ready",
+                        inbound_rejects._db_identity())
+
+    tid = "repairs-test-ven205"
+    with db.connect() as c:
+        c.execute("DROP TABLE IF EXISTS inbound_rejects")
+
+    # Each decorated reader must recover, not raise.
+    assert inbound_rejects.count_open(tid, SITE) == 0
+    assert inbound_rejects.count_all(tid, SITE) == 0
+    assert inbound_rejects.count_unreviewed(tid, SITE) == 0
+    assert inbound_rejects.open_for_tenant(tid, SITE) == []
+    assert inbound_rejects.get(tid, SITE, 1) is None
+
+
+def test_open_non_evidence_is_shed_before_resolved_rows_at_the_cap(client):
+    """_SHED_IDS ranks still-open rows over resolved — this ordering is uncovered.
+
+    Inverting it (keeping dismissed rows over still-open non-evidence) leaves the
+    suite green. Without this test a future edit could make the cap shed open
+    sender_not_allowed mail the operator hasn't reviewed yet instead of the
+    resolved rows they already acted on.
+    """
+    tid = _tenant()
+    # A dismissed row — already resolved, must be the first to go.
+    _post(client, tid, body="Old junk", subject="old newsletter",
+          sender="news@old-newsletter.com")
+    dismissed_rid = inbound_rejects.open_for_tenant(tid, SITE)[0]["id"]
+    inbound_rejects.dismiss(tid, SITE, dismissed_rid)
+    assert inbound_rejects.get(tid, SITE, dismissed_rid)["status"] == "dismissed"
+
+    # Fill past the cap with open sender_not_allowed rows (non-evidence).
+    for i in range(inbound_rejects.MAX_ROWS_PER_TENANT + 1):
+        _post(client, tid, body=f"Newsletter {i}", subject=f"roundup {i}",
+              sender=f"news{i}@newsletter.com")
+
+    # The dismissed row must have been shed in preference to open non-evidence.
+    assert inbound_rejects.get(tid, SITE, dismissed_rid) is None, (
+        "the dismissed row must be shed before still-open non-evidence rows — "
+        "the cap must prefer to keep rows the operator has not yet seen"
+    )
+    assert inbound_rejects.count_all(tid, SITE) <= inbound_rejects.MAX_ROWS_PER_TENANT
+
+
+def test_prune_sheds_all_non_evidence_when_evidence_fills_the_soft_cap(
+        client, monkeypatch):
+    """The room==0 branch of _prune: evidence alone fills the soft cap.
+
+    When evidence (open+unparsed rows) reaches MAX_ROWS_PER_TENANT, non-evidence
+    gets zero room and the DELETE runs with LIMIT 0 / NOT IN (). Correct on real
+    Postgres in the VEN-147 evidence, but reached by no test in the suite.
+    """
+    monkeypatch.setattr(inbound_rejects, "MAX_ROWS_PER_TENANT", 3)
+    tid = _tenant()
+    for i in range(3):
+        _post(client, tid, body=f"Guest {i} wrote and we could not read it.",
+              subject=f"unparsed lead {i}")
+    assert inbound_rejects.count_unreviewed(tid, SITE) == 3, (
+        "precondition: soft cap filled with evidence"
+    )
+
+    # One sender_not_allowed arrival triggers pruning; non-evidence must get no room.
+    _post(client, tid, body="junk", subject="junk mail", sender="news@newsletter.com")
+
+    assert inbound_rejects.count_all(tid, SITE) == 3, (
+        "with evidence at the soft cap, non-evidence must receive zero room "
+        "and be deleted entirely"
+    )
+    subjects = {r["subject"] for r in inbound_rejects.open_for_tenant(tid, SITE)}
+    for i in range(3):
+        assert f"unparsed lead {i}" in subjects, "evidence must survive the room==0 prune"
