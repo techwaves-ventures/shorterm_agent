@@ -16,6 +16,7 @@ drained separately (see `send_next`) because platform replies drive real Chrome
 one at a time.
 """
 import logging
+import os
 import threading
 import time
 
@@ -279,6 +280,37 @@ def _notify_failure(msg: dict, reason: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Long-lived background threads
+# ---------------------------------------------------------------------------
+
+
+def background_agents_enabled() -> bool:
+    """Whether this process may spawn the long-lived background threads.
+
+    Consulted at the two spawn points below rather than at their callers: both
+    are reachable from several places (`start_drainer` from six, including three
+    request routes), so gating a caller only moves the leak to the next one.
+
+    Default **on**, opt out with DISABLE_BACKGROUND_AGENTS=1. Every hosted
+    entrypoint (`Procfile`, `render.yaml`, `Dockerfile`) starts the app by
+    *importing* `dashboard`, so making the start explicit instead — the obvious
+    alternative — would leave autopilot silently dead on every deploy that kept
+    importing the module. The comment above `dashboard._start_background_agents()`
+    records that exact failure happening once already. A default whose breakage
+    is silent in production and invisible in CI is the wrong default even when
+    it is the cleaner design; this direction makes a mis-set gate show up as a
+    flaking suite, which tests can catch.
+
+    The test suite opts out (`tests/conftest.py`): a daemon thread outlives the
+    test that spawned it and keeps opening connections to whichever temp
+    database is current, which made unrelated tests fail sporadically (VEN-162).
+    """
+    return os.getenv("DISABLE_BACKGROUND_AGENTS", "").strip().lower() not in (
+        "1", "true", "yes",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Background drainer (in-process, for hosts without a separate worker)
 # ---------------------------------------------------------------------------
 
@@ -299,6 +331,10 @@ def start_drainer(site: str) -> bool:
     immediately, while this delivers and records the outcome.
     """
     global _draining
+    # Checked before the latch, never after: a disabled call must not leave
+    # `_draining` set, or the first enabled call would find itself suppressed.
+    if not background_agents_enabled():
+        return False
     with _drain_lock:
         if _draining:
             return False
@@ -380,6 +416,9 @@ def start_scheduler(site: str = "furnishedfinder") -> bool:
     Idempotent — only one scheduler thread per process.
     """
     global _scheduling
+    # Before the latch, for the same reason as in `start_drainer`.
+    if not background_agents_enabled():
+        return False
     with _sched_lock:
         if _scheduling:
             return False

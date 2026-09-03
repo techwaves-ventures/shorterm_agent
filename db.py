@@ -135,6 +135,16 @@ def connect() -> Conn:
 _SCHEMA_LOCK = threading.Lock()
 _SCHEMA_DONE: set[tuple[str, str]] = set()
 
+# SQLite runs the DDL on *every* connection (see open_with_schema), and the
+# ADD COLUMN migrations are check-then-act: read the column list, then ALTER
+# what is missing. Two threads opening their first connection to the same file
+# both read the same list and both issue the ALTER, and the loser gets
+# `sqlite3.OperationalError: duplicate column name: ...`. Serialising the DDL
+# per process closes that window. RLock, not Lock, so a `ddl` body that ever
+# opens a nested connection cannot deadlock against itself (no current one
+# does; audited).
+_SQLITE_DDL_LOCK = threading.RLock()
+
 
 def _reset_schema_state() -> None:
     """Forget the per-process schema latch — for use in a forked child.
@@ -146,9 +156,12 @@ def _reset_schema_state() -> None:
     because a lock held by another thread at fork time stays locked forever in
     the child.
     """
-    global _SCHEMA_LOCK, _SCHEMA_DONE
+    global _SCHEMA_LOCK, _SCHEMA_DONE, _SQLITE_DDL_LOCK
     _SCHEMA_LOCK = threading.Lock()
     _SCHEMA_DONE = set()
+    # Same reason as the lock above: a lock held by another thread at fork time
+    # is held forever in the child, and this one is taken on every connection.
+    _SQLITE_DDL_LOCK = threading.RLock()
 
 
 if hasattr(os, "register_at_fork"):  # not available on Windows
@@ -232,7 +245,11 @@ def open_with_schema(key: str, ddl, session=None) -> Conn:
         c = connect()
         if session is not None:
             session(c)
-        ddl(c)
+        # Serialised, not latched: it still runs on every connection (fixtures
+        # repoint DB_PATH per test and rely on that), but only one thread at a
+        # time, so the check-then-act ADD COLUMN migrations cannot interleave.
+        with _SQLITE_DDL_LOCK:
+            ddl(c)
         return c
     _ensure_pg_schema(key, ddl)
     c = connect()
