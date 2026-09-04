@@ -242,10 +242,34 @@ def send_next(tenant_id: str, site: str, timeout: int = 300) -> dict | None:
     # terminal state before recording an outcome — otherwise a failed send is
     # stored as `sent` and the follow-up cadence advances on a message the guest
     # never received.
+    #
+    # "The run" has to mean *this* dispatch. `runner._state` is one
+    # process-global slot, so a not-running snapshot only ever proved that the
+    # run which last touched that slot had finished. When this send's own
+    # terminal state was overwritten before a 2-second poll saw it — by a
+    # scrape, or by the next drained message — the loop read the replacement's
+    # outcome as this row's, and a send that failed was recorded `sent`. The
+    # token `send_reply` handed back is what distinguishes them.
+    run_token = state.get("run_token")
+    if not run_token:
+        # Accepted-looking, but with no way to tell this run's outcome from
+        # anyone else's. Fail closed: a wrongly-failed row is retried, while a
+        # wrongly-sent one silently strands the guest and advances the cadence
+        # past them.
+        error = "could not correlate the send run; delivery outcome unknown"
+        outbox.set_status(msg["id"], outbox.FAILED, error=error)
+        _notify_failure(msg, error)
+        return msg
+
     deadline = time.time() + timeout
     while time.time() < deadline:
         snapshot = runner.get_state(tenant_id)
-        if not snapshot.get("running"):
+        # All three conditions, not just `not running`. A mismatched or absent
+        # token belongs to someone else's run; an implicit status like `idle`
+        # or `busy` is not an outcome this send ever reported.
+        if (snapshot.get("run_token") == run_token
+                and not snapshot.get("running")
+                and snapshot.get("status") in ("done", "error")):
             if snapshot.get("status") == "error":
                 error = snapshot.get("message") or "send failed"
                 outbox.set_status(msg["id"], outbox.FAILED, error=error)
