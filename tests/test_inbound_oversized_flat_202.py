@@ -63,7 +63,15 @@ _seq = iter(range(1, 10_000))
 
 
 def _tenant():
-    email = f"host{next(_seq)}@test.local"
+    """A fresh tenant, under a local part no other test file uses.
+
+    Every inbound test module sets its own `SQLITE_PATH`, but `db` resolves the
+    path once at import, so in a whole-suite run they all land in whichever one
+    was imported first. Sharing the sibling files' `host{n}@test.local` pattern
+    therefore collided on the unique-email constraint — green alone, three
+    unrelated files red together.
+    """
+    email = f"ven213host{next(_seq)}@test.local"
     return models.create_user(email, PASSWORD).tenant_id
 
 
@@ -289,6 +297,11 @@ def test_pre_auth_read_is_bounded_on_the_chunked_transport(shape):
     bypassed it — would fail here instead of shipping.
     """
     cap = dashboard.app.config["MAX_CONTENT_LENGTH"]
+    assert cap is not None, (
+        "MAX_CONTENT_LENGTH is unset, so nothing bounds this read at all — "
+        "asserting a byte count against `None` would fail with a type error "
+        "and hide which of the two things went wrong"
+    )
     body, ctype = _body_of(shape, 8 * 1024 * 1024)
     status, _, consumed = _call(body, ctype, chunked=True)
 
