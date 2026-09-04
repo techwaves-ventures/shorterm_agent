@@ -6,6 +6,13 @@ playwright>=1.48.0
 python-dotenv>=1.0.0
 requests>=2.31.0
 flask>=3.0
+# Named explicitly even though flask already pulls it in. It was unpinned, and
+# a transitive upgrade moved `MAX_FORM_MEMORY_SIZE` from `None` to 500_000 —
+# changing the binding size limit on a public endpoint with no change here, to
+# a value under this app's own `inbound.MAX_PAYLOAD_BYTES`. `dashboard.py` now
+# sets that value itself; the upper bound is so the *next* default of this kind
+# arrives in a deliberate bump rather than unannounced.
+werkzeug>=3.1,<4
 flask-login>=0.6
 flask-wtf>=1.2          # CSRF protection for every state-changing form/POST
 cryptography>=42
