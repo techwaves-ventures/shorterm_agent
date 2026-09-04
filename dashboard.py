@@ -174,13 +174,28 @@ def _use_worker_queue() -> bool:
     return os.getenv("FORCE_WORKER_QUEUE", "").strip().lower() in ("1", "true", "yes")
 
 
+def _can_drive_browser_in_process() -> bool:
+    """Whether this process can drive a real browser itself.
+
+    One decision, four consumers: the drainer (delivery), `_live_state` (which
+    state the UI projects), and the `/refresh` and `/otp` routes (scrape and
+    OTP). On serverless (no Playwright) or when the worker queue is forced, all
+    four belong to worker.py instead.
+
+    Deliberately named for the *capability*, not for delivery: three of the four
+    consumers do not deliver anything, and this used to be spelled out inline at
+    each of them, so the four copies could drift apart one edit at a time.
+    """
+    return check_leads.playwright_available() and not _use_worker_queue()
+
+
 def _can_deliver_in_process() -> bool:
     """Whether this process can drive the browser to deliver queued messages.
 
     On serverless (no Playwright) or when the worker queue is forced, delivery
     belongs to worker.py instead — starting a drainer here would spin uselessly.
     """
-    return check_leads.playwright_available() and not _use_worker_queue()
+    return _can_drive_browser_in_process()
 
 
 def _live_state(tenant_id: str) -> dict:
@@ -190,7 +205,7 @@ def _live_state(tenant_id: str) -> dict:
     in-process, so the live state comes from the runner. On serverless (Vercel,
     no Playwright) scrapes are worker-backed via the shared DB, so the state is
     projected from the tenant's latest job. Same shape either way."""
-    if check_leads.playwright_available() and not _use_worker_queue():
+    if _can_drive_browser_in_process():
         return runner.get_state(tenant_id)
     return jobs.public_state(tenant_id)
 
@@ -1358,7 +1373,7 @@ def api_status():
 @scrape_allowed
 def refresh():
     tenant_id = current_user.tenant_id
-    if check_leads.playwright_available() and not _use_worker_queue():
+    if _can_drive_browser_in_process():
         # Browser is available here: run the scrape in-process (local/worker host).
         return jsonify(runner.start_scrape(tenant_id))
     # Serverless (Vercel): can't run Playwright in-process. Enqueue a job for the
@@ -1373,7 +1388,7 @@ def refresh():
 def otp():
     tenant_id = current_user.tenant_id
     code = request.form.get("code", "") or (request.json or {}).get("code", "")
-    if check_leads.playwright_available() and not _use_worker_queue():
+    if _can_drive_browser_in_process():
         ok = runner.submit_otp(tenant_id, code)
     else:
         # Route the code to the tenant's active worker job via the shared DB.
