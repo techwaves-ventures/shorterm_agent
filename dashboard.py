@@ -137,9 +137,13 @@ def _start_background_agents() -> None:
     On serverless (no Playwright) or when the worker queue is forced, worker.py
     owns this instead — starting a scheduler here would fire checks that can
     never run.
+
+    `_can_drive_browser_in_process` is defined below this function but called
+    from it at runtime; the only call to `_start_background_agents` is at the
+    bottom of the module, long after both names exist.
     """
     try:
-        if check_leads.playwright_available() and not _use_worker_queue():
+        if _can_drive_browser_in_process():
             automation.start_scheduler(SITE)
     except Exception:
         app.logger.exception("Could not start the autopilot scheduler")
@@ -177,14 +181,16 @@ def _use_worker_queue() -> bool:
 def _can_drive_browser_in_process() -> bool:
     """Whether this process can drive a real browser itself.
 
-    One decision, four consumers: the drainer (delivery), `_live_state` (which
-    state the UI projects), and the `/refresh` and `/otp` routes (scrape and
-    OTP). On serverless (no Playwright) or when the worker queue is forced, all
-    four belong to worker.py instead.
+    One decision, five consumers: `_start_background_agents` (the autopilot
+    scheduler), the drainer (delivery), `_live_state` (which state the UI
+    projects), and the `/refresh` and `/otp` routes (scrape and OTP). On
+    serverless (no Playwright) or when the worker queue is forced, all five
+    belong to worker.py instead.
 
-    Deliberately named for the *capability*, not for delivery: three of the four
+    Deliberately named for the *capability*, not for delivery: four of the five
     consumers do not deliver anything, and this used to be spelled out inline at
-    each of them, so the four copies could drift apart one edit at a time.
+    each of them, so the five copies could drift apart one edit at a time. If
+    you add a sixth consumer, call this — do not spell the expression out again.
     """
     return check_leads.playwright_available() and not _use_worker_queue()
 
