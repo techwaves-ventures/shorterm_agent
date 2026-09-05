@@ -905,9 +905,11 @@ def test_the_cancel_route_reports_a_race_it_lost_after_its_own_read(client, tena
 
     _deal(tenant, "L1")
     msg = _add(tenant, "L1", auto=True)
-    assert outbox.get(msg["id"])["status"] in outbox.CANCELABLE, (
-        "precondition: the row is not cancelable, so the route would 409 from "
-        "its pre-check and the race arm would go unexercised")
+    assert outbox.get(msg["id"])["status"] == outbox.QUEUED, (
+        "precondition: only a `queued` row is claimable (`next_queued` selects "
+        "on it), so anything else makes the injected claim an interleaving that "
+        "cannot happen in production — and a non-cancelable row would 409 from "
+        "the route's pre-check, leaving the race arm unexercised")
 
     real_get = outbox.get
     fired = {"n": 0}
@@ -934,3 +936,21 @@ def test_the_cancel_route_reports_a_race_it_lost_after_its_own_read(client, tena
     assert resp.status_code == 409, (
         f"route answered {resp.status_code} for a send it did not cancel; the "
         "guest receives this message and the operator was told it was stopped")
+
+    # The status code owns the *refusal*; this owns the *report*, which is the
+    # half of the harm the ticket words most emphatically ("telling someone a
+    # message was cancelled when it was not"). `templates/dashboard.html:748`
+    # renders this string verbatim: Not cancelled — already "<error>".
+    error = resp.get_json()["error"]
+    assert error == outbox.STATUS_LABELS[outbox.SENDING], (
+        "the 409 must name the true state; the operator reads this string as "
+        f'Not cancelled - already "{error}"')
+    # …and naming it is only worth anything if it *reads* differently from the
+    # outcome it is denying. `outbox.py:495` records this exact failure mode:
+    # a contradiction stayed invisible "for as long as both came out of
+    # `STATUS_LABELS` as the same string". Collapse those two labels and the
+    # assertion above still passes while the operator is back to being told
+    # "Canceled" over a send that is going out.
+    assert error != outbox.STATUS_LABELS[outbox.CANCELED], (
+        "the lost race is worded identically to a successful cancel, so the "
+        "operator cannot tell them apart — which is the harm, not the refusal")
