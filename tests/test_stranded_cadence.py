@@ -471,13 +471,38 @@ def test_the_repair_is_idempotent(tenant, browser, monkeypatch):
 
 def test_a_healthy_send_is_never_touched(tenant, browser, monkeypatch):
     """With the settle window at zero, so the window is not what is being
-    credited. The CAS is; the window only keeps the repair quiet."""
+    credited. The CAS is; the window only keeps the repair quiet.
+
+    The write count is asserted, not just the resulting row. A healthy send
+    stamps `sent_at` and `last_contact_at` from the same instant, so the two are
+    *equal* — which puts the steady state exactly on the boundary of
+    `_advance_owed`'s comparison. Loosen that `>=` to `>` and every healthy deal
+    is judged to owe an advance on every render; the CAS then refuses each one,
+    so the row is unchanged and an assertion about the row alone still passes.
+    What is left is an UPDATE per delivered deal per render, forever, and the
+    only way to see it is to count.
+    """
     _send(tenant, "h1", "Omar K.", advance_fails=False)
     before = _assert_advanced(tenant, "h1")
+    # An old healthy deal: outside the settle window, still with its contact
+    # stamped at the delivery. `_send_worker` writes them from one `now`, so
+    # backdating both together is the steady state, not a contrivance.
+    _, sent_at = _backdate_delivery(tenant, "h1", seconds=PAST_SETTLE_SECONDS)
+    pipeline.update(tenant, SITE, "h1", last_contact_at=sent_at)
+    before = pipeline.get(tenant, SITE, "h1")
 
     monkeypatch.setattr(automation, "SETTLE_SECONDS", 0)
-    assert automation.reconcile_contacts(tenant, SITE) == 0
+    real_update = pipeline.update
+    writes = []
+    pipeline.update = lambda *a, **k: (writes.append(a), real_update(*a, **k))[1]
+    try:
+        assert automation.reconcile_contacts(tenant, SITE) == 0
+    finally:
+        pipeline.update = real_update
 
+    assert writes == [], (
+        f"a repair pass over a healthy board must write nothing; it issued "
+        f"{len(writes)} deal update(s)")
     after = pipeline.get(tenant, SITE, "h1")
     for col in ("stage", "step_index", "next_action_at", "next_action_step",
                 "last_contact_at", "first_reply_at"):
