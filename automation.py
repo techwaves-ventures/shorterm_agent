@@ -19,6 +19,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime, timedelta
 
 import config
 import outbox
@@ -60,31 +61,62 @@ def reschedule(tenant_id: str, site: str, item_id: str) -> dict | None:
     return pipeline.get(tenant_id, site, item_id)
 
 
-def after_contact(tenant_id: str, site: str, item_id: str) -> None:
+def after_contact(tenant_id: str, site: str, item_id: str,
+                  at: str | None = None, once_since: str | None = None) -> bool:
     """Called when a message actually reaches the guest.
 
     Advances the deal past the step we just delivered and schedules the next
     one. This is what starts the follow-up clock — a deal only enters the
     nurture cadence once real contact has been made, so a draft the owner never
     approved never triggers follow-ups.
+
+    One UPDATE, deliberately. This used to be three (`record_contact`, the step
+    bump, `reschedule`), and its caller swallows failures so that a lifecycle
+    error cannot fail a reply the guest has already read. A fault between those
+    writes therefore left the deal contacted-but-unadvanced with nothing raised
+    to anyone — and, worse, in a state no later pass could recognise as broken,
+    because "contact stamped" is exactly what a healthy advance looks like from
+    outside. Folding them into one statement makes the advance all-or-nothing,
+    which is what lets `reconcile_contacts` below identify an owed advance from
+    the stored columns alone (VEN-219).
+
+    `at` is when the message reached the guest (default now); the follow-up is
+    anchored on it. `once_since` makes the write a compare-and-set against a
+    contact stamp at or after that moment — pass the delivery time and two
+    racing callers can only advance the deal once between them. Returns whether
+    this call is what advanced the deal.
     """
     deal = pipeline.get(tenant_id, site, item_id)
     if not deal:
-        return
-    pipeline.record_contact(tenant_id, site, item_id)
+        return False
+    fields = pipeline.contact_fields(deal, at)
     idx = int(deal.get("step_index") or 0)
     seq = deal.get("sequence")
+    stage = deal.get("stage")
     if not sequences.is_last_step(seq, idx):
-        stage = deal.get("stage")
-        fields = {"step_index": idx + 1}
-        # A second pre-sale touch means we're formally nurturing, not just contacted.
+        fields["step_index"] = idx + 1
+        # A second pre-sale touch means we're formally nurturing, not just
+        # contacted. Read from the pre-contact snapshot, as it always has: a
+        # deal arriving here `new` is promoted to `contacted` by this same
+        # write, and it is not nurturing anyone on the strength of one touch.
         if seq == sequences.PRESALE and idx >= 1 and stage == pipeline.CONTACTED:
             fields["stage"] = pipeline.NURTURING
-        pipeline.update(tenant_id, site, item_id, **fields)
-        reschedule(tenant_id, site, item_id)
+        if stage in (pipeline.LOST, pipeline.COMPLETED):
+            # `reschedule` refused to schedule a closed deal; keep that refusal,
+            # since the merged write no longer goes through it.
+            fields["next_action_at"] = None
+            fields["next_action_step"] = None
+        else:
+            # Scheduled off the merged deal, so `followup_1` anchors on the
+            # contact stamp this same statement is about to write.
+            when, step_id = sequences.schedule({**deal, **fields})
+            fields["next_action_at"] = when
+            fields["next_action_step"] = step_id
     else:
-        pipeline.update(tenant_id, site, item_id,
-                        next_action_at=None, next_action_step=None)
+        fields["next_action_at"] = None
+        fields["next_action_step"] = None
+    return pipeline.update(tenant_id, site, item_id,
+                           uncontacted_since=once_since, **fields)
 
 
 def start_prearrival(tenant_id: str, site: str, item_id: str,
@@ -260,6 +292,93 @@ def send_next(tenant_id: str, site: str, timeout: int = 300) -> dict | None:
                       error="timed out waiting for the send to finish")
     _notify_failure(msg, "the send timed out")
     return msg
+
+
+# How long a delivery is left alone before a repair pass will touch it. The
+# send worker stamps `sent_at` and *then* advances the deal, so for a moment
+# every healthy send looks exactly like a stranded one. The compare-and-set in
+# `after_contact` is what actually makes the repair safe; this only keeps the
+# repair from racing a send that is still finishing, and keeps a cross-host
+# clock skew (see `timeframe`) costing at most a delayed repair rather than a
+# wrong one. Do not remove the CAS on the strength of this window existing.
+SETTLE_SECONDS = 120
+
+
+def _advance_owed(deal: dict, response: dict | None, before_iso: str) -> str | None:
+    """The delivery time whose lifecycle advance never landed, or None.
+
+    Derived, not recorded: `responses.sent_at` says a message reached the guest,
+    `deals.last_contact_at` says the advance for it ran, and `after_contact`
+    writes the second in one statement. So a contact stamp older than the send —
+    or missing entirely — means the advance is owed, and the same predicate goes
+    false the instant it is paid. That is the whole reason `after_contact` is one
+    UPDATE; while it was three, a half-applied advance stamped the contact
+    without advancing anything and this could not see it.
+    """
+    resp = response or {}
+    if resp.get("status") != "sent":
+        return None
+    sent_at = pipeline.norm_ts(resp.get("sent_at"))
+    if not sent_at or sent_at > before_iso:
+        return None
+    if pipeline.cmp_ts(deal.get("last_contact_at")) >= pipeline.cmp_ts(sent_at):
+        return None
+    return sent_at
+
+
+def reconcile_contacts(tenant_id: str, site: str,
+                       responses: dict[str, dict] | None = None) -> int:
+    """Finish lifecycle advances that a delivered send failed to make.
+
+    `runner._send_worker` swallows a failure here on purpose — a reply the guest
+    has already read must not be reported as failed because the database was
+    locked for a moment. The cost of that swallow is that the advance had
+    exactly one chance, and losing it is silent: the reply goes out, the cadence
+    never starts, and the board reads "awaiting guest" with nothing scheduled.
+    Left alone, `pipeline.advance_lifecycle` then closes the deal as
+    "No reply for 21 days" — a guest who was messaged once and never chased.
+
+    So the swallow stays and this pays the debt afterwards, the way
+    `outbox.reclaim_stuck_sending` pays for a send stranded mid-flight. It runs
+    from the same two places for the same reason: the worker pass, and every
+    dashboard render, because the default topology has no worker at all.
+
+    A deal whose guest has already written back is stamped but not scheduled.
+    The contact is a fact and the 21-day clock should run from it, but chasing
+    someone for silence they have already broken is the harm
+    `pipeline.record_guest_reply` exists to prevent — and re-arming the cadence
+    would also bury their reply, since "guest replied" is
+    `last_guest_reply_at > last_contact_at`.
+    """
+    # Same shape and clock as `pipeline._now()`, which is what the two stamps
+    # being compared are written in — deliberately not the schedule frame, since
+    # `timeframe.stamp` would put the cutoff on a different clock to the values.
+    before = (datetime.now() - timedelta(seconds=SETTLE_SECONDS)).isoformat(
+        timespec="seconds")
+    if responses is None:
+        responses = storage.get_responses(tenant_id, site)
+    repaired = 0
+    for deal in pipeline.all_deals(tenant_id, site):
+        item_id = deal["item_id"]
+        try:
+            sent_at = _advance_owed(deal, responses.get(item_id), before)
+            if not sent_at:
+                continue
+            if pipeline.guest_is_waiting(deal):
+                pipeline.record_contact(tenant_id, site, item_id, at=sent_at)
+                continue
+            if after_contact(tenant_id, site, item_id,
+                             at=sent_at, once_since=sent_at):
+                repaired += 1
+                log.warning(
+                    "Recovered the follow-up cadence for %s: delivered at %s, "
+                    "lifecycle advance had not run", item_id, sent_at)
+        except Exception:
+            # One unusable deal must not stop the pass, and must not take the
+            # dashboard render this runs inside down with it — the same posture
+            # as `pipeline.backfill`'s per-item guard.
+            log.exception("Could not reconcile the lifecycle advance for %s", item_id)
+    return repaired
 
 
 def _notify_failure(msg: dict, reason: str) -> None:

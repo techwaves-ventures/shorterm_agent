@@ -260,6 +260,14 @@ def _board(tenant_id: str) -> dict:
     # Items scraped before the pipeline existed get a deal on first view, so an
     # existing install picks up the lifecycle without a migration step.
     pipeline.backfill(tenant_id, SITE, items, responses, config.get_units(tenant_id))
+    # Self-heal on view, before the deals are read: finish any lifecycle advance
+    # a delivered send failed to make. Same placement rule as the reclaim below —
+    # the render that repairs something is the render that most needs to show it,
+    # so a deal healed here appears as "Scheduled" on this page rather than one
+    # poll later. Ungated for the same reason too: it is pure DB work, and the
+    # default topology runs no worker.py at all, so gating it would leave the
+    # strand permanent for most installs.
+    automation.reconcile_contacts(tenant_id, SITE, responses)
     deals = pipeline.all_deals(tenant_id, SITE)
     # Self-heal on view: requeue sends stranded by a crashed process.
     #

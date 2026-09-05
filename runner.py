@@ -361,9 +361,23 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
         try:
             import automation
 
-            automation.after_contact(tenant_id, site, item_id)
+            automation.after_contact(tenant_id, site, item_id, at=now,
+                                     once_since=now)
         except Exception:
+            # Still swallowed: the guest has read this reply, and a locked
+            # database is no reason to report it failed. But swallowed is not
+            # the same as unrecorded. `automation.reconcile_contacts` re-derives
+            # this deal as owing an advance from the `sent_at` above and
+            # finishes it on the next worker pass or dashboard render, and the
+            # operator is told now rather than discovering weeks later that a
+            # guest was messaged once and then auto-closed for "No reply for 21
+            # days".
             log.exception("Could not advance deal lifecycle for %s", item_id)
+            notify(
+                "Follow-up cadence didn't start",
+                f"The reply to {who} was delivered, but scheduling their "
+                f"follow-ups failed. It will be retried automatically.",
+            )
 
         # 2. Email — best-effort; never fails the send if the platform reply went.
         email_note = ""
