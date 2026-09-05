@@ -180,15 +180,22 @@ def _advance_raising():
         automation.after_contact = real
 
 
-def _send(tid, item_id, guest, *, advance_fails):
+def _send(tid, item_id, guest, *, advance_fails, guest_replied_at=None):
     """Deliver a reply through the real `_send_worker`.
 
     Via `runner.send_reply` rather than `automation.send_next`, deliberately:
     that is the entry point `browser_server.py`'s `/v1/reply` uses, and it
     bypasses `send_next` entirely. A fix placed in `send_next` would pass a
     `send_next`-driven test and still leave this path silent.
+
+    `guest_replied_at` stamps a guest message *before* the send, which is the
+    ordinary shape of a threaded conversation — the guest writes in, the owner
+    answers. Both `runner._scrape_worker` and `inbound` call
+    `record_guest_reply` on the parent deal before the owner's reply goes out.
     """
     item = _seed(tid, item_id, guest)
+    if guest_replied_at is not None:
+        pipeline.record_guest_reply(tid, SITE, item_id, at=guest_replied_at)
     with _advance_raising() if advance_fails else contextlib.nullcontext():
         state = runner.send_reply(tid, SITE, item, f"Hi {guest}, happy to hold it.")
         assert state.get("status") != "busy", (
@@ -452,6 +459,60 @@ def test_two_racing_repairs_advance_the_deal_exactly_once(
         "step_index 2 means the guest skips followup_1 entirely")
 
 
+def test_a_repair_racing_the_send_worker_advances_the_deal_exactly_once(
+        tenant, browser, monkeypatch):
+    """The same compare-and-set, pinned at the call site instead of the callee.
+
+    The test above proves `after_contact` honours `once_since`. It cannot prove
+    `reconcile_contacts` *passes* it: it calls `after_contact` directly, so the
+    reconciler's own argument list is one call frame outside everything it can
+    see. Drop `once_since=` from the reconciler and the WHERE term stays in
+    `pipeline.update`, the callee test stays green, and the whole suite stays
+    green — while the interlock the PR rests on is gone.
+
+    So the race is driven through `reconcile_contacts`, and the competitor is
+    the send worker's own advance, spelled exactly as `runner._send_worker`
+    issues it. The interleaving is the one that hurts: the reconciler decides an
+    advance is owed from the deal list, and the worker's advance lands in the
+    gap before the reconciler re-reads. The reconciler then reads a deal already
+    at step 1 and, unguarded, writes step 2 — the guest skips `followup_1`
+    entirely and is chased next with `followup_2`.
+    """
+    _send(tenant, "w1", "Rafa M.", advance_fails=True)
+    _assert_stranded(tenant, "w1")
+    _, sent_at = _backdate_delivery(tenant, "w1", seconds=PAST_SETTLE_SECONDS)
+
+    # The seam is `after_contact`'s own re-read, which is the first `pipeline.get`
+    # of the pass. Restored before the competitor runs, so the competitor is
+    # ordinary shipping code and cannot recurse into this.
+    real_get = pipeline.get
+    raced = []
+
+    def racing_get(*a, **k):
+        if not raced:
+            pipeline.get = real_get
+            raced.append(automation.after_contact(
+                tenant, SITE, "w1", at=sent_at, once_since=sent_at))
+        return real_get(*a, **k)
+
+    pipeline.get = racing_get
+    try:
+        repaired = automation.reconcile_contacts(tenant, SITE)
+    finally:
+        pipeline.get = real_get
+
+    assert raced == [True], (
+        "control: the competing advance never ran, or did not win — nothing "
+        "below is about a race")
+    deal = pipeline.get(tenant, SITE, "w1")
+    assert int(deal["step_index"] or 0) == 1, (
+        "step_index 2 means the guest skips followup_1 entirely")
+    assert deal["next_action_step"] == "followup_1"
+    assert repaired == 0, (
+        "the reconciler reported a repair it did not make; the send worker had "
+        "already advanced this deal")
+
+
 def test_the_repair_is_idempotent(tenant, browser, monkeypatch):
     """A second pass over an already-repaired deal is a no-op."""
     _send(tenant, "i1", "Sam T.", advance_fails=True)
@@ -532,7 +593,7 @@ def test_a_send_that_is_still_settling_is_left_alone_then_repaired(
     _assert_advanced(tenant, "s1")
 
 
-def test_a_guest_who_already_replied_is_stamped_but_never_chased(
+def test_a_guest_who_replied_after_the_delivery_is_advanced_but_not_chased(
         tenant, browser, monkeypatch):
     """The hazard in the repair, and the reason it is not a plain retry.
 
@@ -542,23 +603,185 @@ def test_a_guest_who_already_replied_is_stamped_but_never_chased(
     — the exact harm `record_guest_reply` exists to prevent.
 
     The contact still has to be stamped: it is a fact, and the 21-day abandon
-    clock measures from it.
+    clock measures from it. So does the step — `step_index` names the *next*
+    step to draft, so a repair that stamps the contact and stops leaves the
+    owner's next touch re-sending the reply this guest has already read, and
+    leaves it there permanently, since the stamp is what makes `_advance_owed`
+    say nothing is owed.
+
+    The state is asserted through `lead_state`, which is what the board actually
+    branches on, rather than through the predicate underneath it.
     """
     _send(tenant, "g1", "Priya S.", advance_fails=True)
     _assert_stranded(tenant, "g1")
     _, sent_at = _backdate_delivery(tenant, "g1",
                                     seconds=PAST_SETTLE_SECONDS)
+    # After the delivery, which is the ordering the stand-down is for.
     pipeline.record_guest_reply(tenant, SITE, "g1")
 
     automation.reconcile_contacts(tenant, SITE)
 
     deal = pipeline.get(tenant, SITE, "g1")
+    resp = storage.get_responses(tenant, SITE).get("g1")
     assert deal["last_contact_at"] == sent_at, "the contact is a fact; stamp it"
+    assert int(deal["step_index"] or 0) == 1, (
+        "the delivered step was not consumed, so the owner's next touch drafts "
+        "the message this guest has already read")
     assert deal["next_action_at"] is None, (
         "re-arming the cadence chases a guest who has already written back")
-    assert pipeline.guest_is_waiting(deal), (
+    assert deal["next_action_step"] is None
+    assert deal["stage"] == pipeline.CONTACTED, (
+        "nurturing means chasing silence, and this guest has broken it")
+    assert pipeline.lead_state(deal, resp) == pipeline.GUEST_REPLIED, (
         "the badge saying the owner owes this guest a reply must survive the "
         "repair — stamping the contact at the repair time would retire it")
+
+
+# ---------------------------------------------------------------------------
+# The same guard, on the ordering that carries most of the product's sends
+# ---------------------------------------------------------------------------
+
+def test_a_healthy_send_after_an_earlier_guest_message_starts_the_cadence(
+        tenant, browser, monkeypatch):
+    """Control, and the definition the repair below is measured against.
+
+    A guest writing in *before* the owner's reply is the ordinary threaded
+    conversation, not an exception: `record_guest_reply` runs on the parent deal
+    for every threaded message (`runner.py`, `inbound.py`), so every send after
+    the first on an answered deal has this shape. Nothing about that prior
+    message suppresses the cadence — the owner answered them, so the ball is
+    back with the guest and `followup_1` is armed as usual.
+
+    Without this control the test below reads as an assertion about repair
+    behaviour in isolation. With it, it is an assertion that the repair and the
+    healthy send agree, which is the only standard a repair pass can be held to.
+    """
+    guest_at = (datetime.now() - timedelta(seconds=PAST_SETTLE_SECONDS + 600)
+                ).isoformat(timespec="seconds")
+    _send(tenant, "k1", "Priya S.", advance_fails=False,
+          guest_replied_at=guest_at)
+
+    deal = _assert_advanced(tenant, "k1")
+    resp = storage.get_responses(tenant, SITE).get("k1")
+    assert pipeline.lead_state(deal, resp) == pipeline.SCHEDULED
+
+
+def test_a_strand_behind_an_earlier_guest_message_is_still_repaired(
+        tenant, browser, monkeypatch):
+    """The same ordering with the advance stranded: the repair must land the
+    deal where the control above landed it.
+
+    This is the case a guard written as `guest_is_waiting(deal)` gets wrong, and
+    it is not a corner. That predicate compares the guest's message to the row's
+    own `last_contact_at` — which on a stranded deal is stale by construction,
+    because that staleness *is* the fault. So it reports a guest who was
+    answered ten minutes later as still waiting, skips the repair, and stamps
+    the contact anyway; after that `_advance_owed` sees nothing owed and no
+    later pass can reach the deal. The comparison has to be against the delivery
+    being repaired.
+
+    Second pass asserted too: "repaired" and "no longer visible to the
+    reconciler" look identical from the repaired row alone.
+    """
+    guest_at = (datetime.now() - timedelta(seconds=PAST_SETTLE_SECONDS + 600)
+                ).isoformat(timespec="seconds")
+    _send(tenant, "k2", "Priya S.", advance_fails=True,
+          guest_replied_at=guest_at)
+    stranded = pipeline.get(tenant, SITE, "k2")
+    assert (storage.get_responses(tenant, SITE).get("k2") or {}).get(
+        "status") == "sent", "precondition: the reply was not delivered"
+    assert stranded["last_contact_at"] is None, "precondition: not stranded"
+    assert stranded["next_action_at"] is None, "precondition: not stranded"
+    _, sent_at = _backdate_delivery(tenant, "k2", seconds=PAST_SETTLE_SECONDS)
+
+    assert automation.reconcile_contacts(tenant, SITE) == 1, (
+        "the repair was skipped on the ordering that carries every send after "
+        "the first")
+
+    deal = _assert_advanced(tenant, "k2")
+    resp = storage.get_responses(tenant, SITE).get("k2")
+    assert deal["last_contact_at"] == sent_at
+    assert deal["next_action_step"] == "followup_1"
+    assert pipeline.lead_state(deal, resp) == pipeline.SCHEDULED, (
+        "the control ends `scheduled`; a deal the repair stamped without "
+        "advancing reads `awaiting_guest` and is chased by nobody")
+    assert automation.reconcile_contacts(tenant, SITE) == 0, (
+        "a repaired deal must be settled, not merely unreachable")
+
+
+def test_a_stood_down_repair_lands_where_the_healthy_send_landed(
+        tenant, browser, monkeypatch):
+    """The stand-down arm, held to the only standard a repair pass has: the
+    row the operation it stands in for would have produced.
+
+    Both arms are the same conversation at the same clock — first reply, guest
+    answers, owner replies again, guest answers again — and they differ in one
+    thing: on the second arm the lifecycle advance is lost. Run in one tenant so
+    a single `reconcile_contacts` pass sees both, which also pins that the pass
+    leaves the healthy deal alone.
+
+    The second touch is where the stand-down gets interesting: at `step_index`
+    1 a pre-sale advance promotes the deal to `nurturing`. A healthy send does
+    promote it — and then the guest's reply pulls it straight back to
+    `contacted`, because nurturing means chasing silence. A repair that runs
+    after the reply has to arrive at `contacted` directly; promoting on the way
+    would leave the two arms describing the same guest differently, and it is
+    the repaired one that would be wrong.
+    """
+    now = datetime.now().replace(microsecond=0)
+
+    def stamp(**delta):
+        return (now - timedelta(**delta)).isoformat(timespec="seconds")
+
+    item = {"id": None, "kind": "lead", "traveler": "Priya S.",
+            "title": "2BR Midtown | Priya S.", "property_name": "Midtown 2BR"}
+
+    for item_id, strands in (("n1", False), ("n2", True)):
+        # Touch one, healthy on both arms, backdated so the second touch is
+        # the newer contact.
+        _send(tenant, item_id, "Priya S.", advance_fails=False)
+        _assert_advanced(tenant, item_id)
+        pipeline.update(tenant, SITE, item_id, last_contact_at=stamp(hours=3))
+        pipeline.record_guest_reply(tenant, SITE, item_id, at=stamp(hours=2))
+
+        # Touch two: delivered on both arms, advanced on only one.
+        with _advance_raising() if strands else contextlib.nullcontext():
+            state = runner.send_reply(tenant, SITE, {**item, "id": item_id},
+                                      "Hi Priya, those dates work.")
+            assert state.get("status") != "busy"
+            _settle(tenant)
+        storage.update_response(tenant, SITE, item_id, sent_at=stamp(hours=1))
+        if not strands:
+            # `_send_worker` writes `sent_at` and the contact stamp from one
+            # `now`, so they move together — this is the steady state, not a
+            # contrivance. On the stranded arm there is no contact stamp to move.
+            pipeline.update(tenant, SITE, item_id, last_contact_at=stamp(hours=1))
+        # The guest answers our second touch, on both arms.
+        pipeline.record_guest_reply(tenant, SITE, item_id, at=stamp(minutes=30))
+
+    healthy_before = pipeline.get(tenant, SITE, "n1")
+    assert int(healthy_before["step_index"] or 0) == 2, (
+        "precondition: the healthy arm did not take its second step, so there "
+        "is nothing meaningful to compare the repair against")
+    assert int(pipeline.get(tenant, SITE, "n2")["step_index"] or 0) == 1, (
+        "precondition: the second advance was not stranded")
+
+    assert automation.reconcile_contacts(tenant, SITE) == 1, (
+        "exactly the stranded arm; a healthy deal must not be repaired")
+
+    healthy = pipeline.get(tenant, SITE, "n1")
+    repaired = pipeline.get(tenant, SITE, "n2")
+    for col in ("stage", "step_index", "next_action_at", "next_action_step",
+                "last_contact_at"):
+        assert repaired[col] == healthy[col], (
+            f"{col}: repaired {repaired[col]!r} != healthy {healthy[col]!r}")
+    assert healthy["stage"] == pipeline.CONTACTED, (
+        "guard on the comparison itself: if a guest reply stopped pulling the "
+        "deal out of `nurturing`, both arms could agree on the wrong stage")
+    for col in ("stage", "step_index", "next_action_at", "next_action_step",
+                "last_contact_at"):
+        assert healthy[col] == healthy_before[col], (
+            f"{col} changed on the healthy arm during the repair pass")
 
 
 # ---------------------------------------------------------------------------

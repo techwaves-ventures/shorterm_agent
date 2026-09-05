@@ -924,7 +924,7 @@ def _is_abandoned(deal: dict, stale_before: str) -> bool:
     """
     if deal.get("next_action_at"):
         return False
-    if guest_is_waiting(deal):
+    if _guest_is_waiting(deal):
         return False
     last = max(cmp_ts(deal.get("last_guest_reply_at")),
                cmp_ts(deal.get("last_contact_at")),
@@ -971,7 +971,7 @@ def lead_state(deal: dict, response: dict | None = None,
 
     if deal.get("stage") in CLOSED_STAGES or status == "dismissed":
         return CLOSED
-    if guest_is_waiting(deal):
+    if _guest_is_waiting(deal):
         return GUEST_REPLIED
     if has_failed_send or is_draft_failure(resp):
         return NEEDS_YOU
@@ -985,7 +985,7 @@ def lead_state(deal: dict, response: dict | None = None,
     return AWAITING_GUEST
 
 
-def guest_is_waiting(deal: dict) -> bool:
+def _guest_is_waiting(deal: dict) -> bool:
     """True when the guest's last message came after our last one."""
     replied = cmp_ts(deal.get("last_guest_reply_at"))
     if not replied:

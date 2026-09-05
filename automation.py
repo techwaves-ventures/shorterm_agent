@@ -62,7 +62,8 @@ def reschedule(tenant_id: str, site: str, item_id: str) -> dict | None:
 
 
 def after_contact(tenant_id: str, site: str, item_id: str,
-                  at: str | None = None, once_since: str | None = None) -> bool:
+                  at: str | None = None, once_since: str | None = None,
+                  chase: bool = True) -> bool:
     """Called when a message actually reaches the guest.
 
     Advances the deal past the step we just delivered and schedules the next
@@ -85,6 +86,14 @@ def after_contact(tenant_id: str, site: str, item_id: str,
     contact stamp at or after that moment — pass the delivery time and two
     racing callers can only advance the deal once between them. Returns whether
     this call is what advanced the deal.
+
+    `chase=False` records the contact and advances the step but leaves the deal
+    stood down: no next action, no nurture promotion. It is for a repair of a
+    delivery the guest has *already* written back to (see `reconcile_contacts`),
+    and it is what `record_guest_reply` would have done to this deal the moment
+    the reply arrived, had the advance not been lost. Advancing the step still
+    matters: `step_index` names the *next* step to draft, so leaving it behind
+    makes the owner's next touch re-send the one already delivered.
     """
     deal = pipeline.get(tenant_id, site, item_id)
     if not deal:
@@ -99,11 +108,14 @@ def after_contact(tenant_id: str, site: str, item_id: str,
         # contacted. Read from the pre-contact snapshot, as it always has: a
         # deal arriving here `new` is promoted to `contacted` by this same
         # write, and it is not nurturing anyone on the strength of one touch.
-        if seq == sequences.PRESALE and idx >= 1 and stage == pipeline.CONTACTED:
+        if (chase and seq == sequences.PRESALE and idx >= 1
+                and stage == pipeline.CONTACTED):
             fields["stage"] = pipeline.NURTURING
-        if stage in (pipeline.LOST, pipeline.COMPLETED):
+        if not chase or stage in (pipeline.LOST, pipeline.COMPLETED):
             # `reschedule` refused to schedule a closed deal; keep that refusal,
-            # since the merged write no longer goes through it.
+            # since the merged write no longer goes through it. `chase=False`
+            # lands in the same place for a different reason — the guest has
+            # already answered, and nurturing means chasing silence.
             fields["next_action_at"] = None
             fields["next_action_step"] = None
         else:
@@ -343,12 +355,25 @@ def reconcile_contacts(tenant_id: str, site: str,
     from the same two places for the same reason: the worker pass, and every
     dashboard render, because the default topology has no worker at all.
 
-    A deal whose guest has already written back is stamped but not scheduled.
-    The contact is a fact and the 21-day clock should run from it, but chasing
-    someone for silence they have already broken is the harm
-    `pipeline.record_guest_reply` exists to prevent — and re-arming the cadence
+    A deal whose guest wrote back *after* the delivery being repaired is
+    advanced but stood down — see `after_contact(chase=False)`. Chasing someone
+    for silence they have already broken is the harm
+    `pipeline.record_guest_reply` exists to prevent, and re-arming the cadence
     would also bury their reply, since "guest replied" is
     `last_guest_reply_at > last_contact_at`.
+
+    That comparison is against `sent_at`, deliberately, and not against the
+    row's own `last_contact_at` the way `lead_state` does. On a stranded
+    deal `last_contact_at` is stale *by construction* — that staleness is the
+    fault being repaired — so reading it answers "did the guest write after our
+    last recorded contact" instead of "did they write after the delivery we are
+    repairing". The two disagree on the ordinary ordering *guest writes in →
+    owner replies → the advance strands*, which covers every send after the
+    first on a deal the guest has answered, and getting it wrong there is not
+    recoverable: standing the deal down stamps `last_contact_at = sent_at`, and
+    that stamp is exactly what makes `_advance_owed` say nothing is owed. A
+    guard inside a repair pass has to key off the repair's own reference value,
+    never off the column the fault corrupted.
     """
     # Same shape and clock as `pipeline._now()`, which is what the two stamps
     # being compared are written in — deliberately not the schedule frame, since
@@ -364,15 +389,16 @@ def reconcile_contacts(tenant_id: str, site: str,
             sent_at = _advance_owed(deal, responses.get(item_id), before)
             if not sent_at:
                 continue
-            if pipeline.guest_is_waiting(deal):
-                pipeline.record_contact(tenant_id, site, item_id, at=sent_at)
-                continue
-            if after_contact(tenant_id, site, item_id,
-                             at=sent_at, once_since=sent_at):
+            answered = (pipeline.cmp_ts(deal.get("last_guest_reply_at"))
+                        > pipeline.cmp_ts(sent_at))
+            if after_contact(tenant_id, site, item_id, at=sent_at,
+                             once_since=sent_at, chase=not answered):
                 repaired += 1
                 log.warning(
-                    "Recovered the follow-up cadence for %s: delivered at %s, "
-                    "lifecycle advance had not run", item_id, sent_at)
+                    "Recovered the lifecycle advance for %s: delivered at %s, "
+                    "advance had not run%s", item_id, sent_at,
+                    "; the guest has since replied, so no follow-up was armed"
+                    if answered else "")
         except Exception:
             # One unusable deal must not stop the pass, and must not take the
             # dashboard render this runs inside down with it — the same posture
