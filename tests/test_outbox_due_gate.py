@@ -405,6 +405,14 @@ def test_cancelling_the_blocker_immediately_unblocks_the_guest(client, tenant):
 
     resp = client.post(f"/outbox/{blocker['id']}/cancel", data={})
     assert resp.status_code == 200, f"cancel returned {resp.status_code}"
+    # The success arm's flag, for the same reason as the two refusal arms:
+    # `postForm` (`templates/dashboard.html:572`) discards `r.status`, so `ok`
+    # is the whole of what the operator sees. Flipping it leaves the row
+    # correctly canceled while `cancelMsg` reports "Could not cancel this
+    # message." and skips the reload — the mirror of the green-toast lie.
+    assert resp.get_json()["ok"] is True, (
+        "the cancel took, but the route reported failure — the dashboard shows "
+        "'Could not cancel this message.' over a row that is now canceled")
     assert outbox.get(blocker["id"])["status"] == outbox.CANCELED
 
     released, _ = outbox.release_to_send(pending["id"],
@@ -516,6 +524,17 @@ def test_the_cancel_route_reports_the_race_rather_than_a_green_toast(client, ten
     assert body["already"] is True, (
         "the refusal was not marked `already`, so the dashboard says nothing "
         "about why the cancel did not take")
+    # `ok`/`already` only decide *whether* the banner renders; `error` is the
+    # sentence in it — `Not cancelled — already "${res.error}"`. Round 1 pinned
+    # this string on the post-CAS arm and it did not travel here, so collapsing
+    # this arm's lookup to the CANCELED label left the file green while the
+    # operator read `already "Canceled"` over a message on its way to the guest.
+    error = body["error"]
+    assert error == outbox.STATUS_LABELS[outbox.SENDING], (
+        "the 409 must name the true state; the operator reads this string as "
+        f'Not cancelled - already "{error}"')
+    assert error != outbox.STATUS_LABELS[outbox.CANCELED], (
+        "the lost race is worded identically to a successful cancel")
 
 
 # --------------------------------------------------------------------------
