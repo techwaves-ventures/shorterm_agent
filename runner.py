@@ -333,6 +333,29 @@ def submit_otp(tenant_id: str, code: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _undelivered_reason(channels: set[str], tenant_email: str | None) -> str:
+    """Why a send that raised no error still delivered nothing.
+
+    Only reachable when every enabled channel declined to send. The platform
+    channel raises on its own failures, so it is never one of these — which is
+    why the branches below only have to explain the email ones. The order
+    mirrors the branch order in the email block, so the reason always names the
+    arm that actually fired. These strings reach the operator verbatim as the
+    outbox row's error, so they are written for a host, not for a log.
+    """
+    if not channels & {"platform", "email"}:
+        enabled = ", ".join(sorted(channels)) or "none"
+        return (f"No reply channel is enabled that this app can send on "
+                f"(configured: {enabled}). Nothing was sent.")
+    if not tenant_email:
+        return ("Email is the only enabled reply channel and this guest has no "
+                "email address on file. Nothing was sent.")
+    if not mailer.is_configured():
+        return ("Email is the only enabled reply channel and email is not "
+                "configured. Nothing was sent.")
+    return f"The email to {tenant_email} failed and it was the only reply channel."
+
+
 def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
     item_id = item["id"]
     kind = item.get("kind", "lead")
@@ -344,6 +367,13 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
 
     furnishedfinder.set_context(_ff_username(tenant_id), _otp_provider(tenant_id), _status_cb)
     try:
+        # Set only by a channel that actually put the message in front of the
+        # guest. `status=sent` and the cadence advance below hang off this, not
+        # off reaching the end of the function: a tenant with the platform
+        # channel switched off used to be recorded as contacted even when the
+        # email — their only delivery — failed or was never attempted.
+        delivered = False
+
         # 1. Platform reply — the source of truth for status=sent. Leads use the
         #    "Reply To Tenant" row action; messages reply inside the thread.
         if "platform" in channels:
@@ -353,20 +383,12 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
                     furnishedfinder.send_message_reply(page, item, text)
                 else:
                     furnishedfinder.send_reply(page, item, text)
-        now = datetime.now().isoformat(timespec="seconds")
-        storage.update_response(tenant_id, site, item_id, status="sent", draft=text, sent_at=now)
-        # Real contact was made: stamp response time and start the follow-up
-        # cadence. Imported here to keep runner free of an import cycle
-        # (automation -> runner for delivery).
-        try:
-            import automation
+            delivered = True
 
-            automation.after_contact(tenant_id, site, item_id)
-        except Exception:
-            log.exception("Could not advance deal lifecycle for %s", item_id)
-
-        # 2. Email — best-effort; never fails the send if the platform reply went.
+        # 2. Email — best-effort *when the platform reply already landed*, and
+        #    load-bearing when it did not, because then it is the only delivery.
         email_note = ""
+        only_channel = not delivered
         if "email" in channels:
             if not tenant_email:
                 email_note = " (no email on file — platform only)"
@@ -387,15 +409,42 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
                         tenant_id, site, item_id,
                         emailed_at=datetime.now().isoformat(timespec="seconds"),
                     )
+                    delivered = True
                     email_note = f" + emailed {tenant_email}"
                 except Exception as e:
                     log.exception("Email send failed for %s", item_id)
+                    # Unconditional: `/v1/reply` (browser_server) calls this
+                    # worker directly and never reaches automation's failure
+                    # notifier, so suppressing this would lose the alert
+                    # entirely on that path.
                     notify(
                         "Email reply failed",
-                        f"Platform reply to {who} sent, but email to "
-                        f"{tenant_email} failed: {e}",
+                        (f"Email was the only reply channel for {who} and it "
+                         f"failed: {e} — nothing reached the guest."
+                         if only_channel else
+                         f"Platform reply to {who} sent, but email to "
+                         f"{tenant_email} failed: {e}"),
                     )
                     email_note = f" (email to {tenant_email} FAILED — see logs)"
+
+        if not delivered:
+            # Raise rather than reporting inline, so the handler below stays the
+            # single place a failed send is recorded. Callers that drain the
+            # outbox read status=error and mark the row failed, which routes the
+            # send into the existing "Retry send" surface.
+            raise RuntimeError(_undelivered_reason(channels, tenant_email))
+
+        now = datetime.now().isoformat(timespec="seconds")
+        storage.update_response(tenant_id, site, item_id, status="sent", draft=text, sent_at=now)
+        # Real contact was made: stamp response time and start the follow-up
+        # cadence. Imported here to keep runner free of an import cycle
+        # (automation -> runner for delivery).
+        try:
+            import automation
+
+            automation.after_contact(tenant_id, site, item_id)
+        except Exception:
+            log.exception("Could not advance deal lifecycle for %s", item_id)
 
         _set(status="done", message=f"Reply sent to {who}{email_note}.", running=False)
     except Exception as e:
