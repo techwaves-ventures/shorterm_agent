@@ -497,6 +497,14 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str,
         # Real contact was made: stamp response time and start the follow-up
         # cadence. Imported here to keep runner free of an import cycle
         # (automation -> runner for delivery).
+        #
+        # This is the SOLE owner of the cadence advance — do not add a second
+        # one in `automation.send_next` on observing this run finish.
+        # `after_contact` is not idempotent, so two callers advanced the deal
+        # two steps and the guest was skipped Followup 1 (VEN-217). Nor can this
+        # one move to `send_next` instead: `browser_server`'s `/v1/reply` calls
+        # `send_reply` directly, with no outbox row and no drainer, so that
+        # guest's cadence would never start at all.
         try:
             import automation
 
