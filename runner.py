@@ -400,7 +400,24 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
         _set(status="done", message=f"Reply sent to {who}{email_note}.", running=False)
     except Exception as e:
         log.exception("Send failed for %s", item_id)
-        _set(status="error", message=f"Send failed: {e}", running=False)
+        # A bare reason, not a sentence. This message is what `automation.send_next`
+        # copies into `outbox.error`, and every surface that renders that column
+        # supplies its own framing: the card prepends "Send failed: "
+        # (dashboard.html), the digest prints it under "** N messages FAILED to
+        # send **", and `_notify_failure` writes "… didn't go out: {reason}". A
+        # label here was a second copy on all three ("Send failed: Send failed:
+        # reply box not found"). The other four writers of that column
+        # ("stored item not found", the send timeout, the abandon-after-N-attempts
+        # note) already store a bare reason, so this is the column's contract and
+        # this handler was the one violating it.
+        #
+        # The banner (dashboard.html:210/778) renders the message unlabelled and
+        # so reads terser now — which is exactly how it already reads for a failed
+        # scrape, whose handler above stores a bare `str(e)` too.
+        #
+        # `or type(e).__name__` because an exception raised with no message would
+        # otherwise store "", and a blank red banner names nothing.
+        _set(status="error", message=str(e) or type(e).__name__, running=False)
     finally:
         furnishedfinder.clear_context()
         # Belt-and-braces: the paths above already clear `running`, but if one
