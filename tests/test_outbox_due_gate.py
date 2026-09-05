@@ -875,3 +875,62 @@ def test_rows_sharing_one_clamped_stamp_are_broken_the_drainer_s_way(tenant, ord
         f"{order}: the card is captioned by row {state['id']} but the drainer "
         f"takes row {drainer_takes['id']} next — with the stamps tied, the id "
         "order is the only thing left to agree on and it does not")
+
+
+# --------------------------------------------------------------------------
+# 8. The cancel route's post-CAS arm, which no test reaches
+#
+# `test_the_cancel_route_reports_the_race_rather_than_a_green_toast` above is
+# named for this race but does not run it: it pre-sets `SENDING`, so the
+# route's ordinary pre-check answers 409 and returns. The five lines below
+# that check — written precisely because a pre-read cannot see a claim landing
+# *after* it — were reachable by nothing in the suite. Reverting them to an
+# unconditional `{"ok": true}` left all 43 tests here green, which is a green
+# toast over a message the guest receives, five deletable lines away.
+# --------------------------------------------------------------------------
+
+def test_the_cancel_route_reports_a_race_it_lost_after_its_own_read(client, tenant,
+                                                                   monkeypatch):
+    """The claim lands after the route's read, which is the arm's precondition.
+
+    Frame-matching `cancel` pins the injection to the real window — between
+    `cancel`'s own read and its CAS. It is deliberately *not* what makes the
+    branch reachable: dropping the frame term still kills the mutant, because
+    `racing_get` hands back the row it read *before* claiming, so the route's
+    pre-check sees `queued` and falls through either way. Measured, not argued.
+    But that leaves reachability riding on a stale snapshot the route happens to
+    be holding, so the guard stays and the window stays stated.
+    """
+    import sys
+
+    _deal(tenant, "L1")
+    msg = _add(tenant, "L1", auto=True)
+    assert outbox.get(msg["id"])["status"] in outbox.CANCELABLE, (
+        "precondition: the row is not cancelable, so the route would 409 from "
+        "its pre-check and the race arm would go unexercised")
+
+    real_get = outbox.get
+    fired = {"n": 0}
+
+    def racing_get(mid):
+        row = real_get(mid)
+        if sys._getframe(1).f_code.co_name == "cancel" and fired["n"] == 0:
+            fired["n"] += 1
+            outbox.set_status(mid, outbox.SENDING)   # the drainer wins the claim
+        return row
+
+    monkeypatch.setattr(outbox, "get", racing_get)
+    resp = client.post(f"/outbox/{msg['id']}/cancel", data={})
+    # Restore by re-patching. `monkeypatch.undo()` would also revert the
+    # `db.DB_PATH` the `tenant` fixture set, and the assertions below would then
+    # read a different database — which presents as the row having vanished.
+    monkeypatch.setattr(outbox, "get", real_get)
+
+    # An earlier race test on this ticket matched the wrong frame and silently
+    # never fired, passing for months while asserting nothing.
+    assert fired["n"] == 1, "injection never fired — the test proved nothing"
+    assert outbox.get(msg["id"])["status"] == outbox.SENDING, (
+        "the CAS overwrote a row the drainer had already claimed")
+    assert resp.status_code == 409, (
+        f"route answered {resp.status_code} for a send it did not cancel; the "
+        "guest receives this message and the operator was told it was stopped")
