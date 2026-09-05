@@ -504,6 +504,18 @@ def test_the_cancel_route_reports_the_race_rather_than_a_green_toast(client, ten
     assert resp.status_code == 409, (
         f"cancel answered {resp.status_code} for a row already being delivered")
     assert outbox.get(msg["id"])["status"] == outbox.SENDING
+    # The docstring names `{"ok": true}` as the lie, and until this line nothing
+    # asserted it: `postForm` (`templates/dashboard.html:572`) discards
+    # `r.status`, so the 409 above is invisible to the only caller. This is the
+    # route's *common* arm — a row already `sending` or `sent`, no race needed —
+    # and flipping `ok` here left the whole file green while `cancelMsg`
+    # reloaded the page as though the message had been called off.
+    body = resp.get_json()
+    assert body["ok"] is False, (
+        "the route reported success over a row the drainer is delivering")
+    assert body["already"] is True, (
+        "the refusal was not marked `already`, so the dashboard says nothing "
+        "about why the cancel did not take")
 
 
 # --------------------------------------------------------------------------
@@ -937,11 +949,32 @@ def test_the_cancel_route_reports_a_race_it_lost_after_its_own_read(client, tena
         f"route answered {resp.status_code} for a send it did not cancel; the "
         "guest receives this message and the operator was told it was stopped")
 
-    # The status code owns the *refusal*; this owns the *report*, which is the
-    # half of the harm the ticket words most emphatically ("telling someone a
-    # message was cancelled when it was not"). `templates/dashboard.html:748`
-    # renders this string verbatim: Not cancelled — already "<error>".
-    error = resp.get_json()["error"]
+    # The status code owns the *refusal* — but it is the one field this route's
+    # sole consumer never looks at: `postForm` (`templates/dashboard.html:572`)
+    # returns `r.json()` and throws `r.status` away. `cancelMsg` (`:740`)
+    # dispatches on the *body*, in the order `res.ok` → `res.already` →
+    # `res.error`, so the body is what has to be asserted, in that order.
+    # Answering `409 {"ok": true}` takes the first branch —
+    # `if (res.ok) { location.reload(); return; }` — and the page reloads
+    # exactly as it does after a cancel that worked, saying nothing at all about
+    # the send still on its way to the guest.
+    body = resp.get_json()
+    assert body["ok"] is False, (
+        "the route reported success for a send it did not cancel; the dashboard "
+        "reads `ok` first and silently reloads, so the operator is shown the "
+        "same screen as a cancel that worked")
+    # `already` is the gate on the message below ever being rendered, and on the
+    # refresh that follows it. Drop it and the banner loses `Not cancelled —
+    # already`, printing a bare `Sending…` with no auto-refresh behind it.
+    assert body["already"] is True, (
+        "the refusal was not marked as a lost race, so the dashboard falls "
+        "through to its generic message and never says what actually happened")
+
+    # This owns the *report*, which is the half of the harm the ticket words
+    # most emphatically ("telling someone a message was cancelled when it was
+    # not"). `templates/dashboard.html:748` renders this string verbatim:
+    # Not cancelled — already "<error>".
+    error = body["error"]
     assert error == outbox.STATUS_LABELS[outbox.SENDING], (
         "the 409 must name the true state; the operator reads this string as "
         f'Not cancelled - already "{error}"')
