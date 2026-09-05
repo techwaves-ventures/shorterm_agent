@@ -24,8 +24,10 @@ about a tenant who has the platform channel switched *off*. A fix scoped to
 
 **Two kinds of test live here and they are not the same evidence.**
 
-*Reproductions* — the five `..._is_not_recorded_sent` / `..._records_the_outbox_row_failed`
-tests. Each fails on `0f0100e` on a **value**, not on a missing symbol.
+*Reproductions* — the six `..._is_not_recorded_sent` / `..._names_the_address` /
+`..._records_the_outbox_row_failed` tests: one per zero-delivery arm above, plus
+the composite of two of them. Each fails on `0f0100e` on a **value**, not on a
+missing symbol.
 
 *Non-regression guards* — the three `..._still_...` / `..._keeps_...` tests.
 These are **green on base by design**; they exist to stop the fix becoming a
@@ -207,6 +209,20 @@ def test_email_only_send_failure_is_not_recorded_sent(seams, monkeypatch):
     assert GUEST_EMAIL in obs["run_message"]
     assert "only reply channel" in obs["run_message"]
 
+    # The alert is the *other* operator surface, and on this arm it is the only
+    # one that fires before the run ends. Its wording is a branch of its own
+    # (`only_channel`), so it needs its own assertion: without the negative
+    # half below, replacing that branch with a constant leaves the whole suite
+    # green while an operator is told "Platform reply to Dana Guest sent" about
+    # a tenant with the platform channel switched off and zero sends made —
+    # the pre-fix sentence this ticket exists to remove.
+    assert seams.notifications, "the failure has to reach the operator"
+    title, body = seams.notifications[0]
+    assert title == "Email reply failed"
+    assert "only reply channel" in body
+    assert "nothing reached the guest" in body
+    assert "Platform reply" not in body
+
 
 def test_email_only_with_no_smtp_configured_is_not_recorded_sent(seams, monkeypatch):
     """AC2 — silent on base: zero send attempts, no log, no alert, and the
@@ -238,6 +254,37 @@ def test_email_only_with_no_address_on_file_is_not_recorded_sent(seams):
     assert seams.email_sends == []
     _assert_nothing_recorded(obs, seams)
     assert "no email address on file" in obs["run_message"]
+
+
+def test_email_only_with_neither_address_nor_smtp_names_the_address(seams, monkeypatch):
+    """AC3b — no address *and* no SMTP, the composite of the two arms above.
+
+    Reachable: an email-only tenant who never configured SMTP and whose
+    responder failed to extract an address. Zero-delivery like the rest, so it
+    is red on base for the same reason — but it is here for a second job.
+
+    `_undelivered_reason` promises its branch order mirrors the email block's,
+    so the reason names the arm that actually fired. Every other test satisfies
+    exactly one of its conditions, and a claim about *order* is only observable
+    when two hold at once: swapping the two branches keeps all other tests
+    green. The negative assertion is what owns the promise.
+    """
+    import mailer
+    import runner
+
+    monkeypatch.setattr(mailer, "is_configured", lambda: False)
+
+    tid = _seed("email", tenant_email="")
+    runner._send_worker(tid, SITE, ITEM, "Hi Dana.")
+
+    obs = _observe(tid)
+    assert seams.email_sends == []
+    _assert_nothing_recorded(obs, seams)
+    # The email block checks the address first, so the reason must too: telling
+    # a host "email is not configured" when the real blocker is a missing
+    # address sends them to the wrong settings screen.
+    assert "no email address on file" in obs["run_message"]
+    assert "not configured" not in obs["run_message"]
 
 
 def test_no_sendable_channel_is_not_recorded_sent(seams):
