@@ -68,6 +68,25 @@ _state = {
     "updated_at": None,
 }
 
+# Terminal send outcomes, keyed by the run token that produced them.
+#
+# `_state` above answers "what is the runner doing *now*", and it is one slot
+# that the next run overwrites. That makes it the wrong place to leave an
+# answer: `automation.send_next` polls every two seconds, and a scrape claiming
+# the runner inside that gap replaced a finished send's `done` before its own
+# poller ever looked. The send was genuinely delivered — the guest was written
+# to — and the row still ended `failed` / "timed out", with a Retry button
+# beside it. A token told the poller which outcomes were *not* its own
+# (VEN-130); it still had no way to learn its own once the slot moved on.
+#
+# So each send also records how it ended here, under its own token, and its
+# poller reads it back from here first. Bounded and consumed on read: in the
+# dashboard this normally holds at most one entry, because the poller pops it.
+# Entries linger only when nobody ever polls for them — a browser-server
+# caller, or a worker that finishes after `send_next` has already given up.
+_OUTCOMES_MAX = 64
+_outcomes: dict[str, dict] = {}
+
 # Per-tenant OTP rendezvous: a running scrape registers a waiter, then blocks
 # until the matching tenant submits a code on their own dashboard. Keyed by
 # tenant_id so one tenant can never unblock another's run.
@@ -97,6 +116,56 @@ def _set_owned(run_token: str, **kwargs) -> bool:
         return True
 
 
+def _publish_terminal(run_token: str, tenant_id: str, status: str,
+                      message: str) -> None:
+    """Publish a send's final outcome: to `_outcomes` under this run's own
+    token, and to the shared UI slot if this run still owns it.
+
+    The record is written unconditionally, the slot write is not. That
+    asymmetry is the point: an outcome belongs to the *run*, not to the slot.
+    A worker whose slot write is refused — because another run claimed the
+    runner while this one was in flight — has still finished, and its own
+    poller is still entitled to the answer. Gating the record on the slot write
+    landing would rebuild a smaller copy of the defect this exists to fix.
+
+    Called explicitly at the worker's two terminal sites rather than inferred
+    inside `_set_owned`: the progress callback writes through `_set_owned` with
+    a caller-supplied status too, so terminal-ness cannot be sniffed there
+    without a predicate a future caller could fool."""
+    with _lock:
+        # Re-inserted rather than updated so the eviction order below stays the
+        # insertion order.
+        _outcomes.pop(run_token, None)
+        _outcomes[run_token] = {
+            "status": status, "message": message, "tenant_id": str(tenant_id),
+        }
+        while len(_outcomes) > _OUTCOMES_MAX:
+            _outcomes.pop(next(iter(_outcomes)))
+    _set_owned(run_token, status=status, message=message, running=False)
+
+
+def take_send_outcome(run_token: str, tenant_id: str | None = None) -> dict | None:
+    """Pop the terminal outcome recorded for `run_token`, or None if this run
+    has not finished (or its outcome has already been read).
+
+    Consumed on read: exactly one poller is entitled to an outcome, and an
+    answer nobody is waiting for would otherwise sit in a bounded map crowding
+    out live ones.
+
+    The tenant check mirrors `get_state`'s leak guard — the message can name
+    another tenant's traveler — and a mismatch leaves the entry in place for
+    whoever it really belongs to rather than consuming it."""
+    if not run_token:
+        return None
+    with _lock:
+        entry = _outcomes.get(run_token)
+        if entry is None:
+            return None
+        if tenant_id is not None and entry.get("tenant_id") != str(tenant_id):
+            return None
+        return dict(_outcomes.pop(run_token))
+
+
 def get_state(tenant_id: str | None = None) -> dict:
     """Snapshot of the run state. If `tenant_id` is given and a run is active for
     a *different* tenant, return an idle snapshot — status messages can contain
@@ -110,6 +179,30 @@ def get_state(tenant_id: str | None = None) -> dict:
             "updated_at": snap.get("updated_at"),
         }
     return snap
+
+
+def without_run_token(state: dict) -> dict:
+    """Copy of a run state with the in-process correlation token removed.
+
+    `run_token` exists so `automation.send_next` can tell its own dispatch's
+    outcome from another run's. It is not a client-facing value: no route
+    accepts one, nothing outside this process can act on one, and it is only
+    ever compared against this process's own slot. A value with no meaning to
+    a caller does not belong in a body the dashboard polls on a timer, or
+    inlined into the HTML of every page load."""
+    snap = dict(state or {})
+    snap.pop("run_token", None)
+    return snap
+
+
+def public_state(tenant_id: str | None = None) -> dict:
+    """`get_state` for an HTTP response body.
+
+    Defined in terms of `get_state` rather than by re-reading `_state`, so the
+    cross-tenant leak guard still applies — and so anything that stubs
+    `get_state` keeps working. `get_state` itself is deliberately left alone:
+    `send_next` reads the token through it."""
+    return without_run_token(get_state(tenant_id))
 
 
 def _otp_provider(tenant_id: str):
@@ -444,12 +537,11 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str,
                     )
                     email_note = f" (email to {tenant_email} FAILED — see logs)"
 
-        _set_owned(run_token, status="done",
-                   message=f"Reply sent to {who}{email_note}.", running=False)
+        _publish_terminal(run_token, tenant_id, "done",
+                          f"Reply sent to {who}{email_note}.")
     except Exception as e:
         log.exception("Send failed for %s", item_id)
-        _set_owned(run_token, status="error", message=f"Send failed: {e}",
-                   running=False)
+        _publish_terminal(run_token, tenant_id, "error", f"Send failed: {e}")
     finally:
         furnishedfinder.clear_context()
         # Belt-and-braces: the paths above already clear `running`, but if one

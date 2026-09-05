@@ -189,9 +189,14 @@ def _live_state(tenant_id: str) -> dict:
     On a host with Playwright (local/worker-host dashboard) the scrape runs
     in-process, so the live state comes from the runner. On serverless (Vercel,
     no Playwright) scrapes are worker-backed via the shared DB, so the state is
-    projected from the tenant's latest job. Same shape either way."""
+    projected from the tenant's latest job. Same shape either way — which is why
+    the in-process branch goes through `public_state`: the runner's `run_token`
+    is an in-process correlation value with no counterpart in the job
+    projection and no meaning to a client, and everything reached from here is
+    served to one (`/api/status`, `/otp`, `/refresh`, and the `state | tojson`
+    inlined into every dashboard page)."""
     if check_leads.playwright_available() and not _use_worker_queue():
-        return runner.get_state(tenant_id)
+        return runner.public_state(tenant_id)
     return jobs.public_state(tenant_id)
 
 
@@ -1360,7 +1365,10 @@ def refresh():
     tenant_id = current_user.tenant_id
     if check_leads.playwright_available() and not _use_worker_queue():
         # Browser is available here: run the scrape in-process (local/worker host).
-        return jsonify(runner.start_scrape(tenant_id))
+        # Not routed through `_live_state`: when a run is already active for this
+        # same tenant, `start_scrape` returns the live `_state` directly, so a
+        # refresh during an in-flight send would echo that send's token.
+        return jsonify(runner.without_run_token(runner.start_scrape(tenant_id)))
     # Serverless (Vercel): can't run Playwright in-process. Enqueue a job for the
     # off-Vercel worker that shares this DB, and report the worker-backed state.
     jobs.enqueue(tenant_id)
