@@ -26,6 +26,10 @@ def _ddl(c) -> None:
             item_id TEXT NOT NULL,
             payload TEXT,
             first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            -- The second dedup key and the forward bit; see `_already_ingested`.
+            -- NULL alt_id means the row predates them, not "no second key".
+            alt_id TEXT,
+            via_forward INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (tenant_id, site, kind, item_id)
         )"""
     )
@@ -59,6 +63,21 @@ def _ddl(c) -> None:
     # DDL. It stays inside the schema step so it runs under the advisory lock
     # and commits before any caller statement — never concurrently with one.
     _migrate_tenant_id(c)
+
+    # Runs *after* the rebuild, unlike the `responses` migration above: that
+    # rebuild copies a fixed column list, so a column added before it would be
+    # silently dropped on the way through. Rows written before these columns
+    # existed keep alt_id NULL, and `_already_ingested` reads that NULL as
+    # "this row's strict key was never recorded" rather than inventing one.
+    seen_have = db.table_columns(c, "seen")
+    for col, decl in (("alt_id", "TEXT"),
+                      ("via_forward", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in seen_have:
+            c.execute(f"ALTER TABLE seen ADD COLUMN {col} {decl}")
+    c.execute(
+        "CREATE INDEX IF NOT EXISTS seen_alt_id "
+        "ON seen (tenant_id, site, kind, alt_id)"
+    )
 
 
 def _conn():
@@ -129,41 +148,121 @@ def _parse_payload(s: str) -> dict:
             return {}
 
 
+# Keys an item carries for the dedup decision but that are not part of the item
+# itself. Stripped before the payload is stored so a row written by this version
+# is byte-identical to one written before these existed — otherwise every
+# pre-existing row would look "changed" on its next pass and be rewritten.
+_DEDUP_HINTS = ("dedup_id", "via_forward")
+
+
+def _payload_of(it: dict) -> str:
+    return json.dumps({k: v for k, v in it.items() if k not in _DEDUP_HINTS},
+                      ensure_ascii=False)
+
+
+def _already_ingested(c, tenant_id: str, site: str, kind: str, it: dict) -> bool:
+    """Whether this item is a copy of one already ingested, on either key.
+
+    An item may carry a second, looser key (`dedup_id`) alongside its `id`; see
+    the id derivation in `sites/ff_email.py` for why one key cannot do this job.
+    The strict key separates two messages sent on the same day but is rewritten
+    by every relay; the loose key survives relays but cannot tell two same-day
+    sends apart. So a loose match alone is not enough to drop something — the
+    question is whether the loose match is a *copy* or a *second message*, and
+    three things answer it:
+
+      - the incoming mail is itself a forward (`via_forward`), so it is a copy
+        of the notification rather than a new one;
+      - the stored row arrived as a forward, so this direct delivery is the
+        original it was made from — the same pair in the other arrival order,
+        which happens when a host forwards their backlog before the live feed
+        is pointed at us;
+      - the stored row predates the strict key (alt_id NULL). Its strict key was
+        never recorded, so a strict miss against it proves nothing and the only
+        safe reading is the one this table had before: loose match means seen.
+        These rows are why the loose key is the unchanged one — an open
+        conversation stays addressable under the key it was written with. The
+        original defect stays live for them until their next message is stored
+        under both keys, which is the pre-existing behaviour, not a new loss.
+
+    Everything else — a loose match with no forward on either side and a row
+    that does carry a strict key — is a guest writing twice, and is let through.
+    """
+    iid = str(it["id"])
+    if c.execute(
+        "SELECT 1 FROM seen WHERE tenant_id=? AND site=? AND kind=? AND item_id=?",
+        (tenant_id, site, kind, iid),
+    ).fetchone():
+        return True
+
+    loose = str(it.get("dedup_id") or "")
+    if not loose or loose == iid:
+        # No second key, or it resolved to the same stamp — the check above was
+        # already the whole question.
+        return False
+
+    # `item_id=?` as well as `alt_id=?`: a row written before the strict key
+    # existed holds the loose key in item_id, which is the column it was the
+    # primary key of at the time.
+    rows = c.execute(
+        "SELECT alt_id, via_forward FROM seen "
+        "WHERE tenant_id=? AND site=? AND kind=? AND (alt_id=? OR item_id=?)",
+        (tenant_id, site, kind, loose, loose),
+    ).fetchall()
+    for alt_id, stored_via_forward in rows:
+        if not alt_id:
+            return True
+        if it.get("via_forward") or stored_via_forward:
+            return True
+    return False
+
+
 def filter_new(tenant_id: str, site: str, kind: str, items: Iterable[dict]) -> list[dict]:
     """Record items and return only the ones not seen before (for this tenant).
 
-    Brand-new item_ids are inserted and returned (so they get notified/drafted).
+    Brand-new items are inserted and returned (so they get notified/drafted).
     Already-seen items are NOT returned, but their stored payload is refreshed
     when the freshly-scraped payload differs — this lets a re-scrape backfill
     richer data (e.g. the lead detail view) onto existing rows without
     re-notifying. `first_seen` is preserved so ordering stays stable.
+
+    "Seen before" is `_already_ingested`, which may consult a second key; items
+    without one behave exactly as they did when `item_id` was the only key.
     """
     new = []
     with _conn() as c:
         for it in items:
             iid = str(it["id"])
-            payload = json.dumps(it, ensure_ascii=False)
-            cur = c.execute(
-                "SELECT payload FROM seen WHERE tenant_id=? AND site=? AND kind=? AND item_id=?",
-                (tenant_id, site, kind, iid),
+            payload = _payload_of(it)
+            if _already_ingested(c, tenant_id, site, kind, it):
+                cur = c.execute(
+                    "SELECT payload FROM seen WHERE tenant_id=? AND site=? AND kind=? AND item_id=?",
+                    (tenant_id, site, kind, iid),
+                )
+                row = cur.fetchone()
+                # A row matched on the loose key is a *copy* of this item, not
+                # this item, so there is nothing under `iid` to refresh and the
+                # copy must not overwrite the original's payload.
+                if row is not None and row[0] != payload:
+                    # Seen before but content changed (e.g. detail backfilled).
+                    c.execute(
+                        "UPDATE seen SET payload=? WHERE tenant_id=? AND site=? AND kind=? AND item_id=?",
+                        (payload, tenant_id, site, kind, iid),
+                    )
+                continue
+            c.execute(
+                "INSERT INTO seen (tenant_id, site, kind, item_id, payload, alt_id, via_forward) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (tenant_id, site, kind, iid, payload,
+                 str(it.get("dedup_id") or "") or None,
+                 1 if it.get("via_forward") else 0),
             )
-            row = cur.fetchone()
-            if row is None:
-                c.execute(
-                    "INSERT INTO seen (tenant_id, site, kind, item_id, payload) VALUES (?,?,?,?,?)",
-                    (tenant_id, site, kind, iid, payload),
-                )
-                new.append(it)
-            elif row[0] != payload:
-                # Seen before but content changed (e.g. detail backfilled).
-                c.execute(
-                    "UPDATE seen SET payload=? WHERE tenant_id=? AND site=? AND kind=? AND item_id=?",
-                    (payload, tenant_id, site, kind, iid),
-                )
+            new.append(it)
     return new
 
 
-def already_seen(tenant_id: str, site: str, kind: str, item_id: str) -> bool:
+def already_seen(tenant_id: str, site: str, kind: str, item_id: str,
+                 item: dict | None = None) -> bool:
     """Whether this item has been ingested before — without recording it.
 
     `filter_new` answers the same question but *records as it asks*, which makes
@@ -171,15 +270,19 @@ def already_seen(tenant_id: str, site: str, kind: str, item_id: str) -> bool:
     is indistinguishable from consuming. Recovery needs to tell "this message was
     already applied" from "this message is new", and must not mark the second one
     seen until the board write has actually happened.
+
+    Pass `item` when the caller holds the parsed item: the answer then uses the
+    same two-key rule `filter_new` applies, so a caller that asks first and
+    records afterwards does not get two different answers about one message.
+    With only an id it degrades to the strict key, which is the whole question
+    for anything that never carried a second one.
     """
     if not item_id:
         return False
+    probe = dict(item) if item else {}
+    probe["id"] = str(item_id)
     with _conn() as c:
-        row = c.execute(
-            "SELECT 1 FROM seen WHERE tenant_id=? AND site=? AND kind=? AND item_id=?",
-            (tenant_id, site, kind, str(item_id)),
-        ).fetchone()
-    return row is not None
+        return _already_ingested(c, tenant_id, site, kind, probe)
 
 
 def forget(tenant_id: str, site: str, kind: str, item_id: str) -> bool:
