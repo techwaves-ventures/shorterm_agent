@@ -22,18 +22,43 @@ parser over the same input the original attempt failed on, and we hold less of
 the message than the provider sent.
 
 Bounds, because these rows hold guest PII and arrive from outside: body
-truncated to `MAX_STORED_BODY`, at most `MAX_ROWS_PER_TENANT` rows per
-tenant+site, and identical replays collapse onto one row with a bumped
-`seen_count` rather than a new row.
+truncated to `MAX_STORED_BODY`, identical replays collapse onto one row with a
+bumped `seen_count` rather than a new row, and the row count is capped — see
+below for why that cap deletes only one *class* of row.
 
-At the cap the survivors are chosen by usefulness, not recency — see `_KEEP_IDS`
-for what that ordering can and cannot separate. Known bound: FurnishedFinder's
-own digests and reminders come *from the allowed sender* and so land in the same
-`unparsed` bucket as a lead we failed to read. A tenant who reaches 200 open
-`unparsed` rows can therefore have a genuine enquiry evicted by that mail. The
-eviction is logged (a pruned unreviewed row always warns), so it is bounded and
-visible rather than silent, but separating the two would need bulk-mail headers
-this table does not keep.
+## The cap sheds noise, never evidence
+
+An earlier version enforced one flat `MAX_ROWS_PER_TENANT` cap over every row,
+ranking survivors by usefulness and deleting the rest. That ranking cannot work,
+and the reason generalises: FurnishedFinder's own digests and reminders arrive
+*from the allowed sender* with no guest name, so they land in the same open
+`unparsed` bucket as a lead we failed to read. The two are indistinguishable to
+this table. Any ordering over indistinguishable rows does not save the right
+one — it only chooses which one dies, and it chose the oldest, which is the
+enquiry that has been waiting longest for the operator. Ordinary mail volume
+was enough; no attacker required. That re-created the exact silent lead loss
+this table exists to end, inside the feature built to end it.
+
+So rows are split into two classes and only one of them is ever deleted:
+
+* **Evidence** — open + `unparsed`: a message a guest may well have sent that we
+  could not read, which no one has looked at yet. Never hard-deleted. Bounded by
+  `MAX_UNREVIEWED`; at that ceiling `record` declines to store a *new* one and
+  says so loudly, rather than destroying one already captured. Reviewing a row
+  (dismiss/recover) reclassifies it, so the ceiling self-heals.
+* **Everything else** — resolved rows, and `sender_not_allowed` mail that was
+  never ours. Shed newest-wins at `MAX_ROWS_PER_TENANT`, exactly as before.
+
+Evidence is counted against the soft cap first, so a tenant with few evidence
+rows still holds at most `MAX_ROWS_PER_TENANT` rows in total; the ceiling only
+lifts that for rows we are refusing to throw away. Total retention per
+tenant+site is therefore bounded by `MAX_UNREVIEWED`.
+
+The residual harm is real and deliberate: at the ceiling a *new* lead is turned
+away. That is bounded, self-healing, surfaced to the operator on the settings
+page (not only in a log), and — unlike the behaviour it replaces — it never
+destroys a lead already in hand. A replay of a row we already hold is an UPDATE,
+not growth, so a guest re-sending is never turned away.
 """
 import functools
 import hashlib
@@ -50,7 +75,13 @@ DISMISSED = "dismissed"
 RECOVERED = "recovered"
 
 MAX_STORED_BODY = 8_000
+# Soft cap: how many rows a tenant+site holds once evidence is accounted for.
+# Only non-evidence is deleted to satisfy it (see the module docstring).
 MAX_ROWS_PER_TENANT = 200
+# Hard ceiling on unreviewed evidence. Reached only by a tenant who has let 1000
+# unreadable messages pile up without touching the review page, or by a flood.
+# Past it `record` refuses new evidence instead of deleting old evidence.
+MAX_UNREVIEWED = 1_000
 _MAX_SUBJECT = 500
 _MAX_SENDER = 320          # RFC 5321 maximum path length
 _MAX_REASON = 500
@@ -114,6 +145,26 @@ _COLS = (
 )
 
 _SELECT = f"SELECT {', '.join(_COLS)} FROM inbound_rejects"
+
+# How much of each body the review *list* renders. The stored body stays
+# `MAX_STORED_BODY`; this bounds only what one page load carries.
+#
+# Load-bearing because of the retention ceiling above, not as a nicety. The list
+# has no pagination, so its weight is `rows x body`: raising the evidence bound
+# from 200 rows to `MAX_UNREVIEWED` took the worst case from ~1.9 MB to a
+# measured 9.26 MB of HTML — and it peaks exactly when the queue is full, which
+# is the one moment the operator has to be able to open this page to clear it.
+# Refusing to delete a lead is only an improvement if the page that recovers it
+# still loads. The full body is untouched on disk and is what Retry re-parses;
+# `get` still reads it whole.
+_LIST_BODY = 600
+# Built from `_COLS` so a column added later cannot silently drift the two
+# projections apart — `_row` zips positionally. One extra character is selected
+# so the caller can tell "exactly at the limit" from "cut short".
+_SELECT_LIST = "SELECT {} FROM inbound_rejects".format(", ".join(
+    f"SUBSTR(body, 1, {_LIST_BODY + 1}) AS body" if col == "body" else col
+    for col in _COLS
+))
 
 
 def _now() -> str:
@@ -366,36 +417,47 @@ def _fingerprint(subject: str, sender: str, body: str) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-# Which rows survive the cap, best first. Ordering by usefulness rather than by
-# recency alone is load-bearing: a host who forwards *all* their mail instead of
-# filtering on furnishedfinder.com produces `sender_not_allowed` rows at
-# newsletter volume, and a plain newest-wins cap would let 200 of those silently
-# delete the one genuine unreadable enquiry — the exact loss this table exists to
-# prevent, reintroduced by its own bookkeeping. So: still-open before resolved,
-# a lead we failed to read before mail that was never ours, and only then recent.
-#
-# `received_at` leads the recency tiebreak because a duplicate forward bumps that
-# and not `id`; ordering by `id` alone would evict the freshest row first.
-_KEEP_IDS = """SELECT id FROM inbound_rejects
-                WHERE tenant_id=? AND site=?
-                ORDER BY CASE WHEN status=? THEN 0 ELSE 1 END,
-                         CASE WHEN reason_code=? THEN 0 ELSE 1 END,
-                         received_at DESC, id DESC
-                LIMIT ?"""
+# A row nobody has reviewed yet, whose message we could not read: the lost lead
+# itself. This is the one class the cap must never delete, so it is written once
+# and every statement below is expressed in terms of it.
+_IS_EVIDENCE = "status=? AND reason_code=?"
+_EVIDENCE_PARAMS = (OPEN, "unparsed")
 
-_KEEP_PARAMS = ("unparsed",)  # the code that must outlive everything else
+# Which *non-evidence* rows survive, best first: still-open before resolved, and
+# only then recent. `received_at` leads the recency tiebreak because a duplicate
+# forward bumps that and not `id`; ordering by `id` alone would evict the
+# freshest row first.
+#
+# There is deliberately no ordering that ranks evidence against evidence. A
+# genuine enquiry and a FurnishedFinder digest are indistinguishable here, so a
+# ranking would only pick which lead to destroy — see the module docstring.
+_SHED_IDS = f"""SELECT id FROM inbound_rejects
+                 WHERE tenant_id=? AND site=? AND NOT ({_IS_EVIDENCE})
+                 ORDER BY CASE WHEN status=? THEN 0 ELSE 1 END,
+                          received_at DESC, id DESC
+                 LIMIT ?"""
+
+
+def _count_evidence(c: db.Conn, tenant_id: str, site: str) -> int:
+    """Unreviewed rows we could not read — the rows that are never deleted."""
+    row = c.execute(
+        f"SELECT COUNT(*) FROM inbound_rejects "
+        f"WHERE tenant_id=? AND site=? AND {_IS_EVIDENCE}",
+        (tenant_id, site) + _EVIDENCE_PARAMS,
+    ).fetchone()
+    return int(row[0]) if row else 0
 
 
 def _prune(c: db.Conn, tenant_id: str, site: str) -> None:
-    """Enforce the per-tenant row cap, keeping the most useful rows.
+    """Shed non-evidence down to the soft cap. Evidence is never deleted.
 
     Postgres has no `DELETE ... LIMIT`, so the bound goes in a subselect. This
     is the portable form; the SQLite-only shorthand passes tests locally and
     fails on the hosted database.
     """
-    # Cheap guard first. Pruning means two `NOT IN` scans, and almost every
-    # message arrives with the table nowhere near full — doing that work per
-    # ingest put ~20ms of DB on a public endpoint's request thread.
+    # Cheap guard first. Pruning means a `NOT IN` scan, and almost every message
+    # arrives with the table nowhere near full — doing that work per ingest put
+    # ~20ms of DB on a public endpoint's request thread.
     total = c.execute(
         "SELECT COUNT(*) FROM inbound_rejects WHERE tenant_id=? AND site=?",
         (tenant_id, site),
@@ -403,25 +465,33 @@ def _prune(c: db.Conn, tenant_id: str, site: str) -> None:
     if not total or total[0] <= MAX_ROWS_PER_TENANT:
         return
 
-    keep = (tenant_id, site, OPEN) + _KEEP_PARAMS + (MAX_ROWS_PER_TENANT,)
+    evidence = _count_evidence(c, tenant_id, site)
+    # Evidence is counted against the soft cap first, so a tenant holding little
+    # of it is still bounded at MAX_ROWS_PER_TENANT overall. Floored at zero:
+    # once evidence alone fills the cap, non-evidence gets no room at all.
+    room = max(MAX_ROWS_PER_TENANT - evidence, 0)
 
-    # A cap that quietly discards evidence is indistinguishable from the bug.
-    doomed = c.execute(
-        f"SELECT COUNT(*) FROM inbound_rejects WHERE tenant_id=? AND site=? "
-        f"AND status=? AND id NOT IN ({_KEEP_IDS})",
-        (tenant_id, site, OPEN) + keep,
-    ).fetchone()
-    if doomed and doomed[0]:
+    if evidence >= MAX_ROWS_PER_TENANT:
+        # The one warning worth logging. The old one fired whenever *any*
+        # unreviewed row was pruned, which happens harmlessly on nearly every
+        # request once a host forwards their newsletters — identical output in
+        # the benign and the damaging case, so it carried no signal. This fires
+        # only under real capacity pressure, which is also on the settings page.
         log.warning(
-            "Pruning %s unreviewed rejected inbound row(s) for tenant %s at the "
-            "%s-row cap — raise the cap or review sooner",
-            doomed[0], tenant_id, MAX_ROWS_PER_TENANT,
+            "Tenant %s holds %s unreviewed unreadable inbound row(s), at or past "
+            "the %s-row soft cap (hard ceiling %s, after which new ones are "
+            "refused) — review the rejected-email queue",
+            tenant_id, evidence, MAX_ROWS_PER_TENANT, MAX_UNREVIEWED,
         )
+
+    if total[0] - evidence <= room:
+        return  # nothing sheddable is over the line
 
     c.execute(
         f"DELETE FROM inbound_rejects WHERE tenant_id=? AND site=? "
-        f"AND id NOT IN ({_KEEP_IDS})",
-        (tenant_id, site) + keep,
+        f"AND NOT ({_IS_EVIDENCE}) AND id NOT IN ({_SHED_IDS})",
+        (tenant_id, site) + _EVIDENCE_PARAMS
+        + (tenant_id, site) + _EVIDENCE_PARAMS + (OPEN, room),
     )
 
 
@@ -450,6 +520,28 @@ def record(tenant_id: str, site: str, reason_code: str, reason: str,
     reason = (reason or _CAPTURE_REASON.get(reason_code) or "")[:_MAX_REASON]
 
     with _conn() as c:
+        # The ceiling. Refusing a new row is a real loss, but a bounded and
+        # loud one; the alternative is deleting a lead we already hold, which
+        # is the defect this replaced. Only evidence is gated — resolved rows
+        # and mail that was never ours are shed by `_prune` instead.
+        #
+        # Checked against the *fingerprint* too: a replay is an UPDATE, not
+        # growth, so a guest re-forwarding an enquiry we already hold is never
+        # turned away. That is the strongest signal of a real lead there is.
+        if reason_code == "unparsed" and _count_evidence(c, tenant_id, site) >= MAX_UNREVIEWED:
+            held = c.execute(
+                "SELECT id FROM inbound_rejects WHERE tenant_id=? AND site=? AND fingerprint=?",
+                (tenant_id, site, fp),
+            ).fetchone()
+            if not held:
+                log.error(
+                    "Refused a rejected inbound email for tenant %s: %s unreviewed "
+                    "rows is the hard ceiling. Nothing was deleted, but this lead "
+                    "was not captured — the rejected-email queue must be reviewed",
+                    tenant_id, MAX_UNREVIEWED,
+                )
+                return None
+
         # An exact replay bumps the counter instead of adding a row. `status` is
         # deliberately NOT reset: a row the operator already dismissed or
         # recovered stays that way, otherwise Dismiss would be undone by the
@@ -482,14 +574,25 @@ def record(tenant_id: str, site: str, reason_code: str, reason: str,
 
 @_repairs_schema
 def open_for_tenant(tenant_id: str, site: str) -> list[dict]:
-    """Unresolved rejections, newest first — what the review page lists."""
+    """Unresolved rejections, newest first — what the review page lists.
+
+    `body` is a `_LIST_BODY` preview, not the stored text, and `body_truncated`
+    says which. Use `get` when the whole message matters (retry does).
+    """
     tenant_id = str(tenant_id)
     with _conn() as c:
         rows = c.execute(
-            f"{_SELECT} WHERE tenant_id=? AND site=? AND status=? ORDER BY id DESC",
+            f"{_SELECT_LIST} WHERE tenant_id=? AND site=? AND status=? ORDER BY id DESC",
             (tenant_id, site, OPEN),
         ).fetchall()
-    return [_row(r) for r in rows]
+    out = []
+    for r in rows:
+        row = _row(r)
+        body = row["body"] or ""
+        row["body_truncated"] = len(body) > _LIST_BODY
+        row["body"] = body[:_LIST_BODY]
+        out.append(row)
+    return out
 
 
 @_repairs_schema
@@ -514,6 +617,18 @@ def count_all(tenant_id: str, site: str) -> int:
             (tenant_id, site),
         ).fetchone()
     return int(row[0]) if row else 0
+
+
+@_repairs_schema
+def count_unreviewed(tenant_id: str, site: str) -> int:
+    """Rows the cap will never delete — what `MAX_UNREVIEWED` bounds.
+
+    Distinct from `count_open`, which also counts mail that was never ours. The
+    settings page compares this against the ceiling: a refusal the operator
+    cannot see would be the same silent loss as the deletion it replaced.
+    """
+    with _conn() as c:
+        return _count_evidence(c, str(tenant_id), site)
 
 
 @_repairs_schema

@@ -23,6 +23,7 @@
       border-radius: var(--radius); padding: 12px 14px; font-size: .82rem;
       line-height: 1.5; white-space: pre-wrap; word-break: break-word;
       max-height: 260px; overflow: auto; color: var(--muted); margin: 0; }
+    .rej__more { font-size: .76rem; color: var(--muted); margin: 6px 0 0; }
     .rej__actions { display: flex; gap: 10px; flex-wrap: wrap;
       padding: 0 20px 16px; }
     .rej__actions form { margin: 0; }
@@ -88,7 +89,14 @@
              read as a safety net for rows written before the copy existed, which
              it could not actually catch. #}
           <div class="rej__reason">{{ r.reason }}</div>
-          <pre class="rej__excerpt">{{ r.body or '(empty message)' }}</pre>
+          {# A preview, not the stored message — see `_LIST_BODY`. Said out loud
+             when it is cut, because a silently clipped email would have the host
+             judge a lead on text we chose not to show them. Nothing is lost:
+             Try again re-parses the whole message as it was received. #}
+          <pre class="rej__excerpt">{{ r.body or '(empty message)' }}{% if r.body_truncated %}…{% endif %}</pre>
+          {% if r.body_truncated %}
+          <p class="rej__more">Showing the first part of this email. Try again reads all of it.</p>
+          {% endif %}
         </div>
         <div class="rej__actions">
           <form method="post" action="{{ url_for('inbound_rejected_retry', rid=r.id) }}">
