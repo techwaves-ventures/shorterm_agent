@@ -1734,6 +1734,12 @@ def _settings_context(tenant_id: str, settings: dict, units: list[dict] | None =
         # actually wants, and they can only trust it if it's stated.
         "rejected_open": inbound_rejects.count_open(tenant_id, SITE),
         "rejected_total": inbound_rejects.count_all(tenant_id, SITE),
+        # Capacity pressure. At the ceiling the queue starts turning new
+        # unreadable emails away rather than deleting ones it already holds,
+        # and the host is the only person who can clear it — so they have to be
+        # told here, not only in a server log they will never read.
+        "rejected_unreviewed": inbound_rejects.count_unreviewed(tenant_id, SITE),
+        "rejected_ceiling": inbound_rejects.MAX_UNREVIEWED,
     }
 
 
