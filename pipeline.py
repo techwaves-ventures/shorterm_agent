@@ -1170,10 +1170,24 @@ def scheduled(deals: list[dict]) -> list[dict]:
     return out
 
 
-def arrivals(deals: list[dict], within_days: int = 30) -> list[dict]:
-    """Booked guests arriving soon — the post-booking half of the lifecycle."""
-    today = datetime.now().date().isoformat()
-    horizon = (datetime.now() + timedelta(days=within_days)).date().isoformat()
+def arrivals(deals: list[dict], within_days: int = 30,
+             today: str | None = None) -> list[dict]:
+    """Booked guests arriving soon — the post-booking half of the lifecycle.
+
+    `today` is the **property's** calendar date as `YYYY-MM-DD`. `check_in` is a
+    zoneless calendar date the guest stated and the listing shows (parse_date),
+    so bounding it with the *server's* date drops a guest on the very day they
+    arrive, for the several hours a day the two zones disagree. Callers hold the
+    tenant and pass `scheduler.local_now(tenant_id).date().isoformat()`; the
+    default is the old server-frame behaviour only so an out-of-tree caller
+    keeps working.
+    """
+    today = today or datetime.now().date().isoformat()
+    # Derived from `today`, not from a second reading of the clock: two
+    # independent now() calls straddle midnight, which would put the two ends of
+    # the window on different days. Matches advance_lifecycle.
+    horizon = (datetime.fromisoformat(today).date()
+               + timedelta(days=within_days)).isoformat()
     out = [d for d in deals
            if d.get("stage") in BOOKED_STAGES
            and d.get("check_in") and today <= d["check_in"] <= horizon]
@@ -1181,11 +1195,17 @@ def arrivals(deals: list[dict], within_days: int = 30) -> list[dict]:
     return out
 
 
-def metrics(deals: list[dict], responses: dict[str, dict]) -> dict:
+def metrics(deals: list[dict], responses: dict[str, dict],
+            today: str | None = None) -> dict:
     """Headline numbers for the dashboard KPI strip.
 
     `median_response` is deliberately the median, not the mean: one lead you
     left for a week shouldn't make an otherwise-fast operation look broken.
+
+    `today` is the property's calendar date, forwarded to `arrivals` so the
+    `arrivals_30d` tile counts the same set the Arrivals list beside it shows.
+    Threading one and not the other is worse than the shared bug: the tile and
+    the list under it would disagree.
     """
     open_deals = [d for d in deals if d.get("stage") in OPEN_STAGES]
     booked = [d for d in deals if d.get("stage") in BOOKED_STAGES]
@@ -1204,7 +1224,7 @@ def metrics(deals: list[dict], responses: dict[str, dict]) -> dict:
         "open_count": len(open_deals),
         "pipeline_value": sum(int(d.get("monthly_value") or 0) for d in open_deals),
         "booked_count": len(booked),
-        "arrivals_30d": len(arrivals(deals)),
+        "arrivals_30d": len(arrivals(deals, today=today)),
         "median_response": median,
         "median_response_label": _fmt_hours(median),
         "conversion": (len(booked) / len(contacted) * 100) if contacted else None,

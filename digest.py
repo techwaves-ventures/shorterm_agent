@@ -76,6 +76,14 @@ def build(tenant_id: str, now: datetime | None = None) -> dict | None:
     server_now = now.astimezone().replace(tzinfo=None) if (now and now.tzinfo) else (now or datetime.now())
     since = server_now - timedelta(hours=24)
 
+    # The other frame, on purpose. `check_in` is not a machine stamp — it is the
+    # calendar date the guest gave and the listing shows, carrying no zone — so
+    # it has to be bounded by the *property's* date, the opposite of `since`
+    # above. Same rule applied to two columns with different provenance: compare
+    # each one in the frame it was written in. Re-derived rather than sharing a
+    # binding with anything above, so the two frames can never drift into one.
+    prop_today = scheduler.local_now(tenant_id, now).date().isoformat()
+
     responses = storage.get_responses(tenant_id, SITE)
     deals = pipeline.all_deals(tenant_id, SITE)
     items = storage.all_items(tenant_id, SITE)
@@ -86,8 +94,8 @@ def build(tenant_id: str, now: datetime | None = None) -> dict | None:
 
     new_deals = [d for d in deals if is_new(d)]
     waiting = pipeline.needs_action(deals, responses)
-    arrivals = pipeline.arrivals(deals, within_days=7)
-    metrics = pipeline.metrics(deals, responses)
+    arrivals = pipeline.arrivals(deals, within_days=7, today=prop_today)
+    metrics = pipeline.metrics(deals, responses, today=prop_today)
 
     messages = outbox.for_tenant(
         tenant_id, SITE, (outbox.PENDING, outbox.SENT, outbox.FAILED)
