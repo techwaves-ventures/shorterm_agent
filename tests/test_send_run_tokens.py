@@ -429,7 +429,18 @@ def scripted(monkeypatch):
 
 def test_a_matching_done_is_recorded_sent(tenant, scripted):
     """The happy path. It passes on the unfixed code too — that is exactly why
-    it is not evidence on its own, and why the tests below exist."""
+    it is not evidence on its own, and why the tests below exist.
+
+    `contacted` is empty on purpose, and zero is the right number *for this
+    harness only*. The cadence advance belongs to `runner._send_worker`, which
+    the `scripted` fixture replaces wholesale — so no worker runs here and
+    nothing in this file can observe the advance. Do not "restore" this to
+    `== 1`: `send_next` used to advance the cadence as well, and because this
+    fixture hides the worker's call, that assertion read as "exactly once" while
+    passing on code that advanced the deal twice (VEN-217). The real
+    exactly-once guarantee is asserted against a real worker in
+    `tests/test_ven217_cadence_owner.py`.
+    """
     install, contacted, _ = scripted
     msg = _queued(tenant)
     install({"status": "launching", "running": True, "run_token": "A"},
@@ -438,7 +449,8 @@ def test_a_matching_done_is_recorded_sent(tenant, scripted):
     automation.send_next(tenant, SITE, timeout=30)
 
     assert outbox.get(msg["id"])["status"] == outbox.SENT
-    assert len(contacted) == 1, "the follow-up cadence advances exactly once"
+    assert contacted == [], (
+        "the drainer records the row's outcome; it does not advance the deal")
 
 
 def test_a_matching_error_is_recorded_failed(tenant, scripted):
