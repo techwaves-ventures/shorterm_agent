@@ -17,7 +17,14 @@ import config
 
 log = logging.getLogger(__name__)
 
-_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+# Same pattern, same O(n^2), and the same fix as `sites/ff_email._EMAIL_RE` —
+# see the reasoning there for why the lookbehind cannot change what `search`
+# finds. This copy is reachable from `/inbound/email` too, just further along:
+# `_find_email` scans `item["title"]`, which `ff_email.parse` builds from a
+# whole unbounded `_label` line, so a body that is legal under the payload cap
+# still produces a title hundreds of kilobytes long. Fixing only the regexes
+# the ticket named would have left this one quadratic behind them.
+_EMAIL_RE = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+\.[\w.-]+")
 
 
 def _find_email(item: dict) -> str | None:

@@ -29,6 +29,7 @@ from flask import (
     url_for,
 )
 from flask_wtf.csrf import CSRFProtect
+from werkzeug.exceptions import RequestEntityTooLarge
 from flask_login import (
     LoginManager,
     current_user,
@@ -90,6 +91,15 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(days=14),
     # Reject oversized request bodies before they're parsed.
     MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+    # Bulk form data has its own, smaller limit, and this app never set it —
+    # so a framework default governed it. That default moved from `None` to
+    # 500_000 in an upgrade nobody asked for (`requirements.txt` pins `flask`
+    # but not `werkzeug`), landing *below* `inbound.MAX_PAYLOAD_BYTES`. The
+    # effect was that a public endpoint's binding limit was a number this
+    # project had never chosen, and an over-limit body was refused by the
+    # framework before `inbound.accept` could refuse it with the app's own
+    # reason code. Tied to that constant so the two can't drift apart again.
+    MAX_FORM_MEMORY_SIZE=inbound.MAX_PAYLOAD_BYTES,
 )
 
 # --- CSRF ------------------------------------------------------------------
@@ -189,9 +199,14 @@ def _live_state(tenant_id: str) -> dict:
     On a host with Playwright (local/worker-host dashboard) the scrape runs
     in-process, so the live state comes from the runner. On serverless (Vercel,
     no Playwright) scrapes are worker-backed via the shared DB, so the state is
-    projected from the tenant's latest job. Same shape either way."""
+    projected from the tenant's latest job. Same shape either way — which is why
+    the in-process branch goes through `public_state`: the runner's `run_token`
+    is an in-process correlation value with no counterpart in the job
+    projection and no meaning to a client, and everything reached from here is
+    served to one (`/api/status`, `/otp`, `/refresh`, and the `state | tojson`
+    inlined into every dashboard page)."""
     if check_leads.playwright_available() and not _use_worker_queue():
-        return runner.get_state(tenant_id)
+        return runner.public_state(tenant_id)
     return jobs.public_state(tenant_id)
 
 
@@ -462,17 +477,62 @@ def inbound_email():
     mail providers retry on non-2xx, which would replay a message we already
     deliberately rejected.
     """
-    supplied = (
-        request.headers.get("X-Inbound-Secret")
-        or request.args.get("secret")
-        or (request.form.get("secret") if request.form else "")
-        or ""
-    )
-    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    # Reading the body is itself a way this route can fail, so it sits inside a
+    # guard rather than above one. `MAX_CONTENT_LENGTH` makes werkzeug raise
+    # `RequestEntityTooLarge` out of any of the three accesses below, and Flask
+    # renders that as a 413 without ever entering the body of this view — which
+    # broke the flat-202 contract in the one place it matters most. A real
+    # FurnishedFinder notification carrying photos over the cap got a 413, the
+    # provider retried it forever because providers retry on non-2xx, the lead
+    # never landed, and nothing reached `inbound_rejects` for the operator to
+    # see. Answering 202 drops that message once instead of loudly and
+    # repeatedly, and keeps the response identical to every other outcome here.
+    #
+    # The raise is observed at the `request.form` access below, not at
+    # `get_data` — form parsing applies the smaller form-memory limit — so
+    # narrowing this guard to the read alone would not hold. Everything that
+    # touches the request body belongs inside it.
     try:
-        tenant_id, item = inbound.accept(
-            payload, supplied, raw_size=request.content_length or 0
+        # Measured first, before anything reads `request.form` or `get_json`.
+        #
+        # `content_length` is None when the provider streams the body with
+        # chunked transfer-encoding, and `or 0` collapsed "unknown" into
+        # "empty" — so the size check in `accept` skipped itself and a 1.9 MB
+        # body sent chunked reached the parser while the identical body sent
+        # with the header was rejected. Falling back to the bytes actually read
+        # closes that.
+        #
+        # The ordering is the whole trick: form and multipart parsing drains
+        # the stream, after which `get_data` returns empty and the fallback
+        # silently yields 0 again — which is what the mail providers we target
+        # actually POST. Reading (and caching) the body up front leaves form
+        # parsing below working off the cache, so every content type gets a
+        # real measurement.
+        raw_size = request.content_length
+        if raw_size is None:
+            raw_size = len(request.get_data(cache=True))
+
+        supplied = (
+            request.headers.get("X-Inbound-Secret")
+            or request.args.get("secret")
+            or (request.form.get("secret") if request.form else "")
+            or ""
         )
+        payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    except RequestEntityTooLarge:
+        # Caught here and not with an `errorhandler`: a global one would also
+        # turn every oversized upload elsewhere in the dashboard into a
+        # success. This endpoint is the only one with a reason to swallow it.
+        # No body detail in the log — the message is over a megabyte and may be
+        # a stranger's, since this runs before the provider secret is checked.
+        app.logger.warning(
+            "Inbound email rejected: body exceeds MAX_CONTENT_LENGTH (%s bytes declared)",
+            request.content_length,
+        )
+        return ("", 202)
+
+    try:
+        tenant_id, item = inbound.accept(payload, supplied, raw_size=raw_size)
     except inbound.Rejected as e:
         app.logger.warning("Inbound email rejected: %s", e)
         # Keep the ones that represent a *lost lead*. A rejection that never got
@@ -1368,7 +1428,10 @@ def refresh():
     tenant_id = current_user.tenant_id
     if check_leads.playwright_available() and not _use_worker_queue():
         # Browser is available here: run the scrape in-process (local/worker host).
-        return jsonify(runner.start_scrape(tenant_id))
+        # Not routed through `_live_state`: when a run is already active for this
+        # same tenant, `start_scrape` returns the live `_state` directly, so a
+        # refresh during an in-flight send would echo that send's token.
+        return jsonify(runner.without_run_token(runner.start_scrape(tenant_id)))
     # Serverless (Vercel): can't run Playwright in-process. Enqueue a job for the
     # off-Vercel worker that shares this DB, and report the worker-backed state.
     jobs.enqueue(tenant_id)
@@ -1679,6 +1742,12 @@ def _settings_context(tenant_id: str, settings: dict, units: list[dict] | None =
         # actually wants, and they can only trust it if it's stated.
         "rejected_open": inbound_rejects.count_open(tenant_id, SITE),
         "rejected_total": inbound_rejects.count_all(tenant_id, SITE),
+        # Capacity pressure. At the ceiling the queue starts turning new
+        # unreadable emails away rather than deleting ones it already holds,
+        # and the host is the only person who can clear it — so they have to be
+        # told here, not only in a server log they will never read.
+        "rejected_unreviewed": inbound_rejects.count_unreviewed(tenant_id, SITE),
+        "rejected_ceiling": inbound_rejects.MAX_UNREVIEWED,
     }
 
 

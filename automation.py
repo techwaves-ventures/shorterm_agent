@@ -248,6 +248,15 @@ def _plus_hour(now_iso: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Both failure branches in `send_next` can land on a message that really did
+# reach the guest — the runner drives a browser, and it fails *after* the reply
+# box as readily as before it. The card renders a primary "Retry send" beside
+# whatever error is stored, so the text is the only thing standing between an
+# operator and a second copy of the same message. Same register as the
+# abandoned-send wording in `outbox`, from one constant so the two can't drift.
+MAY_HAVE_REACHED_GUEST = "may already have reached the guest; check before retrying"
+
+
 def send_next(tenant_id: str, site: str, timeout: int = 300) -> dict | None:
     """Deliver the oldest queued message via the existing reply path.
 
@@ -284,25 +293,70 @@ def send_next(tenant_id: str, site: str, timeout: int = 300) -> dict | None:
     # send_reply dispatches to a background thread and returns immediately, so
     # its return value says nothing about delivery. Wait for the run to reach a
     # terminal state before recording an outcome — otherwise a failed send is
-    # stored as `sent` and the follow-up cadence advances on a message the guest
-    # never received.
+    # stored as `sent`, and the operator is never offered the retry that would
+    # have got the message to the guest.
+    #
+    # This loop records the row's *outcome*; it does not advance the deal. The
+    # worker does that, at the moment the reply actually lands — see
+    # `runner._send_worker`. Doing both here fired `after_contact` twice per
+    # delivered send (once from inside the worker, once here), and it is not
+    # idempotent, so the deal jumped two steps and the guest was never sent
+    # Followup 1.
+    #
+    # "The run" has to mean *this* dispatch. `runner._state` is one
+    # process-global slot, so a not-running snapshot only ever proved that the
+    # run which last touched that slot had finished. When this send's own
+    # terminal state was overwritten before a 2-second poll saw it — by a
+    # scrape, or by the next drained message — the loop read the replacement's
+    # outcome as this row's, and a send that failed was recorded `sent`. The
+    # token `send_reply` handed back is what distinguishes them.
+    run_token = state.get("run_token")
+    if not run_token:
+        # Accepted-looking, but with no way to tell this run's outcome from
+        # anyone else's. Fail closed: a wrongly-failed row is retried, while a
+        # wrongly-sent one silently strands the guest and advances the cadence
+        # past them.
+        error = ("could not correlate the send run; delivery outcome unknown — "
+                 f"{MAY_HAVE_REACHED_GUEST}")
+        outbox.set_status(msg["id"], outbox.FAILED, error=error)
+        _notify_failure(msg, error)
+        return msg
+
     deadline = time.time() + timeout
     while time.time() < deadline:
-        snapshot = runner.get_state(tenant_id)
-        if not snapshot.get("running"):
-            if snapshot.get("status") == "error":
-                error = snapshot.get("message") or "send failed"
+        # This run's own recorded outcome first, the live slot only as a
+        # fallback. The token stopped this loop adopting someone else's
+        # outcome; it could not give this run back its own, because the slot it
+        # was published to is global and the next run overwrites it. A scrape
+        # claiming the runner inside this two-second gap left a genuinely
+        # delivered send recorded `failed`. The record is keyed by this
+        # dispatch's token, so by construction it can only ever answer with
+        # this run's own outcome — the acceptance rule below is unchanged.
+        outcome = runner.take_send_outcome(run_token, tenant_id)
+        if outcome is None:
+            snapshot = runner.get_state(tenant_id)
+            # All three conditions, not just `not running`. A mismatched or
+            # absent token belongs to someone else's run; an implicit status
+            # like `idle` or `busy` is not an outcome this send ever reported.
+            if (snapshot.get("run_token") == run_token
+                    and not snapshot.get("running")
+                    and snapshot.get("status") in ("done", "error")):
+                outcome = snapshot
+        if outcome is not None:
+            if outcome.get("status") == "error":
+                error = outcome.get("message") or "send failed"
                 outbox.set_status(msg["id"], outbox.FAILED, error=error)
                 _notify_failure(msg, error)
             else:
                 outbox.set_status(msg["id"], outbox.SENT)
-                after_contact(tenant_id, site, msg["item_id"])
             return msg
         time.sleep(2)
 
-    outbox.set_status(msg["id"], outbox.FAILED,
-                      error="timed out waiting for the send to finish")
-    _notify_failure(msg, "the send timed out")
+    # Still not finished. Honest as a timeout — but a worker running past the
+    # deadline may be running past it *inside* the reply it already delivered.
+    error = f"timed out waiting for the send to finish — {MAY_HAVE_REACHED_GUEST}"
+    outbox.set_status(msg["id"], outbox.FAILED, error=error)
+    _notify_failure(msg, f"the send timed out — {MAY_HAVE_REACHED_GUEST}")
     return msg
 
 

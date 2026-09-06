@@ -7,6 +7,7 @@ polls the ./OTP_CODE file).
 """
 import logging
 import os
+import secrets
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -53,8 +54,38 @@ _state = {
     # finishes — that would yank the page out from under whatever the user is
     # doing, which is the whole thing async delivery is meant to avoid.
     "kind": None,
+    # Identity of the *invocation* this state belongs to, for sends only.
+    # `_state` is one process-global dict, so "not running any more" is a fact
+    # about whatever run last touched it — not about the run a caller started.
+    # `automation.send_next` polls for a terminal state after `send_reply`
+    # returns, and without an invocation id it accepted the first one it saw:
+    # a scrape's `done` satisfied the poll for a send that had already failed,
+    # and the message was recorded delivered to a guest who was never written
+    # to. In-process correlation metadata only — opaque, non-PII, never
+    # persisted, and never accepted from a client as authority. `None` on every
+    # state that is not an accepted send.
+    "run_token": None,
     "updated_at": None,
 }
+
+# Terminal send outcomes, keyed by the run token that produced them.
+#
+# `_state` above answers "what is the runner doing *now*", and it is one slot
+# that the next run overwrites. That makes it the wrong place to leave an
+# answer: `automation.send_next` polls every two seconds, and a scrape claiming
+# the runner inside that gap replaced a finished send's `done` before its own
+# poller ever looked. The send was genuinely delivered — the guest was written
+# to — and the row still ended `failed` / "timed out", with a Retry button
+# beside it. A token told the poller which outcomes were *not* its own
+# (VEN-130); it still had no way to learn its own once the slot moved on.
+#
+# So each send also records how it ended here, under its own token, and its
+# poller reads it back from here first. Bounded and consumed on read: in the
+# dashboard this normally holds at most one entry, because the poller pops it.
+# Entries linger only when nobody ever polls for them — a browser-server
+# caller, or a worker that finishes after `send_next` has already given up.
+_OUTCOMES_MAX = 64
+_outcomes: dict[str, dict] = {}
 
 # Per-tenant OTP rendezvous: a running scrape registers a waiter, then blocks
 # until the matching tenant submits a code on their own dashboard. Keyed by
@@ -69,6 +100,72 @@ def _set(**kwargs) -> None:
         _state["updated_at"] = datetime.now().isoformat(timespec="seconds")
 
 
+def _set_owned(run_token: str, **kwargs) -> bool:
+    """`_set`, but only while `run_token` still owns the global state.
+
+    Every write a send makes goes through here. A worker whose run has already
+    been replaced must not write its own progress — least of all a terminal
+    `done`/`error` — over a newer run's state: the newer run's token would stay
+    on the row, so its poller would read the *stale* worker's outcome as its
+    own. Returns whether the write landed."""
+    with _lock:
+        if _state.get("run_token") != run_token:
+            return False
+        _state.update(kwargs)
+        _state["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        return True
+
+
+def _publish_terminal(run_token: str, tenant_id: str, status: str,
+                      message: str) -> None:
+    """Publish a send's final outcome: to `_outcomes` under this run's own
+    token, and to the shared UI slot if this run still owns it.
+
+    The record is written unconditionally, the slot write is not. That
+    asymmetry is the point: an outcome belongs to the *run*, not to the slot.
+    A worker whose slot write is refused — because another run claimed the
+    runner while this one was in flight — has still finished, and its own
+    poller is still entitled to the answer. Gating the record on the slot write
+    landing would rebuild a smaller copy of the defect this exists to fix.
+
+    Called explicitly at the worker's two terminal sites rather than inferred
+    inside `_set_owned`: the progress callback writes through `_set_owned` with
+    a caller-supplied status too, so terminal-ness cannot be sniffed there
+    without a predicate a future caller could fool."""
+    with _lock:
+        # Re-inserted rather than updated so the eviction order below stays the
+        # insertion order.
+        _outcomes.pop(run_token, None)
+        _outcomes[run_token] = {
+            "status": status, "message": message, "tenant_id": str(tenant_id),
+        }
+        while len(_outcomes) > _OUTCOMES_MAX:
+            _outcomes.pop(next(iter(_outcomes)))
+    _set_owned(run_token, status=status, message=message, running=False)
+
+
+def take_send_outcome(run_token: str, tenant_id: str | None = None) -> dict | None:
+    """Pop the terminal outcome recorded for `run_token`, or None if this run
+    has not finished (or its outcome has already been read).
+
+    Consumed on read: exactly one poller is entitled to an outcome, and an
+    answer nobody is waiting for would otherwise sit in a bounded map crowding
+    out live ones.
+
+    The tenant check mirrors `get_state`'s leak guard — the message can name
+    another tenant's traveler — and a mismatch leaves the entry in place for
+    whoever it really belongs to rather than consuming it."""
+    if not run_token:
+        return None
+    with _lock:
+        entry = _outcomes.get(run_token)
+        if entry is None:
+            return None
+        if tenant_id is not None and entry.get("tenant_id") != str(tenant_id):
+            return None
+        return dict(_outcomes.pop(run_token))
+
+
 def get_state(tenant_id: str | None = None) -> dict:
     """Snapshot of the run state. If `tenant_id` is given and a run is active for
     a *different* tenant, return an idle snapshot — status messages can contain
@@ -78,9 +175,34 @@ def get_state(tenant_id: str | None = None) -> dict:
     if tenant_id is not None and snap.get("tenant_id") not in (None, str(tenant_id)):
         return {
             "status": "idle", "message": "", "counts": {}, "running": False,
-            "tenant_id": None, "kind": None, "updated_at": snap.get("updated_at"),
+            "tenant_id": None, "kind": None, "run_token": None,
+            "updated_at": snap.get("updated_at"),
         }
     return snap
+
+
+def without_run_token(state: dict) -> dict:
+    """Copy of a run state with the in-process correlation token removed.
+
+    `run_token` exists so `automation.send_next` can tell its own dispatch's
+    outcome from another run's. It is not a client-facing value: no route
+    accepts one, nothing outside this process can act on one, and it is only
+    ever compared against this process's own slot. A value with no meaning to
+    a caller does not belong in a body the dashboard polls on a timer, or
+    inlined into the HTML of every page load."""
+    snap = dict(state or {})
+    snap.pop("run_token", None)
+    return snap
+
+
+def public_state(tenant_id: str | None = None) -> dict:
+    """`get_state` for an HTTP response body.
+
+    Defined in terms of `get_state` rather than by re-reading `_state`, so the
+    cross-tenant leak guard still applies — and so anything that stubs
+    `get_state` keeps working. `get_state` itself is deliberately left alone:
+    `send_next` reads the token through it."""
+    return without_run_token(get_state(tenant_id))
 
 
 def _otp_provider(tenant_id: str):
@@ -271,6 +393,10 @@ def _busy_state(tenant_id: str) -> dict:
         "status": "busy",
         "message": "Another check is currently running. Please try again shortly.",
         "counts": {}, "running": False, "tenant_id": tenant_id, "kind": None,
+        # Nothing was dispatched, so there is no run to correlate with. A busy
+        # snapshot must never carry a token: `send_next` treats a token as the
+        # proof that a thread was started for *its* row.
+        "run_token": None,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -292,6 +418,10 @@ def start_scrape(tenant_id: str = "1") -> dict:
         _state.update(
             status="launching", message="Starting…", counts={}, running=True,
             tenant_id=tenant_id, kind="scrape",
+            # A scrape is not a send: clear any token the previous send left
+            # behind, or this run's terminal `done` would still be wearing that
+            # send's token and would answer its poller.
+            run_token=None,
             updated_at=datetime.now().isoformat(timespec="seconds"),
         )
     threading.Thread(target=_worker, args=(tenant_id,), daemon=True).start()
@@ -333,7 +463,8 @@ def submit_otp(tenant_id: str, code: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
+def _send_worker(tenant_id: str, site: str, item: dict, text: str,
+                 run_token: str) -> None:
     item_id = item["id"]
     kind = item.get("kind", "lead")
     who = item.get("traveler") or item.get("sender") or "tenant"
@@ -342,12 +473,20 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
     # The address the responder extracted at draft time, stored on the response.
     tenant_email = (storage.get_responses(tenant_id, site).get(item_id) or {}).get("tenant_email")
 
-    furnishedfinder.set_context(_ff_username(tenant_id), _otp_provider(tenant_id), _status_cb)
+    # The browser library's progress callback is bound to this run too. It never
+    # clears `running`, so it cannot fabricate a terminal state, but an
+    # unscoped one would still overwrite a newer run's status/message while the
+    # newer run's token stayed on the row.
+    def status_cb(state: str, message: str = "") -> None:
+        _set_owned(run_token, status=state, message=message)
+
+    furnishedfinder.set_context(_ff_username(tenant_id), _otp_provider(tenant_id), status_cb)
     try:
         # 1. Platform reply — the source of truth for status=sent. Leads use the
         #    "Reply To Tenant" row action; messages reply inside the thread.
         if "platform" in channels:
-            _set(status="checking", message=f"Sending platform reply to {who}…")
+            _set_owned(run_token, status="checking",
+                       message=f"Sending platform reply to {who}…")
             with check_leads.browser_page(tenant_id) as page:
                 if kind == "message":
                     furnishedfinder.send_message_reply(page, item, text)
@@ -358,6 +497,14 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
         # Real contact was made: stamp response time and start the follow-up
         # cadence. Imported here to keep runner free of an import cycle
         # (automation -> runner for delivery).
+        #
+        # This is the SOLE owner of the cadence advance — do not add a second
+        # one in `automation.send_next` on observing this run finish.
+        # `after_contact` is not idempotent, so two callers advanced the deal
+        # two steps and the guest was skipped Followup 1 (VEN-217). Nor can this
+        # one move to `send_next` instead: `browser_server`'s `/v1/reply` calls
+        # `send_reply` directly, with no outbox row and no drainer, so that
+        # guest's cadence would never start at all.
         try:
             import automation
 
@@ -388,7 +535,8 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
                 email_note = " (SMTP not configured — platform only)"
             else:
                 try:
-                    _set(status="checking", message=f"Emailing {tenant_email}…")
+                    _set_owned(run_token, status="checking",
+                               message=f"Emailing {tenant_email}…")
                     # The guest sees the host's name and replies reach them
                     # directly; the envelope stays on our verified sender so it
                     # authenticates instead of landing in spam (see mailer.py).
@@ -411,18 +559,22 @@ def _send_worker(tenant_id: str, site: str, item: dict, text: str) -> None:
                     )
                     email_note = f" (email to {tenant_email} FAILED — see logs)"
 
-        _set(status="done", message=f"Reply sent to {who}{email_note}.", running=False)
+        _publish_terminal(run_token, tenant_id, "done",
+                          f"Reply sent to {who}{email_note}.")
     except Exception as e:
         log.exception("Send failed for %s", item_id)
-        _set(status="error", message=f"Send failed: {e}", running=False)
+        _publish_terminal(run_token, tenant_id, "error", f"Send failed: {e}")
     finally:
         furnishedfinder.clear_context()
         # Belt-and-braces: the paths above already clear `running`, but if one
         # ever escaped without doing so the global lock would wedge every tenant
         # out of scraping and sending. Guarded by `_lock` (the lock that actually
-        # protects `_state`) and scoped to this run, so a newer run isn't clobbered.
+        # protects `_state`) and scoped to this run, so a newer run isn't
+        # clobbered. Scoped by token, not tenant: the same tenant's next run is
+        # a *different* run, and clearing its `running` here would hand its
+        # poller a not-running state it never earned.
         with _lock:
-            if _state.get("tenant_id") == tenant_id and _state.get("running"):
+            if _state.get("run_token") == run_token and _state.get("running"):
                 _state["running"] = False
 
 
@@ -434,6 +586,11 @@ def send_reply(tenant_id: str, site: str, item: dict, text: str) -> dict:
     A collision is reported as busy even when the run holding the lock belongs
     to this same tenant — unlike `start_scrape`, which echoes its own run's
     progress back to the UI and marks nothing as delivered either way.
+
+    An accepted call returns a state carrying a fresh opaque `run_token`. That
+    token is the caller's only proof that the terminal state it later observes
+    belongs to *this* dispatch: a busy collision carries none, and neither does
+    any run that starts after this one. See `automation.send_next`.
     """
     tenant_id = str(tenant_id)
     with _lock:
@@ -452,12 +609,23 @@ def send_reply(tenant_id: str, site: str, item: dict, text: str) -> dict:
             # /responder/send and the scheduler both call start_drainer while
             # /scrape/start can be running for the same tenant, so the two meet.
             return _busy_state(tenant_id)
+        # Minted inside the lock, after the run is confirmed free and in the
+        # same update that claims it — so a token exists if and only if the
+        # thread below is about to be started for it.
+        run_token = secrets.token_urlsafe(16)
         _state.update(
             status="launching", message="Starting…", running=True,
-            tenant_id=tenant_id, kind="send",
+            tenant_id=tenant_id, kind="send", run_token=run_token,
             updated_at=datetime.now().isoformat(timespec="seconds"),
         )
     threading.Thread(
-        target=_send_worker, args=(tenant_id, site, item, text), daemon=True
+        target=_send_worker, args=(tenant_id, site, item, text, run_token),
+        daemon=True,
     ).start()
-    return get_state(tenant_id)
+    # Not `get_state(tenant_id)`: by the time we read it the worker may already
+    # have finished and a *later* run replaced the state, and the caller would
+    # be handed that run's token as if it were its own. The token is this call's
+    # to report, so report it explicitly.
+    snap = get_state(tenant_id)
+    snap["run_token"] = run_token
+    return snap
