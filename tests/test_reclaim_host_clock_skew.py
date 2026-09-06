@@ -272,3 +272,65 @@ def test_send_one_second_past_boundary_is_requeued(pg_outbox):
 
     assert requeued == 1
     assert ob.get(msg["id"])["status"] == ob.QUEUED
+
+
+# ---------------------------------------------------------------------------
+# The format contract, on both dialects, with real (unpinned) clocks.
+#
+# `utc_now_sql` promises the same text `datetime.now(timezone.utc).isoformat(
+# timespec="seconds")` produces, and the two dialects reach it by different SQL
+# — `to_char(clock_timestamp() ...)` on Postgres, `strftime(...)` on SQLite —
+# so neither expression's output is implied by the other's. The promise is
+# load-bearing twice over: `reclaim_stuck_sending` routes any stamp whose
+# `tzinfo is None` down the legacy "decline to judge, restamp" branch, so an
+# expression that lost its `+00:00` suffix would put *every* fresh row on that
+# branch and no send would ever be reclaimed again — the permanent strand
+# VEN-133 exists to close, arriving silently and with the suite still green.
+# And a column already holding legacy stamps has to stay parseable by one call.
+#
+# Asserted on the value the app actually writes (`sending_at` after a claim),
+# not on the helper's return, so a caller that stopped using the helper fails
+# here too.
+# ---------------------------------------------------------------------------
+
+_STAMP_RE = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00$"
+
+
+def _assert_stamp_contract(ob, item_id):
+    import re
+
+    msg = ob.add("t1", SITE, item_id, sequence="presale", step_id="s",
+                 step_label="S", body="b", auto=False)
+    ob.set_status(msg["id"], ob.SENDING)
+    stamp = ob.get(msg["id"])["sending_at"]
+
+    legacy = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    assert re.match(_STAMP_RE, str(stamp)), (
+        f"sending_at {stamp!r} is not in the format legacy rows use "
+        f"({legacy!r}); reclaim_stuck_sending would read it as naive and never "
+        "judge its age"
+    )
+
+    parsed = datetime.fromisoformat(str(stamp))
+    assert parsed.tzinfo is not None, (
+        f"sending_at {stamp!r} parsed naive — the legacy branch of "
+        "reclaim_stuck_sending would swallow every fresh row"
+    )
+    assert parsed.utcoffset() == timedelta(0), (
+        f"sending_at {stamp!r} is not UTC; ages would be off by the offset"
+    )
+    # The database is local to this machine in the test rig, so its clock and
+    # the test's are the same clock. A wide bound: this pins "reads a real
+    # clock", not clock accuracy.
+    drift = abs((parsed - datetime.now(timezone.utc)).total_seconds())
+    assert drift < 120, f"sending_at {stamp!r} is {drift:.0f}s from real now"
+
+
+def test_sqlite_stamp_matches_the_legacy_format(sqlite_outbox):
+    """The SQLite branch of `utc_now_sql` writes a parseable, aware UTC stamp."""
+    _assert_stamp_contract(sqlite_outbox, "item_fmt_sqlite")
+
+
+def test_postgres_stamp_matches_the_legacy_format(pg_outbox):
+    """The Postgres branch writes the same shape, by different SQL."""
+    _assert_stamp_contract(pg_outbox, "item_fmt_pg")
