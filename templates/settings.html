@@ -286,6 +286,15 @@
               <p class="hint">In Gmail: Settings → Forwarding → add this address, then a filter
                 for mail from <code>furnishedfinder.com</code>. This address is unique to you —
                 treat it like a password.</p>
+              {# The queue never deletes an unread email to make room, so once
+                 it is full it turns new ones away instead. Only the host can
+                 clear it, so this cannot live in a server log they never read. #}
+              {% if rejected_unreviewed >= rejected_ceiling %}
+              <span class="warn-note">⚠ Your unread list is full ({{ rejected_ceiling }}
+                emails). Nothing you already have has been deleted, but emails we can't
+                read are being turned away until you
+                <a href="{{ url_for('inbound_rejected') }}">clear some</a>.</span>
+              {% endif %}
               {# Stated even at zero: "nothing was lost" is the reassurance the
                  host is actually after, and silence can't distinguish that from
                  a broken forwarding rule. #}

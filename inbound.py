@@ -439,7 +439,14 @@ def accept(payload: dict, webhook_secret: str, raw_size: int = 0) -> tuple[str, 
     # anyone, so these carry no tenant and are never persisted.
     if not configured():
         raise Rejected("inbound email is not configured", code="not_configured")
-    if raw_size and raw_size > MAX_PAYLOAD_BYTES:
+    # Dropping the `raw_size and` guard is a readability change, not a fix:
+    # `raw_size` is always an int here, and `x and x > K` is equivalent to
+    # `x > K` for one — a mutation reverting it leaves the suite green. It is
+    # written plainly because the old form *read* as "0 means unknown, skip the
+    # check", which is the mistake that produced the fail-open in the caller.
+    # What actually stops an under-declared body is the check against the
+    # extracted body below.
+    if raw_size > MAX_PAYLOAD_BYTES:
         raise Rejected("payload too large", code="too_large")
     if not verify_webhook(webhook_secret):
         raise Rejected("bad webhook secret", code="bad_secret")
@@ -458,7 +465,17 @@ def accept(payload: dict, webhook_secret: str, raw_size: int = 0) -> tuple[str, 
 
     from sites import ff_email
 
-    item = ff_email.parse(extract_subject(payload), extract_body(payload),
+    body = extract_body(payload)
+    # The `raw_size` check above measures the *request* and can only be as good
+    # as what the caller could measure; this one measures the text that actually
+    # reaches the parser, so the documented cap holds however the body was
+    # transferred and whatever the sender claimed its length was. It is the
+    # check that closes the form-encoded chunked case, where the caller sees a
+    # size of 0 because form parsing has already drained the stream.
+    if len(body) > MAX_PAYLOAD_BYTES:
+        raise Rejected("payload too large", code="too_large")
+
+    item = ff_email.parse(extract_subject(payload), body,
                           received_at=extract_date(payload))
     if not item:
         raise Rejected(
