@@ -705,19 +705,57 @@ def parse(subject: str, body: str, received_at: str = "") -> dict | None:
     # existed (so no open deal is orphaned), and two leads from one guest that
     # differ only in an unlabelled move-in stay two leads.
     #
-    # For a message the stamp is resolved in order of how stable it is across
-    # relays, because the id has to satisfy two opposing requirements at once:
-    # the same message arriving twice must collapse, and a guest sending the
-    # *same words* again ("Any update?") must not. Only a timestamp separates
-    # the second case, and only a timestamp that survives forwarding keeps the
-    # first. So: FurnishedFinder's own "Date received" line, else the original
-    # Date carried inside a forwarded header block, else the transport stamp.
-    # If none exists the two collapse — there is genuinely nothing to tell them
-    # apart — which is the old behaviour, now confined to a template that
-    # carries no date at all.
+    # A message's id has to satisfy two opposing requirements at once: the same
+    # message arriving twice must collapse, and a guest sending the *same words*
+    # again ("Any update?") must not. Only a timestamp separates the second
+    # case, and only a timestamp that survives forwarding keeps the first — and
+    # no single stamp does both, which is why one is not enough.
+    #
+    # FurnishedFinder's own "Date received" line survives a forward (it is in
+    # the body the forward quotes) but is *day-precision* in every rendering
+    # seen so far — "July 19, 2026", "8/15/26", never a time. Ranking it first
+    # and stopping there made two messages sent on one day hash identically, so
+    # the guest's second message was dropped by the dedup before anything was
+    # written: the board never showed it and the nurture sequence kept chasing
+    # someone who had written twice. The transport `Date` has the precision that
+    # separates them but is rewritten by each relay, so ranking *it* first
+    # instead only trades this defect for its mirror image.
+    #
+    # So a message carries two keys and the dedup layer reads both:
+    #
+    #   id        strict — the transport stamp. Distinguishes two sends on one
+    #             day, and is what everything downstream keys on.
+    #   dedup_id  loose — the same resolution order this parser has always used
+    #             (FF's line, else a forwarded block's Date, else transport).
+    #             Constant across relays, so a re-forward still finds the copy
+    #             already stored, and rows written before the strict key existed
+    #             are still addressable under the key they were written with.
+    #
+    # Neither key alone decides; `storage.filter_new` combines them with
+    # `via_forward` below, and the reasoning for that rule lives there. When
+    # there is no transport stamp the strict key falls back to the loose one —
+    # there is genuinely nothing more precise to use, which is the pre-existing
+    # behaviour for a template carrying no date at all.
     parts = [name, stated_in, stated_out, property_name, kind]
-    if kind == "message":
-        stamp = received or _forward_split(body)[1] or (received_at or "")
-        parts += [stamp, _body_fingerprint(body)]
-    item["id"] = hashlib.sha1("||".join(parts).encode()).hexdigest()[:16]
+    if kind != "message":
+        item["id"] = hashlib.sha1("||".join(parts).encode()).hexdigest()[:16]
+        return item
+
+    forward_at, forward_date = _forward_split(body)
+    fingerprint = _body_fingerprint(body)
+    loose = received or forward_date or (received_at or "")
+    strict = (received_at or "") or loose
+
+    def _hash(stamp: str) -> str:
+        return hashlib.sha1(
+            "||".join(parts + [stamp, fingerprint]).encode()
+        ).hexdigest()[:16]
+
+    item["id"] = _hash(strict)
+    item["dedup_id"] = _hash(loose)
+    # Whether this email is itself a forward of the notification rather than the
+    # notification. The parser already computes it to strip the banner; the
+    # dedup rule needs it to tell "a copy of something we hold" from "a second
+    # message that happens to share a day with the first".
+    item["via_forward"] = forward_at != 0
     return item

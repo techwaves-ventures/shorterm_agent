@@ -374,10 +374,20 @@ def test_a_guest_repeating_themselves_is_not_discarded_as_already_seen():
     assert monday["id"] != tuesday["id"]
 
 
-def test_the_same_message_forwarded_twice_is_still_one_message():
+def test_the_same_message_forwarded_twice_is_still_one_message(tenant):
     """The other direction. The id hashed the raw email, which carries the
     relaying wrapper, so one message re-forwarded through a different client
-    arrived as a second copy of itself."""
+    arrived as a second copy of itself.
+
+    Both copies now carry a transport date, and deliberately *different* ones:
+    a forward is a new email whose `Date` is the moment it was forwarded, never
+    the moment the original arrived. Passing none — as this test first did —
+    left the id resolving through a fallback that no real delivery takes, so it
+    asserted a guarantee it was not exercising. With real dates on both copies
+    the two ids differ by design (that is what separates two sends on one day),
+    and the property that has to hold is the one the defect was about: the
+    second copy must not be ingested as a second message. VEN-155.
+    """
     original = WRAPPER.format(tenant="Dana R.", received="Aug 12, 2026",
                               body="Is parking included?")
     forwarded = ("---------- Forwarded message ----------\n"
@@ -385,8 +395,15 @@ def test_the_same_message_forwarded_twice_is_still_one_message():
                  "Date: Wed, 12 Aug 2026 08:00:00 +0000\n"
                  "Subject: New message\n\n") + original.replace("\n", "\n ")
 
-    assert (ff_email.parse("New message", original)["id"]
-            == ff_email.parse("Fwd: New message", forwarded)["id"])
+    first = ff_email.parse("New message", original,
+                           received_at="Wed, 12 Aug 2026 08:00:04 +0000")
+    copy = ff_email.parse("Fwd: New message", forwarded,
+                          received_at="Sat, 15 Aug 2026 09:12:00 +0000")
+
+    assert storage.filter_new(tenant, SITE, "message", [first]) == [first]
+    assert storage.filter_new(tenant, SITE, "message", [copy]) == [], (
+        "a re-forward of a message already held must not open a second one"
+    )
 
 
 def test_an_empty_template_field_does_not_swallow_the_guests_first_line():
