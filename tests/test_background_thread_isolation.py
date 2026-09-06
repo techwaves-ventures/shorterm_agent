@@ -179,6 +179,26 @@ def test_importing_dashboard_still_starts_the_scheduler_by_default(tmp_path):
         f"the scheduler no longer starts on import; threads seen: {names}")
 
 
+@pytest.mark.skipif(
+    importlib.util.find_spec("playwright") is None,
+    reason="no Playwright in this interpreter, so the scheduler is gated off "
+           "for an unrelated reason and this would pass vacuously",
+)
+def test_importing_dashboard_starts_no_scheduler_when_the_worker_queue_is_forced(tmp_path):
+    """The other direction of the same gate, and the one nothing pinned.
+
+    The test above pins *capable ⇒ scheduler starts*. Without this one, the
+    capability check at the import site could lose its `and not
+    _use_worker_queue()` half and the suite would stay green (VEN-163: it did —
+    dropping that conjunct shipped 56/56). Production consequence on a host
+    that has Playwright *and* sets FORCE_WORKER_QUEUE=1: the web process starts
+    its own scheduler alongside worker.py's, so two schedulers fire checks.
+    """
+    names = _import_dashboard(tmp_path, {"FORCE_WORKER_QUEUE": "1"})
+    assert "autopilot-scheduler" not in names, (
+        f"the web process started a scheduler the worker owns; threads seen: {names}")
+
+
 def _import_dashboard(tmp_path, overrides):
     root = str(Path(__file__).resolve().parent.parent)
     env = dict(os.environ)
