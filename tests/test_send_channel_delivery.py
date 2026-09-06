@@ -140,6 +140,21 @@ def _seed(channels: str, tenant_email: str | None = GUEST_EMAIL) -> str:
     return tid
 
 
+def _run_send_worker(tid: str, text: str) -> None:
+    """Call the real `_send_worker` the way `send_reply` dispatches it: with a
+    fresh `run_token` this call owns, so its `_set_owned`/`_publish_terminal`
+    writes land on `runner._state` instead of being silently refused as a
+    stale run (VEN-130's ownership check gates every state write on the token
+    matching, and `_send_worker` takes no default)."""
+    import runner
+
+    token = f"test-token-{tid}"
+    with runner._lock:
+        runner._state.update(status="launching", message="", running=True,
+                             tenant_id=tid, kind="send", run_token=token)
+    runner._send_worker(tid, SITE, ITEM, text, token)
+
+
 def _observe(tid: str) -> dict:
     """Every surface an operator can look at, after the worker has run."""
     import runner
@@ -200,7 +215,7 @@ def test_email_only_send_failure_is_not_recorded_sent(seams, monkeypatch):
     monkeypatch.setattr(mailer, "send_email", _boom)
 
     tid = _seed("email")
-    runner._send_worker(tid, SITE, ITEM, "Hi Dana, the unit is available.")
+    _run_send_worker(tid, "Hi Dana, the unit is available.")
 
     obs = _observe(tid)
     assert seams.platform_sends == []
@@ -234,7 +249,7 @@ def test_email_only_with_no_smtp_configured_is_not_recorded_sent(seams, monkeypa
     monkeypatch.setattr(mailer, "is_configured", lambda: False)
 
     tid = _seed("email")
-    runner._send_worker(tid, SITE, ITEM, "Hi Dana.")
+    _run_send_worker(tid, "Hi Dana.")
 
     obs = _observe(tid)
     assert seams.email_sends == [], "nothing can be sent without SMTP"
@@ -248,7 +263,7 @@ def test_email_only_with_no_address_on_file_is_not_recorded_sent(seams):
     import runner
 
     tid = _seed("email", tenant_email="")
-    runner._send_worker(tid, SITE, ITEM, "Hi Dana.")
+    _run_send_worker(tid, "Hi Dana.")
 
     obs = _observe(tid)
     assert seams.email_sends == []
@@ -275,7 +290,7 @@ def test_email_only_with_neither_address_nor_smtp_names_the_address(seams, monke
     monkeypatch.setattr(mailer, "is_configured", lambda: False)
 
     tid = _seed("email", tenant_email="")
-    runner._send_worker(tid, SITE, ITEM, "Hi Dana.")
+    _run_send_worker(tid, "Hi Dana.")
 
     obs = _observe(tid)
     assert seams.email_sends == []
@@ -299,7 +314,7 @@ def test_no_sendable_channel_is_not_recorded_sent(seams):
     import runner
 
     tid = _seed("sms")
-    runner._send_worker(tid, SITE, ITEM, "Hi Dana.")
+    _run_send_worker(tid, "Hi Dana.")
 
     obs = _observe(tid)
     assert seams.platform_sends == []
@@ -366,7 +381,7 @@ def test_email_only_success_still_advances_the_cadence(seams):
     import runner
 
     tid = _seed("email")
-    runner._send_worker(tid, SITE, ITEM, "Hi Dana.")
+    _run_send_worker(tid, "Hi Dana.")
 
     obs = _observe(tid)
     assert seams.email_sends == [GUEST_EMAIL]
@@ -402,7 +417,7 @@ def test_platform_reply_keeps_email_best_effort(seams, monkeypatch):
     monkeypatch.setattr(mailer, "send_email", _boom)
 
     tid = _seed("platform,email")
-    runner._send_worker(tid, SITE, ITEM, "Hi Dana.")
+    _run_send_worker(tid, "Hi Dana.")
 
     obs = _observe(tid)
     assert seams.platform_sends == [ITEM_ID]
@@ -432,7 +447,7 @@ def test_platform_failure_still_fails_the_run(seams, monkeypatch):
     monkeypatch.setattr(furnishedfinder, "send_reply", _boom)
 
     tid = _seed("platform,email")
-    runner._send_worker(tid, SITE, ITEM, "Hi Dana.")
+    _run_send_worker(tid, "Hi Dana.")
 
     obs = _observe(tid)
     assert seams.platform_sends == [ITEM_ID]
