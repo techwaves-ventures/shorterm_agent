@@ -6,7 +6,7 @@ D1 is an *interaction* defect: neither commit that produced it is wrong alone.
   for the first time on the worker-queue topology. Before that, the web dyno
   never touched the column — the worker read only its own stamps, where writer
   timezone and reader timezone are the same by construction.
-- Stamping the claim absolute (`outbox._now_utc`) fixes every row written after
+- Stamping the claim via the database clock (`db.utc_now_sql`) fixes every row written after
   deploy, but says nothing about rows already sitting in `sending` with a naive
   stamp when the new code starts reading them.
 

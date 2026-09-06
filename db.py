@@ -50,6 +50,58 @@ def backend() -> str:
     return "postgres" if is_postgres() else "sqlite"
 
 
+# --- The one shared clock --------------------------------------------------
+# A column written by one host and read by another cannot be stamped from the
+# writer's wall clock. Carrying a UTC offset settles the *timezone* half of that
+# (see `outbox._now_utc`); it does nothing about the writer's *clock*, and a host
+# running a quarter-hour behind writes a stamp that is simply old. Every reader
+# is then measuring against a different clock from the writer, and no reading of
+# the row can tell that apart from a genuinely old stamp.
+#
+# On the deployed topology the two hosts already share exactly one clock: the
+# database they both connect to. Stamping and comparing from *that* clock takes
+# the app hosts' clocks out of the comparison entirely. On SQLite the file is
+# local, so the database clock IS the single host's clock — correct by
+# construction, and the same code path.
+#
+# `clock_timestamp()`, not `now()`. Postgres' `now()` is the *transaction's*
+# start, and both users of this read real elapsed time: a claim that blocked on
+# `lock_key` would be stamped before it actually started, and a reclaim pass
+# would measure every row against an instant that recedes as the pass runs.
+# SQLite's `'now'` is already evaluated per statement.
+_UTC_NOW_SQL = {
+    "sqlite": "(strftime('%Y-%m-%dT%H:%M:%S','now') || '+00:00')",
+    "postgres": "(to_char(clock_timestamp() AT TIME ZONE 'utc',"
+                "'YYYY-MM-DD\"T\"HH24:MI:SS') || '+00:00')",
+}
+
+
+def utc_now_sql() -> str:
+    """A SQL scalar expression for "now", from the database's clock.
+
+    Produces the same text `datetime.now(timezone.utc).isoformat(
+    timespec="seconds")` does, so a column already holding those stamps keeps
+    one format and stays `datetime.fromisoformat`-parseable.
+
+    Returned as SQL rather than a value on purpose: bind a value and it came
+    from the app host's clock again, which is the thing being removed.
+    """
+    return _UTC_NOW_SQL[backend()]
+
+
+def utc_now(c: "Conn"):
+    """"Now" from the database's clock, as an aware datetime.
+
+    The read side of `utc_now_sql`. Both ends of an age comparison must come
+    from the same clock; using this for one end and `datetime.now()` for the
+    other just moves the skew from the writer to the reader.
+    """
+    from datetime import datetime
+
+    row = c.execute(f"SELECT {utc_now_sql()}").fetchone()
+    return datetime.fromisoformat(str(row[0]))
+
+
 # --- SQLite dialect -> Postgres translation --------------------------------
 # The app writes SQLite-flavoured DDL/DML; these substitutions make it valid
 # Postgres. Kept deliberately small: only the tokens this codebase actually uses.
