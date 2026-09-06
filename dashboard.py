@@ -270,6 +270,11 @@ def _board(tenant_id: str) -> dict:
     decision, and any message currently awaiting approval — the unit the whole
     UI is built from, replacing the old separate leads/messages lists.
     """
+    # `check_in` is a zoneless calendar date at the property, so the arrivals
+    # window is bounded by the property's date, not this process's. Resolved
+    # once here so the KPI tile and the Arrivals list below it can never be
+    # computed from two different days.
+    prop_today = scheduler.local_now(tenant_id).date().isoformat()
     responses = storage.get_responses(tenant_id, SITE)
     items = storage.all_items(tenant_id, SITE)
     # Items scraped before the pipeline existed get a deal on first view, so an
@@ -346,12 +351,12 @@ def _board(tenant_id: str) -> dict:
         reverse=True,
     )
     return {
-        "metrics": pipeline.metrics(deals, responses),
+        "metrics": pipeline.metrics(deals, responses, today=prop_today),
         "needs_action": needs,
         "reviewable": [card(d) for d in pipeline.reviewable(deals, responses)],
         "all": all_cards,
         "scheduled": [card(d) for d in pipeline.scheduled(deals)][:12],
-        "arrivals": [card(d) for d in pipeline.arrivals(deals)],
+        "arrivals": [card(d) for d in pipeline.arrivals(deals, today=prop_today)],
         "awaiting_approval": [
             {**card(by_id[m["item_id"]]), "pending": m}
             for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
