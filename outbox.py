@@ -627,6 +627,16 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
     live send look stale and delivers it twice. See `_now_utc`. A stamp that
     predates that column carrying its offset is therefore not judged at all,
     only replaced; ages are measured on the pass after.
+
+    Carrying the offset settles the *timezone* half of reading another host's
+    stamp; it says nothing about that host's *clock*. One running ahead stamps
+    a moment that has not happened yet, and a future stamp is never stale, so
+    the row is stranded for as long as the skew — a day of "Sending…" for a day
+    of skew, during which the operator cannot cancel it and the agent will not
+    re-draft the step. So a future stamp is treated like the two unusable cases
+    above: replaced, not judged, which puts recovery at a flat max_age_seconds
+    at any skew. A clock running *behind* is not detectable here at all; see
+    the branch comment.
     """
     now = datetime.now(timezone.utc)
     cutoff = now.timestamp() - max_age_seconds
@@ -663,6 +673,45 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
                 # wedged at deploy time takes two passes — after the restamp, the
                 # row must age out again (up to max_age_seconds); the alternative
                 # is sending a live message twice.
+                c.execute("UPDATE outbox SET sending_at=? WHERE id=? AND status=?",
+                          (_now_utc(), msg["id"], SENDING))
+                continue
+            if stamp > now:
+                # The claiming host's *clock* was ahead — not its timezone; an
+                # aware stamp already carries the offset, so a zone difference
+                # cannot land one in the future. Nothing legitimately does: a
+                # correct clock cannot stamp a moment that has not happened, and
+                # `_now_utc` truncates toward the past, so it cannot manufacture
+                # one either.
+                #
+                # Left unhandled the row is not merely mis-aged, it is *immune*:
+                # age is judged only by `stamp >= cutoff` below, so a stamp `s`
+                # ahead stays "not yet stale" until real time catches up, and
+                # recovery becomes max_age_seconds + s rather than
+                # max_age_seconds. Measured through `dashboard._board` at a
+                # 15-minute render cadence: 15 / 30 / 75 / 1455 minutes at a
+                # skew of 0 / 15min / 1h / 24h. At the last of those the card
+                # reads "Sending…" for a day, Cancel refuses because `SENDING`
+                # is not in `CANCELABLE`, and `has_open_step` keeps counting the
+                # row open — so the agent never re-drafts that step and the
+                # guest is simply never answered.
+                #
+                # Same remedy as the two branches above, for the same reason:
+                # the stamp is unusable, so decline to judge it and replace it
+                # with one written here. The next pass measures a real age, and
+                # recovery is flat at max_age_seconds whatever the skew.
+                #
+                # This is deliberately one-sided, unlike the naive branch above
+                # where one-sidedness was the bug. A clock running *behind*
+                # writes a stamp that is merely old, and an old stamp is exactly
+                # what a genuinely crashed send leaves — the two are
+                # indistinguishable from this row alone, so there is nothing to
+                # test for. (Measured on the westward side: a host 15 min behind
+                # has its one-second-old live send requeued on the very first
+                # render, which delivers the message twice.) Closing that half
+                # needs send *ownership* — whether the claiming process is still
+                # alive — not a better reading of the clock. See VEN-145's
+                # `claim_token` and the note at the top of this module.
                 c.execute("UPDATE outbox SET sending_at=? WHERE id=? AND status=?",
                           (_now_utc(), msg["id"], SENDING))
                 continue
