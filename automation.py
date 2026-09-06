@@ -249,8 +249,15 @@ def send_next(tenant_id: str, site: str, timeout: int = 300) -> dict | None:
     # send_reply dispatches to a background thread and returns immediately, so
     # its return value says nothing about delivery. Wait for the run to reach a
     # terminal state before recording an outcome — otherwise a failed send is
-    # stored as `sent` and the follow-up cadence advances on a message the guest
-    # never received.
+    # stored as `sent`, and the operator is never offered the retry that would
+    # have got the message to the guest.
+    #
+    # This loop records the row's *outcome*; it does not advance the deal. The
+    # worker does that, at the moment the reply actually lands — see
+    # `runner._send_worker`. Doing both here fired `after_contact` twice per
+    # delivered send (once from inside the worker, once here), and it is not
+    # idempotent, so the deal jumped two steps and the guest was never sent
+    # Followup 1.
     #
     # "The run" has to mean *this* dispatch. `runner._state` is one
     # process-global slot, so a not-running snapshot only ever proved that the
@@ -298,7 +305,6 @@ def send_next(tenant_id: str, site: str, timeout: int = 300) -> dict | None:
                 _notify_failure(msg, error)
             else:
                 outbox.set_status(msg["id"], outbox.SENT)
-                after_contact(tenant_id, site, msg["item_id"])
             return msg
         time.sleep(2)
 
