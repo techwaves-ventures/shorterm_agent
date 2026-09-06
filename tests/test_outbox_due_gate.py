@@ -405,6 +405,14 @@ def test_cancelling_the_blocker_immediately_unblocks_the_guest(client, tenant):
 
     resp = client.post(f"/outbox/{blocker['id']}/cancel", data={})
     assert resp.status_code == 200, f"cancel returned {resp.status_code}"
+    # The success arm's flag, for the same reason as the two refusal arms:
+    # `postForm` (`templates/dashboard.html:572`) discards `r.status`, so `ok`
+    # is the whole of what the operator sees. Flipping it leaves the row
+    # correctly canceled while `cancelMsg` reports "Could not cancel this
+    # message." and skips the reload — the mirror of the green-toast lie.
+    assert resp.get_json()["ok"] is True, (
+        "the cancel took, but the route reported failure — the dashboard shows "
+        "'Could not cancel this message.' over a row that is now canceled")
     assert outbox.get(blocker["id"])["status"] == outbox.CANCELED
 
     released, _ = outbox.release_to_send(pending["id"],
@@ -504,6 +512,29 @@ def test_the_cancel_route_reports_the_race_rather_than_a_green_toast(client, ten
     assert resp.status_code == 409, (
         f"cancel answered {resp.status_code} for a row already being delivered")
     assert outbox.get(msg["id"])["status"] == outbox.SENDING
+    # The docstring names `{"ok": true}` as the lie, and until this line nothing
+    # asserted it: `postForm` (`templates/dashboard.html:572`) discards
+    # `r.status`, so the 409 above is invisible to the only caller. This is the
+    # route's *common* arm — a row already `sending` or `sent`, no race needed —
+    # and flipping `ok` here left the whole file green while `cancelMsg`
+    # reloaded the page as though the message had been called off.
+    body = resp.get_json()
+    assert body["ok"] is False, (
+        "the route reported success over a row the drainer is delivering")
+    assert body["already"] is True, (
+        "the refusal was not marked `already`, so the dashboard says nothing "
+        "about why the cancel did not take")
+    # `ok`/`already` only decide *whether* the banner renders; `error` is the
+    # sentence in it — `Not cancelled — already "${res.error}"`. Round 1 pinned
+    # this string on the post-CAS arm and it did not travel here, so collapsing
+    # this arm's lookup to the CANCELED label left the file green while the
+    # operator read `already "Canceled"` over a message on its way to the guest.
+    error = body["error"]
+    assert error == outbox.STATUS_LABELS[outbox.SENDING], (
+        "the 409 must name the true state; the operator reads this string as "
+        f'Not cancelled - already "{error}"')
+    assert error != outbox.STATUS_LABELS[outbox.CANCELED], (
+        "the lost race is worded identically to a successful cancel")
 
 
 # --------------------------------------------------------------------------
@@ -875,3 +906,103 @@ def test_rows_sharing_one_clamped_stamp_are_broken_the_drainer_s_way(tenant, ord
         f"{order}: the card is captioned by row {state['id']} but the drainer "
         f"takes row {drainer_takes['id']} next — with the stamps tied, the id "
         "order is the only thing left to agree on and it does not")
+
+
+# --------------------------------------------------------------------------
+# 8. The cancel route's post-CAS arm, which no test reaches
+#
+# `test_the_cancel_route_reports_the_race_rather_than_a_green_toast` above is
+# named for this race but does not run it: it pre-sets `SENDING`, so the
+# route's ordinary pre-check answers 409 and returns. The five lines below
+# that check — written precisely because a pre-read cannot see a claim landing
+# *after* it — were reachable by nothing in the suite. Reverting them to an
+# unconditional `{"ok": true}` left all 43 tests here green, which is a green
+# toast over a message the guest receives, five deletable lines away.
+# --------------------------------------------------------------------------
+
+def test_the_cancel_route_reports_a_race_it_lost_after_its_own_read(client, tenant,
+                                                                   monkeypatch):
+    """The claim lands after the route's read, which is the arm's precondition.
+
+    Frame-matching `cancel` pins the injection to the real window — between
+    `cancel`'s own read and its CAS. It is deliberately *not* what makes the
+    branch reachable: dropping the frame term still kills the mutant, because
+    `racing_get` hands back the row it read *before* claiming, so the route's
+    pre-check sees `queued` and falls through either way. Measured, not argued.
+    But that leaves reachability riding on a stale snapshot the route happens to
+    be holding, so the guard stays and the window stays stated.
+    """
+    import sys
+
+    _deal(tenant, "L1")
+    msg = _add(tenant, "L1", auto=True)
+    assert outbox.get(msg["id"])["status"] == outbox.QUEUED, (
+        "precondition: only a `queued` row is claimable (`next_queued` selects "
+        "on it), so anything else makes the injected claim an interleaving that "
+        "cannot happen in production — and a non-cancelable row would 409 from "
+        "the route's pre-check, leaving the race arm unexercised")
+
+    real_get = outbox.get
+    fired = {"n": 0}
+
+    def racing_get(mid):
+        row = real_get(mid)
+        if sys._getframe(1).f_code.co_name == "cancel" and fired["n"] == 0:
+            fired["n"] += 1
+            outbox.set_status(mid, outbox.SENDING)   # the drainer wins the claim
+        return row
+
+    monkeypatch.setattr(outbox, "get", racing_get)
+    resp = client.post(f"/outbox/{msg['id']}/cancel", data={})
+    # Restore by re-patching. `monkeypatch.undo()` would also revert the
+    # `db.DB_PATH` the `tenant` fixture set, and the assertions below would then
+    # read a different database — which presents as the row having vanished.
+    monkeypatch.setattr(outbox, "get", real_get)
+
+    # An earlier race test on this ticket matched the wrong frame and silently
+    # never fired, passing for months while asserting nothing.
+    assert fired["n"] == 1, "injection never fired — the test proved nothing"
+    assert outbox.get(msg["id"])["status"] == outbox.SENDING, (
+        "the CAS overwrote a row the drainer had already claimed")
+    assert resp.status_code == 409, (
+        f"route answered {resp.status_code} for a send it did not cancel; the "
+        "guest receives this message and the operator was told it was stopped")
+
+    # The status code owns the *refusal* — but it is the one field this route's
+    # sole consumer never looks at: `postForm` (`templates/dashboard.html:572`)
+    # returns `r.json()` and throws `r.status` away. `cancelMsg` (`:740`)
+    # dispatches on the *body*, in the order `res.ok` → `res.already` →
+    # `res.error`, so the body is what has to be asserted, in that order.
+    # Answering `409 {"ok": true}` takes the first branch —
+    # `if (res.ok) { location.reload(); return; }` — and the page reloads
+    # exactly as it does after a cancel that worked, saying nothing at all about
+    # the send still on its way to the guest.
+    body = resp.get_json()
+    assert body["ok"] is False, (
+        "the route reported success for a send it did not cancel; the dashboard "
+        "reads `ok` first and silently reloads, so the operator is shown the "
+        "same screen as a cancel that worked")
+    # `already` is the gate on the message below ever being rendered, and on the
+    # refresh that follows it. Drop it and the banner loses `Not cancelled —
+    # already`, printing a bare `Sending…` with no auto-refresh behind it.
+    assert body["already"] is True, (
+        "the refusal was not marked as a lost race, so the dashboard falls "
+        "through to its generic message and never says what actually happened")
+
+    # This owns the *report*, which is the half of the harm the ticket words
+    # most emphatically ("telling someone a message was cancelled when it was
+    # not"). `templates/dashboard.html:748` renders this string verbatim:
+    # Not cancelled — already "<error>".
+    error = body["error"]
+    assert error == outbox.STATUS_LABELS[outbox.SENDING], (
+        "the 409 must name the true state; the operator reads this string as "
+        f'Not cancelled - already "{error}"')
+    # …and naming it is only worth anything if it *reads* differently from the
+    # outcome it is denying. `outbox.py:495` records this exact failure mode:
+    # a contradiction stayed invisible "for as long as both came out of
+    # `STATUS_LABELS` as the same string". Collapse those two labels and the
+    # assertion above still passes while the operator is back to being told
+    # "Canceled" over a send that is going out.
+    assert error != outbox.STATUS_LABELS[outbox.CANCELED], (
+        "the lost race is worded identically to a successful cancel, so the "
+        "operator cannot tell them apart — which is the harm, not the refusal")
