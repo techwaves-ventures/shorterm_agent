@@ -209,6 +209,92 @@ def test_an_outlook_re_forward_does_not_open_a_second_deal(tenant):
     assert not took
 
 
+# --- the same message arriving with and without a transport `Date` ----------
+# A stored row and an incoming delivery each either carry a transport stamp or
+# do not, and the two sides can disagree. Both orders have to collapse, and they
+# fail for *different* reasons — the strict probe misses the row in one and the
+# stored row looks precise in the other — so a test in one direction only would
+# leave the other live. See `dashboard.py`'s retry route, which parses a stored
+# rejected row with `row.get("mail_date") or ""`: rows with no stored date are
+# ordinary enough that the route logs about them.
+
+def test_a_redelivery_that_lost_its_transport_date_still_collapses(tenant):
+    """Stored with a `Date`, redelivered without one.
+
+    The retry path re-parses a held email from what was stored, and a row with
+    no `mail_date` re-derives the message with an empty `received_at`. The
+    strict key then falls back to the loose one, so the strict probe looks for
+    an id nothing was ever written under and misses the row that *is* this
+    message — which lives under `item_id=<strict>, alt_id=<loose>`. Reading
+    "this delivery has no finer key" as "there is nothing left to check" makes
+    an already-ingested message report unseen, and recovery writes the board a
+    second time: a duplicate deal and a second autopilot reply to a guest who
+    wrote once. `63f2df6` collapses this, so letting it through is a loss.
+    """
+    assert ingest(tenant, "New message", msg(), ORIGINAL_DATE)[0]
+
+    took, again = ingest(tenant, "New message", msg(), "")
+    assert not took, "the same message redelivered with no Date opened a second deal"
+
+    # And through the gate `inbound.recover` actually asks, not just the one
+    # `store` asks — the two must not disagree about one message.
+    assert storage.already_seen(tenant, SITE, "message", again["id"], item=again)
+
+
+def test_a_redelivery_that_gained_a_transport_date_still_collapses(tenant):
+    """The mirror: stored without a `Date`, redelivered with one.
+
+    Here the stored row is the imprecise side. It was written from a delivery
+    that carried no transport stamp, so its strict key *is* its loose key and
+    `alt_id == item_id` — a row that looks like it recorded a precise key but
+    did not. An incoming message that does carry one loose-matches it, and
+    unless that shape is read as "the stored side has nothing finer than a day"
+    it falls through every clause and is taken as new.
+    """
+    assert ingest(tenant, "New message", msg(), "")[0]
+
+    took, again = ingest(tenant, "New message", msg(), ORIGINAL_DATE)
+    assert not took, "the same message redelivered with a Date opened a second deal"
+    assert storage.already_seen(tenant, SITE, "message", again["id"], item=again)
+
+
+# --- the residual: the fix does not reach a forwarded delivery --------------
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Known residual of VEN-155, documented rather than fixed. When "
+           "either copy carries a forward banner the rule drops on the loose "
+           "key, so two same-day messages with the same words still collapse — "
+           "the filed symptom, on the forwarded path. `63f2df6` drops them too, "
+           "so this is not a regression. Closing it needs a per-message "
+           "discriminator the parser does not have: the input here is "
+           "byte-identical to the re-forward that "
+           "`test_a_forward_arriving_before_the_original_still_collapses` "
+           "requires to collapse. Strict, so whoever finds that discriminator "
+           "is forced to notice this.",
+)
+@pytest.mark.parametrize(
+    "first_render, second_render",
+    [(fwd_gmail, fwd_gmail), (fwd_gmail, None)],
+    ids=["both_forwarded", "forward_then_direct"],
+)
+def test_two_same_day_messages_are_two_messages_even_when_forwarded(
+        tenant, first_render, second_render):
+    """The primary onboarding path is not exposed to this: `README.md` and the
+    settings page set up an *automatic* forwarding rule, which resends the
+    notification without inserting a forward banner, so those deliveries take
+    the direct path above. The exposure is a host forwarding a backlog by hand
+    and then receiving the guest's same-day repeat."""
+    def deliver(render, body, received_at):
+        if render is None:
+            return ingest(tenant, "New message", body, received_at)
+        return ingest(tenant, "Fwd: New message", render(body), received_at)
+
+    assert deliver(first_render, msg(), FORWARD_DATE)[0]
+    took, _ = deliver(second_render, msg(), SAME_DAY_LATER)
+    assert took, "the guest's second message of the day was discarded"
+
+
 # --- the rows that already exist -------------------------------------------
 
 def test_a_row_written_before_the_second_key_still_dedups(tenant):

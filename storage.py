@@ -169,24 +169,46 @@ def _already_ingested(c, tenant_id: str, site: str, kind: str, it: dict) -> bool
     by every relay; the loose key survives relays but cannot tell two same-day
     sends apart. So a loose match alone is not enough to drop something — the
     question is whether the loose match is a *copy* or a *second message*, and
-    three things answer it:
+    two kinds of answer settle it.
+
+    A forward says the loose match is a copy:
 
       - the incoming mail is itself a forward (`via_forward`), so it is a copy
         of the notification rather than a new one;
       - the stored row arrived as a forward, so this direct delivery is the
         original it was made from — the same pair in the other arrival order,
         which happens when a host forwards their backlog before the live feed
-        is pointed at us;
-      - the stored row predates the strict key (alt_id NULL). Its strict key was
-        never recorded, so a strict miss against it proves nothing and the only
-        safe reading is the one this table had before: loose match means seen.
-        These rows are why the loose key is the unchanged one — an open
-        conversation stays addressable under the key it was written with. The
-        original defect stays live for them until their next message is stored
-        under both keys, which is the pre-existing behaviour, not a new loss.
+        is pointed at us.
 
-    Everything else — a loose match with no forward on either side and a row
-    that does carry a strict key — is a guest writing twice, and is let through.
+    Or one of the two sides has no key finer than the loose one, in which case
+    a copy and a second message are genuinely indistinguishable and the only
+    safe reading is the one this table had before the strict key existed:
+
+      - the stored row predates the strict key (alt_id NULL). Its strict key was
+        never recorded, so a strict miss against it proves nothing. These rows
+        are why the loose key is the unchanged one — an open conversation stays
+        addressable under the key it was written with.
+      - the stored row was written from a delivery that carried no transport
+        stamp (alt_id equal to item_id), or *this* delivery carries none
+        (`loose == iid`). Both happen: `dashboard.py`'s retry re-parses a held
+        email with `row.get("mail_date") or ""`, so a row stored without a date
+        re-derives the message with no transport stamp at all. Without these
+        two clauses that redelivery reports unseen and recovery writes the
+        board again — a duplicate deal and a second reply to a guest who wrote
+        once, which is a guarantee the single-key table did have.
+
+    In all four of those the original defect stays live for the pair involved,
+    which is the pre-existing behaviour rather than a new loss. Two of them are
+    the ticket's own symptom on a path this change does not reach: when either
+    copy carries a forward banner, two same-day messages with the same words
+    still collapse, because the input is byte-identical to a re-forward of one
+    message and separating them needs a per-message discriminator the parser
+    does not have. `tests/test_ven155_same_day_messages.py` holds that as a
+    strict xfail so it stays executable rather than implicit.
+
+    Everything else — a loose match with no forward on either side, where both
+    sides recorded a strict key and those keys differ — is a guest writing
+    twice, and is let through.
     """
     iid = str(it["id"])
     if c.execute(
@@ -196,21 +218,29 @@ def _already_ingested(c, tenant_id: str, site: str, kind: str, it: dict) -> bool
         return True
 
     loose = str(it.get("dedup_id") or "")
-    if not loose or loose == iid:
-        # No second key, or it resolved to the same stamp — the check above was
-        # already the whole question.
+    if not loose:
+        # No second key at all — the item never joined the two-key scheme (a
+        # lead, say), so the check above was the whole question. `loose == iid`
+        # is *not* this case: it means this delivery had nothing more precise to
+        # offer, and a stored row may still be more precise than it.
         return False
 
     # `item_id=?` as well as `alt_id=?`: a row written before the strict key
     # existed holds the loose key in item_id, which is the column it was the
     # primary key of at the time.
     rows = c.execute(
-        "SELECT alt_id, via_forward FROM seen "
+        "SELECT item_id, alt_id, via_forward FROM seen "
         "WHERE tenant_id=? AND site=? AND kind=? AND (alt_id=? OR item_id=?)",
         (tenant_id, site, kind, loose, loose),
     ).fetchall()
-    for alt_id, stored_via_forward in rows:
-        if not alt_id:
+    for row_id, alt_id, stored_via_forward in rows:
+        if not alt_id or alt_id == row_id or loose == iid:
+            # One of the two sides has no key finer than the loose one: the row
+            # predates the strict key, or it was written from a delivery that
+            # carried no transport stamp, or this delivery carries none. With
+            # nothing better than a day to compare, a copy and a second message
+            # are indistinguishable, so keep the reading this table had before
+            # the strict key existed.
             return True
         if it.get("via_forward") or stored_via_forward:
             return True
