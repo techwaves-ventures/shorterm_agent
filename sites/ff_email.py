@@ -27,6 +27,7 @@ when it can't establish the basics, so a mis-parse never becomes a fake lead.
 import hashlib
 import logging
 import re
+from email.utils import parseaddr
 
 log = logging.getLogger(__name__)
 
@@ -195,6 +196,100 @@ _FORWARD_HEADER = re.compile(r"^\s*(from|to|cc|bcc|date|sent|subject|reply-to)\s
 # How far into the body a banner still counts as "this mail is a forward".
 _FORWARD_LOOKAHEAD = 6
 
+# Outlook's banner is deliberately NOT in `_FORWARD_BANNER`. Gmail's and Apple
+# Mail's only ever introduce a forward, but Outlook prints
+# "-----Original Message-----" above quoted history on a *reply* as well —
+# `_QUOTE_START` already lists it for exactly that reason. Read as a forward
+# banner it cuts at the wrong line: on a reply the guest's own sentence sits
+# above it, so stripping from the top deletes what they said and keeps the
+# original we sent them. Measured, not feared — widening `_FORWARD_BANNER`
+# turned a reply reading "Sounds good." into the quoted "Any update?".
+#
+# So the marker gets its own pattern, honoured only when the header block under
+# it names FurnishedFinder: a forward *of a notification* carries our sender, a
+# reply quoting our mail carries the host's.
+_OUTLOOK_BANNER = re.compile(r"^\s*-{2,}\s*original message\s*-{2,}\s*$", re.I)
+# Outlook on the web forwards with no banner at all — it just prepends the
+# header block. A bare run of headers is too weak a signal on its own, so all
+# three of these must be named. FurnishedFinder's own wrapper satisfies two.
+_FORWARD_REQUIRED = ({"from"}, {"sent", "date"}, {"subject"})
+# A mail relayed through two clients carries two nested banners, and stripping
+# only the outer one left the inner one in the fingerprint — the same defect one
+# level down. Bounded rather than unbounded: three is past any real relay chain.
+_FORWARD_MAX_DEPTH = 3
+# Domains a forwarded notification's inner `From:` can name. Kept here rather
+# than imported from `inbound` (which imports this module), and matched the way
+# `inbound.sender_allowed` matches: `parseaddr`, then an exact or subdomain
+# test. A substring would accept "furnishedfinder.com.evil.example" and a regex
+# over the raw line would accept the display-name spoof
+# `"no-reply@furnishedfinder.com" <x@evil.example>` — the precise shape
+# `sender_allowed` already carries scar tissue for.
+#
+# This is not authentication and must never be read as any: the envelope decides
+# whether mail is trusted, in `inbound.sender_allowed`. A forged `From:` inside a
+# body can at worst make us strip a header block, which cannot open a deal.
+_FORWARD_FROM_DOMAINS = ("furnishedfinder.com",)
+
+
+def _from_is_ff(line: str) -> bool:
+    """Whether a `From:` header line names a FurnishedFinder address."""
+    _, addr = parseaddr(line.split(":", 1)[1] if ":" in line else "")
+    domain = addr.strip().lower().rpartition("@")[2]
+    return bool(domain) and any(
+        domain == d or domain.endswith("." + d) for d in _FORWARD_FROM_DOMAINS
+    )
+
+
+def _forward_header_block(lines: list[str], i: int) -> tuple[int, str, set, bool]:
+    """Consume the RFC-822 header run starting at `i`.
+
+    Returns (index after the run, the Date/Sent it named, the labels it used,
+    whether its `From:` is FurnishedFinder).
+    """
+    date, labels, from_ff = "", set(), False
+    j = i
+    while j < len(lines):
+        if not lines[j].strip():
+            j += 1
+            continue
+        header = _FORWARD_HEADER.match(lines[j])
+        if not header:
+            break
+        label = header.group(1).lower()
+        labels.add(label)
+        if label in ("date", "sent"):
+            date = lines[j].split(":", 1)[1].strip()
+        if label == "from" and _from_is_ff(lines[j]):
+            from_ff = True
+        j += 1
+    return j, date, labels, from_ff
+
+
+def _forward_split_once(lines: list[str]) -> tuple[int, str]:
+    """One layer of forward wrapper: (index after it, the Date it named)."""
+    for i, line in enumerate(lines[:_FORWARD_LOOKAHEAD]):
+        if _FORWARD_BANNER.match(line):
+            j, date, _, _ = _forward_header_block(lines, i + 1)
+            return j, date
+        if _OUTLOOK_BANNER.match(line):
+            # Ambiguous marker: only a block naming FurnishedFinder is a
+            # forward. Anything else is quoted history, and `_strip_quoted`
+            # owns it — so give up rather than guess at a later banner.
+            j, date, _, from_ff = _forward_header_block(lines, i + 1)
+            return (j, date) if from_ff else (0, "")
+    # No banner: a headerless forward only counts when the body *opens* with the
+    # header block, names all three required labels, and names FurnishedFinder.
+    for line in lines[:_FORWARD_LOOKAHEAD]:
+        if not line.strip():
+            continue
+        if not _FORWARD_HEADER.match(line):
+            break
+        j, date, labels, from_ff = _forward_header_block(lines, 0)
+        if from_ff and all(labels & required for required in _FORWARD_REQUIRED):
+            return j, date
+        break
+    return 0, ""
+
 
 def _forward_split(body: str) -> tuple[int, str]:
     """(index after a leading forward header block, the original Date it named).
@@ -203,26 +298,20 @@ def _forward_split(body: str) -> tuple[int, str]:
     keeping: it is the *original* delivery stamp, so using it in the id lets a
     re-forward dedup against the first copy instead of arriving as a new
     message with a fresh transport date.
+
+    Applied repeatedly, so a mail relayed through two clients has both of its
+    banners stripped and the innermost date — the one closest to the original
+    notification — is the one that survives.
     """
     lines = (body or "").split("\n")
-    for i, line in enumerate(lines[:_FORWARD_LOOKAHEAD]):
-        if not _FORWARD_BANNER.match(line):
-            continue
-        date = ""
-        j = i + 1
-        while j < len(lines):
-            stripped = lines[j].strip()
-            if not stripped:
-                j += 1
-                continue
-            header = _FORWARD_HEADER.match(lines[j])
-            if not header:
-                break
-            if header.group(1).lower() in ("date", "sent"):
-                date = lines[j].split(":", 1)[1].strip()
-            j += 1
-        return j, date
-    return 0, ""
+    start, date = 0, ""
+    for _ in range(_FORWARD_MAX_DEPTH):
+        step, inner = _forward_split_once(lines[start:])
+        if not step:
+            break
+        start += step
+        date = inner or date
+    return start, date
 
 
 def _strip_forwarded(body: str) -> str:
