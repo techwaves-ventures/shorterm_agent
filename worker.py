@@ -193,6 +193,20 @@ def run_agent_pass() -> None:
         except Exception:
             log.exception("Lifecycle pass failed for tenant %s", tenant_id)
 
+    # Pay off any lifecycle advance a delivered send failed to make. Ahead of
+    # the drafting pass, so a cadence repaired here can have its first follow-up
+    # drafted on this same pass instead of waiting for the next one. Over every
+    # tenant with deals, not only those with a step due: a stranded deal has no
+    # next action *by definition* — that is the whole shape of the fault.
+    for tenant_id in pipeline.tenants_with_deals():
+        try:
+            repaired = automation.reconcile_contacts(tenant_id, SITE)
+            if repaired:
+                log.info("Recovered %d stranded follow-up cadence(s) for tenant %s",
+                         repaired, tenant_id)
+        except Exception:
+            log.exception("Lifecycle reconcile failed for tenant %s", tenant_id)
+
     for tenant_id in pipeline.tenants_with_due():
         try:
             summary = automation.run_due(tenant_id, SITE)

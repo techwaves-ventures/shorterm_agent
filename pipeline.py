@@ -751,7 +751,20 @@ def by_item(tenant_id: str, site: str) -> dict[str, dict]:
 
 
 # --- Writes -----------------------------------------------------------------
-def update(tenant_id: str, site: str, item_id: str, **fields) -> None:
+def update(tenant_id: str, site: str, item_id: str,
+           uncontacted_since: str | None = None, **fields) -> bool:
+    """Patch a deal. Returns True iff this call is what wrote the row.
+
+    `uncontacted_since` turns the write into a compare-and-set: an extra WHERE
+    term refusing the update if the row already carries a contact stamp at or
+    after that moment. It is what makes `automation.after_contact` exactly-once
+    per delivery — the reconciler and the send worker can both reach for the
+    same owed advance, and the loser refuses instead of advancing the deal
+    twice. The predicate is on the row being written, so the statement is its
+    own interlock on SQLite and on Postgres alike; no advisory lock is needed
+    here (contrast `outbox.set_status`'s sibling test, which spans other rows).
+    Callers that omit it keep the old unconditional behaviour.
+    """
     allowed = {
         "stage", "guest_name", "unit_id", "check_in", "check_out", "nights",
         "monthly_value", "first_reply_at", "last_contact_at", "sequence",
@@ -760,38 +773,65 @@ def update(tenant_id: str, site: str, item_id: str, **fields) -> None:
     }
     sets = {k: v for k, v in fields.items() if k in allowed}
     if not sets:
-        return
+        return False
     # The single chokepoint every deal write passes through, so it is the one
     # place that can guarantee the timestamp columns stay mutually comparable.
     for col in _TS_COLS:
         if col in sets:
             sets[col] = norm_ts(sets[col])
     assignments = ", ".join(f"{k}=?" for k in sets)
+    where = ["tenant_id=?", "site=?", "item_id=?"]
     vals = list(sets.values()) + [_now(), str(tenant_id), site, str(item_id)]
+    if uncontacted_since is not None:
+        # Both sides normalized, or the string compare lies — see `norm_ts`.
+        where.append("(last_contact_at IS NULL OR last_contact_at < ?)")
+        vals.append(norm_ts(uncontacted_since))
     with _conn() as c:
-        c.execute(
+        cur = c.execute(
             f"UPDATE deals SET {assignments}, updated_at=? "
-            "WHERE tenant_id=? AND site=? AND item_id=?",
+            f"WHERE {' AND '.join(where)}",
             vals,
         )
+        return (cur.rowcount or 0) > 0
 
 
-def record_contact(tenant_id: str, site: str, item_id: str) -> None:
-    """Mark that we just sent the guest something.
+def contact_fields(deal: dict, at: str | None = None) -> dict:
+    """The columns that recording a contact writes — computed, not written.
 
-    Stamps `first_reply_at` once (it powers the response-time metric, which is
-    the product's core speed claim) and moves a brand-new deal to `contacted`.
+    Split out of `record_contact` so `automation.after_contact` can fold them
+    into the single UPDATE that also advances the sequence. Three separate
+    writes could half-apply, and a half-applied advance is invisible to any
+    check derived from the columns it writes: the contact stamp lands, the
+    cadence does not, and nothing downstream can tell that apart from a deal
+    that was properly advanced (VEN-219).
+
+    `at` is when the message actually reached the guest, and defaults to now.
     """
-    deal = get(tenant_id, site, item_id)
-    if not deal:
-        return
-    now = _now()
+    now = norm_ts(at) or _now()
     fields: dict = {"last_contact_at": now}
     if not deal.get("first_reply_at"):
         fields["first_reply_at"] = now
     if deal.get("stage") == NEW:
         fields["stage"] = CONTACTED
-    update(tenant_id, site, item_id, **fields)
+    return fields
+
+
+def record_contact(tenant_id: str, site: str, item_id: str,
+                   at: str | None = None) -> None:
+    """Mark that we just sent the guest something.
+
+    Stamps `first_reply_at` once (it powers the response-time metric, which is
+    the product's core speed claim) and moves a brand-new deal to `contacted`.
+
+    `at` defaults to now. A repair pass passes the moment the message actually
+    reached the guest, because that is what the follow-up sequence is anchored
+    on: stamping the repair time instead pushes every subsequent touch out by
+    however long the deal sat stranded.
+    """
+    deal = get(tenant_id, site, item_id)
+    if not deal:
+        return
+    update(tenant_id, site, item_id, **contact_fields(deal, at))
 
 
 def mark_booked(tenant_id: str, site: str, item_id: str,
