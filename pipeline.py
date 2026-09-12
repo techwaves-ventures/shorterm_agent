@@ -24,6 +24,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 import db
+import scheduler
 import timeframe
 
 log = logging.getLogger(__name__)
@@ -826,7 +827,8 @@ STALE_CLOSE_DAYS = 21
 PRE_ARRIVAL_DAYS = 7
 
 
-def advance_lifecycle(tenant_id: str, site: str, today: str | None = None) -> dict:
+def advance_lifecycle(tenant_id: str, site: str, today: str | None = None,
+                      server_today: str | None = None) -> dict:
     """Move deals through the stages that a calendar — not a human — decides.
 
     `STAYING` and `COMPLETED` were declared, filtered on and labelled, but no
@@ -838,11 +840,38 @@ def advance_lifecycle(tenant_id: str, site: str, today: str | None = None) -> di
 
     Returns a per-transition count. Idempotent: re-running on the same day is a
     no-op, so it is safe to call from every worker pass.
+
+    Two dates, deliberately, because this one function compares columns written
+    in two different frames — see the comments on each. Collapsing them back
+    into one variable is the bug this function used to have (VEN-223): the
+    stage arms read the *server's* date while `check_in`/`check_out` are the
+    property's, so for the hours a day the zones disagree the worker *wrote*
+    the wrong stage — a guest flipped to `staying` before arriving, a booking
+    closed to `completed` a day early and dropped out of `BOOKED_STAGES`
+    entirely. Unlike the display-side twin (VEN-221) re-rendering does not undo
+    it.
     """
-    today = today or datetime.now().date().isoformat()
+    # The PROPERTY's calendar date. `check_in`/`check_out` are zoneless
+    # calendar dates — neither write path reads a clock (`parse_date` off the
+    # listing, or the operator's booking form) — so they are bounded in their
+    # own frame, not in whichever zone this process happens to run in.
+    # Resolved here rather than at the call site precisely because the caller
+    # (`worker.py`) had `tenant_id` in scope and still got the frame wrong; a
+    # future caller cannot reintroduce that by forgetting an argument.
+    today = today or scheduler.local_now(tenant_id).date().isoformat()
     horizon = (datetime.fromisoformat(today).date()
                + timedelta(days=PRE_ARRIVAL_DAYS)).isoformat()
-    stale_before = (datetime.fromisoformat(today) - timedelta(days=STALE_CLOSE_DAYS)
+    # The OTHER frame, on purpose. `stale_before` is compared against
+    # `last_contact_at` / `last_guest_reply_at` / `inquiry_at`, which `_now()`
+    # writes in server wall clock. Deriving it from `today` above would shift
+    # the abandonment bound by the zone offset and auto-close deals on the
+    # wrong day — the same correction as VEN-138, in the opposite direction.
+    # One rule applied twice: compare each column in the frame it was written
+    # in. Kept anchored to midnight (`fromisoformat(...) - 21d`) rather than
+    # re-spelled as `datetime.now() - 21d`, which would move the bound by up to
+    # a further 24h.
+    server_today = server_today or datetime.now().date().isoformat()
+    stale_before = (datetime.fromisoformat(server_today) - timedelta(days=STALE_CLOSE_DAYS)
                     ).isoformat(timespec="seconds")
     moved = {"pre_arrival": 0, "staying": 0, "completed": 0, "lost": 0}
 
