@@ -789,7 +789,7 @@ def test_a_stood_down_repair_lands_where_the_healthy_send_landed(
 # ---------------------------------------------------------------------------
 
 
-def _age_the_inquiry(tid, item_id, *, days):
+def _age_the_deals_stamps(tid, item_id, *, days):
     """Make the deal genuinely old instead of faking the calendar.
 
     `advance_lifecycle` now reads TWO dates (VEN-223 split the property frame
@@ -827,7 +827,7 @@ def _age_the_inquiry(tid, item_id, *, days):
     aged = pipeline.get(tid, SITE, item_id)
     assert aged["inquiry_at"] == old
     assert aged["last_contact_at"] in (None, "", old), (
-        "every stamp the sweep ages off must be behind the bound, or "
+        "every stamp `_is_abandoned` maxes over must be behind the bound, or "
         "`next_action_at` is not the only thing keeping this deal open")
     assert not aged["last_guest_reply_at"], (
         "same reason, and a guest reply would take `_is_abandoned`'s other "
@@ -850,7 +850,7 @@ def test_the_stranded_deal_is_auto_closed_with_a_reason_that_is_not_true(
     _send(tenant, "x1", "Iris P.", advance_fails=True)
     _assert_stranded(tenant, "x1")
 
-    _age_the_inquiry(tenant, "x1", days=pipeline.STALE_CLOSE_DAYS + 2)
+    _age_the_deals_stamps(tenant, "x1", days=pipeline.STALE_CLOSE_DAYS + 2)
     moved = pipeline.advance_lifecycle(tenant, SITE)
 
     assert moved["lost"] == 1
@@ -868,7 +868,7 @@ def test_a_repaired_deal_is_not_auto_closed(tenant, browser, monkeypatch):
     _backdate_delivery(tenant, "x2", seconds=PAST_SETTLE_SECONDS)
     assert automation.reconcile_contacts(tenant, SITE) == 1
 
-    _age_the_inquiry(tenant, "x2", days=pipeline.STALE_CLOSE_DAYS + 2)
+    _age_the_deals_stamps(tenant, "x2", days=pipeline.STALE_CLOSE_DAYS + 2)
     moved = pipeline.advance_lifecycle(tenant, SITE)
 
     assert moved["lost"] == 0
