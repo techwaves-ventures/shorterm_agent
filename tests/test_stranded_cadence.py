@@ -60,7 +60,7 @@ import contextlib
 import os
 import tempfile
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -788,6 +788,36 @@ def test_a_stood_down_repair_lands_where_the_healthy_send_landed(
 # The consequence the strand ends in, and that the repair prevents
 # ---------------------------------------------------------------------------
 
+
+def _age_the_inquiry(tid, item_id, *, days):
+    """Make the deal genuinely old instead of faking the calendar.
+
+    `advance_lifecycle` now reads TWO dates (VEN-223 split the property frame
+    from the server frame, VEN-225 gave `inquiry_at` its own bound), so a test
+    that fakes the passage of time through its arguments has to name every
+    frame the function grows. Backdating the row's only stamp needs none of
+    them: both bounds derive from the real clock, as they do in production.
+    Same idiom as `test_agent_lifecycle.py`'s stale-close test.
+
+    Callers pass `STALE_CLOSE_DAYS + 2`, and the `+ 2` is load-bearing, not
+    slack. VEN-225's `inquiry_stale_before` is the EARLIER of two
+    midnight-anchored bounds, and this tenant is `America/New_York`, so between
+    00:00 and ~04:00 UTC the property date is a day behind the server date and
+    that bound drops a day with it. A `+ 1` stamp then lands at today's
+    time-of-day on the bound's own date — the wrong side of a strict `<` — and
+    the test fails for those hours only. Measured both ways; do not shave it.
+    """
+    old = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
+    with pipeline._conn() as c:
+        cur = c.execute(
+            "UPDATE deals SET inquiry_at=? WHERE tenant_id=? AND item_id=?",
+            (old, tid, item_id))
+        assert (cur.rowcount or 0) == 1, (
+            "the backdate must land, or the sweep below proves nothing")
+    assert pipeline.get(tid, SITE, item_id)["inquiry_at"] == old
+    return old
+
+
 def test_the_stranded_deal_is_auto_closed_with_a_reason_that_is_not_true(
         tenant, browser, monkeypatch):
     """A guard, green on base and on the fix — this behaviour is unchanged.
@@ -803,9 +833,8 @@ def test_the_stranded_deal_is_auto_closed_with_a_reason_that_is_not_true(
     _send(tenant, "x1", "Iris P.", advance_fails=True)
     _assert_stranded(tenant, "x1")
 
-    future = (date.today() + timedelta(days=pipeline.STALE_CLOSE_DAYS + 1)
-              ).isoformat()
-    moved = pipeline.advance_lifecycle(tenant, SITE, today=future)
+    _age_the_inquiry(tenant, "x1", days=pipeline.STALE_CLOSE_DAYS + 2)
+    moved = pipeline.advance_lifecycle(tenant, SITE)
 
     assert moved["lost"] == 1
     deal = pipeline.get(tenant, SITE, "x1")
@@ -822,9 +851,8 @@ def test_a_repaired_deal_is_not_auto_closed(tenant, browser, monkeypatch):
     _backdate_delivery(tenant, "x2", seconds=PAST_SETTLE_SECONDS)
     assert automation.reconcile_contacts(tenant, SITE) == 1
 
-    future = (date.today() + timedelta(days=pipeline.STALE_CLOSE_DAYS + 1)
-              ).isoformat()
-    moved = pipeline.advance_lifecycle(tenant, SITE, today=future)
+    _age_the_inquiry(tenant, "x2", days=pipeline.STALE_CLOSE_DAYS + 2)
+    moved = pipeline.advance_lifecycle(tenant, SITE)
 
     assert moved["lost"] == 0
     deal = pipeline.get(tenant, SITE, "x2")
