@@ -504,7 +504,9 @@ def test_abandonment_bound_is_anchored_to_midnight_not_to_the_hour(
     up to a further 24h". Nothing asserted that: every other frozen instant in
     this file lands on midnight, where the two spellings agree, so the re-spelling
     survived the whole suite (review R5). Here the server is pinned at 13:45, so
-    the misanchored bound sweeps 13h45m further back and takes `warm` with it.
+    the misanchored bound reaches 13h45m further *forward* — `T00:00` becomes
+    `T13:45` on the same day — and takes `warm` with it. (A later bound closes
+    more deals, not fewer: staleness is `stamp < bound`.)
 
     Deliberately zone-free — the fixture tenant sets no timezone, so both dates
     fall back to the server frame and this says something about the *anchor*
@@ -708,6 +710,98 @@ def test_each_bound_is_exact_to_the_second_for_its_own_column(tenant):
     assert stages["inq-a-second-past"] == pipeline.LOST, stages
     assert stages["con-on-bound"] == pipeline.CONTACTED, stages
     assert stages["con-a-second-past"] == pipeline.LOST, stages
+    assert moved["lost"] == 2, (moved, stages)
+
+
+def test_every_stamp_is_bounded_not_only_the_deciding_one(tenant):
+    """VEN-225 AC8 — the rule is per *column*, not per deal (review R1).
+
+    This change replaces an aggregate — `max()` of three stamps against one
+    bound — with a per-element rule: each stamp against the bound for its own
+    column. That restatement is **indistinguishable from the aggregate until two
+    stamps straddle the two differing bounds**, and nothing in this file did
+    that: `_open_deal` pins `inquiry_at` at 2025 and `_inquiry_only` leaves the
+    other two columns NULL, so every deal has at most one stamp anywhere near a
+    bound, and "every stamp is older than its bound" agrees with "the *newest*
+    stamp is older than its bound" everywhere the file looks. Review R1 found
+    two mutants that survived all 736 tests through exactly that gap: taking
+    `max(pairs)` and bounding only that one, and handing `last_guest_reply_at`
+    the inquiry bound.
+
+    So the deals below each carry two non-NULL stamps inside the 24h band
+    between the bounds, in both directions, because the two spellings fail
+    opposite ways:
+
+    * `inquiry_at` in the band with a *newer* `last_contact_at` already past the
+      server bound. The aggregate closes this deal; the per-column rule must
+      not, because its `inquiry_at` has not reached its own property bound and
+      "early in the property frame" is the whole thing `min()` prevents. It is
+      also the ordinary shape of the accepted cost — a listing dated 22 days
+      ago, contacted the same afternoon, never replied to — which is why the
+      `inquiry_stale_before` comment now names this population and not only the
+      never-contacted one.
+    * `last_guest_reply_at` in the band with a newer `last_contact_at`. That
+      column really is a server stamp and keeps the server bound, so the close
+      must still happen; widening it to the inquiry bound would veto here.
+
+    Asserted at the predicate *and* through `advance_lifecycle`, so it also
+    holds the two bounds to the columns the call site pairs them with.
+    """
+    today, server_today = "2026-03-09", "2026-03-10"       # property a day behind
+    inquiry_bound = (datetime.fromisoformat(today) - timedelta(days=STALE)
+                     ).isoformat(timespec="seconds")
+    server_bound = (datetime.fromisoformat(server_today) - timedelta(days=STALE)
+                    ).isoformat(timespec="seconds")
+    band = (datetime.fromisoformat(inquiry_bound) + timedelta(hours=12)
+            ).isoformat(timespec="seconds")
+    newer = (datetime.fromisoformat(band) + timedelta(hours=6)
+             ).isoformat(timespec="seconds")
+    # The band has to be a real band or every assertion below is vacuous: both
+    # stamps must be stale by the SERVER bound and fresh by the INQUIRY one.
+    assert inquiry_bound < band < newer < server_bound, (
+        inquiry_bound, band, newer, server_bound)
+
+    # --- the predicate, directly ---
+    older_inquiry = {"inquiry_at": band, "last_contact_at": newer,
+                     "next_action_at": None}
+    assert pipeline._is_abandoned(older_inquiry, server_bound,
+                                  inquiry_bound) is False, \
+        "an inquiry_at short of its own bound must veto even when it is not the newest"
+    replied_then_contacted = {"last_guest_reply_at": band,
+                              "last_contact_at": newer,
+                              "inquiry_at": INQUIRY_FAR_BEHIND,
+                              "next_action_at": None}
+    # Vacuity guard on the fixture: if the guest were the last to speak, the
+    # early return above the bounds would answer and the pairing would go
+    # untested.
+    assert pipeline._guest_is_waiting(replied_then_contacted) is False, \
+        "vacuity guard: this deal must reach the bounds loop"
+    assert pipeline._is_abandoned(replied_then_contacted, server_bound,
+                                  inquiry_bound) is True, \
+        "last_guest_reply_at is a server stamp and must keep the server bound"
+    # And the aggregate this replaced really does disagree on the first deal, so
+    # the assertions above are not two spellings of the same answer.
+    assert max(pipeline.cmp_ts(band), pipeline.cmp_ts(newer)) < \
+        pipeline.cmp_ts(server_bound), "the old max() spelling closed this deal"
+
+    # --- the same two shapes through the write path ---
+    _open_deal(tenant, "inq-in-band", "A", newer)
+    _open_deal(tenant, "replied-then-contacted", "B", newer)
+    _open_deal(tenant, "both-past", "C", newer)      # positive control
+    with pipeline._conn() as c:
+        c.execute("UPDATE deals SET inquiry_at=? WHERE tenant_id=? AND site=? "
+                  "AND item_id=?", (band, str(tenant), SITE, "inq-in-band"))
+        c.execute("UPDATE deals SET last_guest_reply_at=? WHERE tenant_id=? "
+                  "AND site=? AND item_id=?",
+                  (band, str(tenant), SITE, "replied-then-contacted"))
+
+    moved = pipeline.advance_lifecycle(tenant, SITE, today=today,
+                                       server_today=server_today)
+    stages = _stages(tenant)
+
+    assert stages["inq-in-band"] == pipeline.CONTACTED, stages
+    assert stages["replied-then-contacted"] == pipeline.LOST, stages
+    assert stages["both-past"] == pipeline.LOST, ("positive control", stages)
     assert moved["lost"] == 2, (moved, stages)
 
 

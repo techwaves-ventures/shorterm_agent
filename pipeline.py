@@ -888,6 +888,18 @@ def advance_lifecycle(tenant_id: str, site: str, today: str | None = None,
     # owner a loss they did not take. Not a padding constant: `min` of two real
     # bounds, equal (so a literal no-op) whenever no property zone is set.
     # Do NOT "improve" this by sniffing the frame off the stored 09:00.
+    #
+    # Who pays that day, stated wider than the ticket stated it: ANY open deal
+    # holding an `inquiry_at` between the two bounds is held open, whether or not
+    # `inquiry_at` is its newest stamp. The ticket described only the deal nobody
+    # ever contacted — there `inquiry_at` is the sole stamp and the delay is
+    # obvious — but the common case is a deal that WAS contacted the same
+    # afternoon and never replied to: its `last_contact_at` is past the server
+    # bound, the old `max()` spelling would have closed it, and the inquiry arm
+    # now vetoes for one more pass. That is the same one-day cost on a larger
+    # population, and it is the price of the rule being per column rather than
+    # per deal — the veto has to be unconditional or it is not a bound at all.
+    # Asserted in `test_every_stamp_is_bounded_not_only_the_deciding_one`.
     inquiry_stale_before = min(
         stale_before,
         (datetime.fromisoformat(today) - timedelta(days=STALE_CLOSE_DAYS)
@@ -938,6 +950,14 @@ def _is_abandoned(deal: dict, stale_before: str,
     and a `max()` across two frames is not a time. "The newest is older than the
     bound" and "every stamp is older than its bound" are the same sentence when
     the bounds are equal, so this is a no-op for a tenant with no property zone.
+
+    When they differ, every stamp means every stamp: a single column short of
+    its own bound vetoes the close even if some other, newer column is well past
+    its own. Bounding only the *deciding* (newest) stamp reads like the same
+    rule and is not — it re-opens exactly the early close this exists to
+    prevent, and nothing else in the suite distinguishes the two spellings. See
+    `test_every_stamp_is_bounded_not_only_the_deciding_one`, and see
+    `inquiry_stale_before` in `advance_lifecycle` for who pays for the veto.
     """
     if deal.get("next_action_at"):
         return False
