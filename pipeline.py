@@ -21,7 +21,7 @@ Python and stays portable across SQLite and Postgres (same rationale as jobs.py)
 """
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import db
 import scheduler
@@ -219,6 +219,14 @@ def _normalize_legacy_timestamps() -> None:
 # runs on — the same clock `scheduler.py` deliberately reads for quiet hours.
 # Canonical shape is therefore local time, "T"-separated, seconds precision, and
 # every write into a deal timestamp column goes through `norm_ts` on the way in.
+#
+# `inquiry_at` is SERVER-framed on both write arms as of VEN-226: the parsed
+# listing date is converted from the property's 09:00 into the server frame
+# before storing, and the fallback `_now()` arm was always server-framed. Rows
+# written before VEN-226 may hold a bare "<date>T09:00" in the property's frame
+# (indistinguishable from a server-framed value to every reader); `_backfill_one`
+# heals them from the item's source date rather than by rewriting values.
+# `check_in` and `check_out` remain property-calendar dates (no time component).
 _TS_COLS = ("inquiry_at", "first_reply_at", "last_contact_at",
             "last_guest_reply_at", "next_action_at", "created_at", "updated_at")
 
@@ -336,7 +344,54 @@ _RECEIVED_RE = re.compile(
 )
 
 
-def inquiry_date(item: dict) -> str | None:
+def _inquiry_gate_today(tenant_id: str | None,
+                        server_now: datetime | None = None) -> str:
+    """The latest date that can already have happened, in EITHER frame.
+
+    `inquiry_date`'s future test rejects a *property*-calendar date; bounding it
+    with the server's date discards a genuine same-day inquiry whenever the
+    property is on tomorrow already. `max` is the mirror of VEN-225's `min`: an
+    upper bound must never reject a real value, so take the later of the two
+    dates and reject only what is in the future in *both* frames. The cost is up
+    to one day of slack against a move-out date mistaken for a received date,
+    and those are months out, not one day out.
+    """
+    server_now = server_now or datetime.now()
+    latest = server_now.date()
+    if tenant_id is not None:
+        latest = max(latest, scheduler.local_now(tenant_id, server_now).date())
+    return latest.isoformat()
+
+
+def _inquiry_stamp(inquiry: str, tenant_id: str | None,
+                   server_now: datetime) -> str:
+    """A listing's calendar date as a SERVER-frame instant, never in the future.
+
+    `inquiry` is the zoneless date the listing showed; 09:00 is the convention
+    this module already invented for it. The only change is *whose* 09:00: the
+    property's, converted into the frame every reader of this column compares in
+    (`norm_ts`'s contract, and the frame `timeframe.stamp` already assumes for
+    this anchor). Clamped to now because the 09:00 fiction is in the future
+    whenever the property's local time is still before 09:00 — a guest cannot
+    have asked later than now, and that clamp is what stops a negative age,
+    a dropped response-time pair and a step scheduled before its own trigger.
+    """
+    nine = datetime.combine(date.fromisoformat(inquiry), time(9, 0))
+    at = scheduler.server_naive(tenant_id, nine) if tenant_id is not None else nine
+    return min(at, server_now).isoformat(timespec="seconds")
+
+
+def _property_date(stamp: str | None, tenant_id: str | None) -> str | None:
+    """Which property-calendar date a stored server-frame stamp falls on."""
+    dt = _to_dt(stamp)
+    if dt is None:
+        return None
+    if tenant_id is None:
+        return dt.date().isoformat()
+    return scheduler.local_now(tenant_id, dt).date().isoformat()
+
+
+def inquiry_date(item: dict, today: str | None = None) -> str | None:
     """When the guest actually asked, as ISO — or None if we genuinely can't tell.
 
     Prefers the explicit detail-page value over the row-derived `received`,
@@ -353,7 +408,7 @@ def inquiry_date(item: dict) -> str | None:
         if recovered:
             return recovered
     candidate = parse_date(item.get("received") or item.get("date"))
-    today = datetime.now().date().isoformat()
+    today = today or datetime.now().date().isoformat()
     return candidate if (candidate and candidate <= today) else None
 
 
@@ -539,12 +594,20 @@ def _estimate_value(item: dict, units: list[dict] | None, unit_id: str | None) -
     return 0
 
 
-def derive(item: dict, response: dict | None, units: list[dict] | None = None) -> dict:
-    """Map a scraped lead/message (+ the agent's decision) onto deal fields."""
+def derive(item: dict, response: dict | None, units: list[dict] | None = None,
+           tenant_id: str | None = None) -> dict:
+    """Map a scraped lead/message (+ the agent's decision) onto deal fields.
+
+    `tenant_id` is what lets `inquiry_at` be written in ONE frame. Resolved here
+    rather than at the call site, the same way `advance_lifecycle` does it, so a
+    future caller cannot reintroduce the split by forgetting an argument; None
+    keeps the old server-only behaviour for an out-of-tree caller.
+    """
     kind = item.get("kind", "lead")
     guest = (item.get("traveler") or item.get("sender") or "").strip()
     unit_id = (response or {}).get("unit_id")
-    inquiry = inquiry_date(item)
+    server_now = datetime.now()
+    inquiry = inquiry_date(item, today=_inquiry_gate_today(tenant_id, server_now))
     return {
         "kind": kind,
         "guest_name": guest,
@@ -554,9 +617,15 @@ def derive(item: dict, response: dict | None, units: list[dict] | None = None) -
         "check_out": parse_date(item.get("move_out")),
         "nights": item.get("nights") if isinstance(item.get("nights"), int) else None,
         "monthly_value": _estimate_value(item, units, unit_id),
-        # Fall back to "now" so a lead whose date we couldn't parse still gets a
-        # sane clock rather than sorting as infinitely old.
-        "inquiry_at": f"{inquiry}T09:00:00" if inquiry else _now(),
+        # One column, one frame. The parsed listing date is the PROPERTY's
+        # zoneless calendar date and used to be stored as a bare "<date>T09:00",
+        # which `norm_ts` passes through untouched (already naive, already
+        # T-separated) — so the column held property-framed and server-framed
+        # values that no reader could tell apart, and every reader does interval
+        # arithmetic on it. Fall back to "now" so a lead whose date we couldn't
+        # parse still gets a sane clock rather than sorting as infinitely old.
+        "inquiry_at": (_inquiry_stamp(inquiry, tenant_id, server_now) if inquiry
+                       else server_now.isoformat(timespec="seconds")),
     }
 
 
@@ -568,7 +637,7 @@ def ensure(tenant_id: str, site: str, item: dict, response: dict | None = None,
     resets `stage`, the contact history, or the automation schedule.
     """
     tenant_id, item_id = str(tenant_id), str(item["id"])
-    fields = derive(item, response, units)
+    fields = derive(item, response, units, tenant_id=tenant_id)
     existing = get(tenant_id, site, item_id)
     now = _now()
     if existing:
@@ -579,7 +648,8 @@ def ensure(tenant_id: str, site: str, item: dict, response: dict | None = None,
         # normalizes here — including the stored value, which may predate the
         # canonical format and would otherwise fail the future-date test below.
         inquiry = norm_ts(existing.get("inquiry_at"))
-        if inquiry_date(item) or (inquiry and inquiry > now):
+        if inquiry_date(item, today=_inquiry_gate_today(tenant_id)) or (
+                inquiry and inquiry > now):
             inquiry = norm_ts(fields["inquiry_at"])
         # An existing deal keeps the thread it was filed under unless it never
         # had one (a row created before thread_key existed) — re-keying a live
@@ -649,8 +719,16 @@ def _backfill_one(tenant_id: str, site: str, item_id: str, item: dict,
         # detail scrape backfilled onto the item. Otherwise leave it alone,
         # so the steady-state cost of this pass stays one SELECT.
         stored = str(deal.get("inquiry_at") or "")
-        truth = inquiry_date(item)
-        if stored > now or (truth and stored[:10] != truth):
+        truth = inquiry_date(item, today=_inquiry_gate_today(tenant_id))
+        # `stored[:10]` was a property-date comparison against a server-framed
+        # prefix: once the stamp is converted into the server frame the prefix
+        # legitimately differs from the listing date by a day, and this pass runs
+        # on every dashboard load, so the prefix test would re-derive the same
+        # deal forever. Ask the question it meant to ask instead — which
+        # property day does the stored instant fall on — which converges for a
+        # converted stamp and re-derives a legacy property-framed row exactly
+        # once, from the item's own date rather than by rewriting a value.
+        if stored > now or (truth and _property_date(stored, tenant_id) != truth):
             ensure(tenant_id, site, {**item, "id": item_id},
                    responses.get(item_id), units=units)
         return 0

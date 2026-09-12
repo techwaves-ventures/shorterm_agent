@@ -60,6 +60,24 @@ def local_now(tenant_id: str, now: datetime | None = None) -> datetime:
     aware = now if now.tzinfo else now.astimezone()
     return aware.astimezone(tz).replace(tzinfo=None)
 
+
+def server_naive(tenant_id: str, local: datetime) -> datetime:
+    """`local`, a property-local naive datetime, in the server's naive frame.
+
+    The inverse of `local_now`, and the piece that was missing: every frame fix
+    so far has moved a *bound* into the property frame, which needs one
+    direction only. Turning a property-local calendar date into an instant that
+    can be stored beside `_now()` stamps needs the other one.
+
+    DST note: 09:00 is outside every real DST transition window (00:00-03:00
+    local), so `replace(tzinfo=tz)` never produces a nonexistent or ambiguous
+    local time for this use case.
+    """
+    tz = tz_for(tenant_id)
+    if tz is None:
+        return local
+    return local.replace(tzinfo=tz).astimezone().replace(tzinfo=None)
+
 # Autopilot never fires outside these hours even if the owner sets a silly time:
 # a 3am browser login racks up FurnishedFinder security emails for no benefit.
 BUSINESS_START = time(7, 0)
