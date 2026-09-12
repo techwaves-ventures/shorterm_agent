@@ -795,9 +795,17 @@ def _age_the_inquiry(tid, item_id, *, days):
     `advance_lifecycle` now reads TWO dates (VEN-223 split the property frame
     from the server frame, VEN-225 gave `inquiry_at` its own bound), so a test
     that fakes the passage of time through its arguments has to name every
-    frame the function grows. Backdating the row's only stamp needs none of
-    them: both bounds derive from the real clock, as they do in production.
-    Same idiom as `test_agent_lifecycle.py`'s stale-close test.
+    frame the function grows. Backdating the row's stamps needs none of them:
+    both bounds derive from the real clock, as they do in production. Same
+    idiom as `test_agent_lifecycle.py:871-880`'s stale-close test.
+
+    Age EVERY stamp `_is_abandoned` measures from, not just the inquiry. That
+    function takes `max(last_guest_reply_at, last_contact_at, inquiry_at)`, so
+    leaving one of them at now protects the deal by recency and the
+    `next_action_at` guard above it stops being the thing under test — the
+    repaired-deal test would then pass with that guard deleted. The `CASE` is
+    what keeps the stranded deal's row untouched: the strand leaves
+    `last_contact_at` NULL by construction, which is the defect VEN-219 fixes.
 
     Callers pass `STALE_CLOSE_DAYS + 2`, and the `+ 2` is load-bearing, not
     slack. VEN-225's `inquiry_stale_before` is the EARLIER of two
@@ -810,11 +818,20 @@ def _age_the_inquiry(tid, item_id, *, days):
     old = (datetime.now() - timedelta(days=days)).isoformat(timespec="seconds")
     with pipeline._conn() as c:
         cur = c.execute(
-            "UPDATE deals SET inquiry_at=? WHERE tenant_id=? AND item_id=?",
-            (old, tid, item_id))
+            "UPDATE deals SET inquiry_at=?, "
+            "last_contact_at=CASE WHEN last_contact_at IS NULL THEN NULL "
+            "ELSE ? END WHERE tenant_id=? AND item_id=?",
+            (old, old, tid, item_id))
         assert (cur.rowcount or 0) == 1, (
             "the backdate must land, or the sweep below proves nothing")
-    assert pipeline.get(tid, SITE, item_id)["inquiry_at"] == old
+    aged = pipeline.get(tid, SITE, item_id)
+    assert aged["inquiry_at"] == old
+    assert aged["last_contact_at"] in (None, "", old), (
+        "every stamp the sweep ages off must be behind the bound, or "
+        "`next_action_at` is not the only thing keeping this deal open")
+    assert not aged["last_guest_reply_at"], (
+        "same reason, and a guest reply would take `_is_abandoned`'s other "
+        "early return instead — no test here has the guest write back")
     return old
 
 
