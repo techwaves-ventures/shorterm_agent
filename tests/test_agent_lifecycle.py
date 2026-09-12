@@ -68,6 +68,20 @@ def _lead(tenant_id, item_id="L1", received=None, **extra):
     return item
 
 
+def _age_inquiry(tenant_id, item_id, when):
+    """Push `inquiry_at` behind the stale cutoff too.
+
+    `_is_abandoned` measures staleness across three stamps —
+    `last_guest_reply_at`, `last_contact_at` and `inquiry_at` — and any one of
+    them still fresh keeps the deal open on its own. `_lead` leaves `inquiry_at`
+    at ~now, so a test that ages only one stamp is not stale on the others and
+    passes whether or not the guard it is named after still exists.
+    """
+    with pipeline._conn() as c:
+        c.execute("UPDATE deals SET inquiry_at=? WHERE tenant_id=? AND item_id=?",
+                  (when, tenant_id, item_id))
+
+
 # --- pipeline ---------------------------------------------------------------
 
 
@@ -890,6 +904,7 @@ def test_a_deal_with_a_follow_up_still_queued_is_never_closed(tenant):
            ).isoformat(timespec="seconds")
     pipeline.update(tenant, SITE, "pending", stage=pipeline.NURTURING,
                     last_contact_at=old, next_action_at="2099-01-01T09:00:00")
+    _age_inquiry(tenant, "pending", old)
     pipeline.advance_lifecycle(tenant, SITE)
     assert pipeline.get(tenant, SITE, "pending")["stage"] == pipeline.NURTURING
 
@@ -902,8 +917,20 @@ def test_a_guest_waiting_on_us_is_never_written_off_as_lost(tenant):
     pipeline.update(tenant, SITE, "waiting", stage=pipeline.NURTURING,
                     last_contact_at=old, last_guest_reply_at=old[:10] + "T23:59:59",
                     next_action_at=None)
+    _age_inquiry(tenant, "waiting", old)
+    # Control: the same deal with the two stamps swapped, so *we* spoke last.
+    # Nothing is holding it open and it must close — otherwise the negative
+    # assert below could pass on a deal that was never stale in the first place
+    # rather than on the guard, which is the whole defect this test had.
+    _lead(tenant, "we-spoke-last")
+    pipeline.update(tenant, SITE, "we-spoke-last", stage=pipeline.NURTURING,
+                    last_contact_at=old[:10] + "T23:59:59", last_guest_reply_at=old,
+                    next_action_at=None)
+    _age_inquiry(tenant, "we-spoke-last", old)
+
     pipeline.advance_lifecycle(tenant, SITE)
     assert pipeline.get(tenant, SITE, "waiting")["stage"] != pipeline.LOST
+    assert pipeline.get(tenant, SITE, "we-spoke-last")["stage"] == pipeline.LOST
 
 
 def test_a_booking_with_only_a_checkout_date_still_closes(tenant):
