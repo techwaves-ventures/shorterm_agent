@@ -113,6 +113,20 @@ def test_a_date_a_few_days_ahead_still_takes_the_current_year(parse_on):
     assert parse_on("Jul. 22", "2026-07-20") == "2026-07-22"
 
 
+def test_the_nearest_candidate_wins_when_both_are_within_reach(parse_on):
+    """Two candidate years can both fit — the reach window is 367 days wide, so
+    2025-12-30 (183 back) and 2026-12-30 (182 on) are simultaneously in reach
+    from 2027-07-01's predecessor. This is the case that separates "nearest"
+    from "the first one that fits"; get it wrong and the date is a full year
+    out on an ordinary input.
+
+    `test_an_exact_tie_...` below is 183/183 — symmetric, so it is satisfied by
+    either rule. An order-dependent rule needs an ASYMMETRIC case to pin it.
+    Green on the old code: this is mutation coverage, not defect coverage.
+    """
+    assert parse_on("Dec. 30", "2026-07-01") == "2026-12-30"
+
+
 def test_a_stated_year_is_never_second_guessed(parse_on):
     """Only the yearless shape gets a guess; the other two shapes state it."""
     assert parse_on("Jul. 18, 2024", "2026-07-20") == "2024-07-18"
@@ -201,12 +215,19 @@ def test_a_new_year_message_is_not_auto_closed_as_abandoned(freeze, tenant):
     The stale deal alongside it is the positive control: this asserts the close
     did not fire on the new lead, which would also pass if the close had stopped
     firing at all.
+
+    `today` is passed explicitly rather than left to the clock the `freeze`
+    fixture pins. `freeze` owns `pipeline.datetime`, which is the whole clock
+    here but not on every open branch — VEN-223 onward routes `advance_lifecycle`
+    through `scheduler.local_now`, which this fixture does not own, and the
+    positive control would then silently stop closing anything. Saying the
+    reference day out loud is what the test meant either way.
     """
     freeze("2026-12-31")
     pipeline.ensure(tenant, SITE, _message("nye", "Jan. 1"))
     pipeline.ensure(tenant, SITE, _message("cold", "Nov. 1"))
 
-    moved = pipeline.advance_lifecycle(tenant, SITE)
+    moved = pipeline.advance_lifecycle(tenant, SITE, today="2026-12-31")
 
     fresh = pipeline.get(tenant, SITE, "nye")
     assert fresh["inquiry_at"] == "2026-12-31T12:00:00"
