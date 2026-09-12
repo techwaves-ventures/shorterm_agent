@@ -26,18 +26,37 @@ The same `today` also derived the abandonment bound:
     stale_before = fromisoformat(today) - STALE_CLOSE_DAYS
 
 and `_is_abandoned` compares that against `last_guest_reply_at` /
-`last_contact_at` / `inquiry_at`, which `pipeline._now()` writes in **server**
-wall clock. Re-pointing the single `today` at the property fixes the three stage
-arms and breaks the abandonment arm by exactly the same offset — a deal that is
-genuinely three weeks cold stops closing. So `today` had to be **split** into
-two values, not moved, and one function now legitimately holds two frames. Same
-rule as VEN-138, applied in the opposite direction: compare each column in the
-frame it was written in.
+`last_contact_at` / `inquiry_at`. Re-pointing the single `today` at the property
+fixes the three stage arms and breaks the abandonment arm by exactly the same
+offset — a deal that is genuinely three weeks cold stops closing. So `today` had
+to be **split** into two values, not moved, and one function now legitimately
+holds two frames. Same rule as VEN-138, applied in the opposite direction:
+compare each column in the frame it was written in.
 
 `test_property_frame_today_does_not_move_the_abandonment_bound` and
 `test_worker_call_path_keeps_the_abandonment_bound_in_the_server_frame` are the
 two halves of that guard, and they are the tests that go red if a later change
 collapses the two dates back together.
+
+## And two of those three columns, not all three (VEN-225)
+
+VEN-223 stated that all three abandonment columns are `pipeline._now()` server
+stamps, and this docstring repeated it. It is true of only two:
+`last_contact_at` and `last_guest_reply_at` reach the column through `update()`
+-> `norm_ts`, whose contract is server-local. `inquiry_at` does not —
+`pipeline.derive` writes `f"{listing_date}T09:00:00"` whenever the listing's date
+parses, a zoneless **property**-calendar date, and falls back to `_now()` only
+when it does not. `norm_ts` converts only space-separated values (the database's
+UTC default), so a value that is already naive and `T`-separated passes the one
+chokepoint built to enforce the frame.
+
+Two frames in one column, with indistinguishable stored shapes, so no reader can
+attribute a row to either. `advance_lifecycle` therefore carries a **third**
+bound, `inquiry_stale_before = min(server_bound, property_bound)`, and
+`_is_abandoned` compares each stamp against its own column's bound rather than
+`max()`-ing across frames. `test_a_never_contacted_deal_is_not_closed_early_*`
+and `test_the_server_framed_columns_keep_the_exact_bound` are the halves of
+*that* guard.
 
 ## Why nothing here touches `TZ` / `tzset()`
 
@@ -102,6 +121,14 @@ CANDIDATE_ZONES = [
 REF_DAY = date(2026, 3, 10)
 
 AHEAD, BEHIND = 1, -1
+
+# Behind every bound this file constructs, under any zone offset. `_open_deal`
+# pins `inquiry_at` here so the inquiry arm can never be the deciding one.
+INQUIRY_FAR_BEHIND = "2025-01-05T09:00:00"
+
+# Read from the module rather than written as 21, so a change to the product
+# rule moves these tests with it instead of quietly making them vacuous.
+STALE = pipeline.STALE_CLOSE_DAYS
 
 
 # --- clock and zone helpers -------------------------------------------------
@@ -205,9 +232,14 @@ def _booked(tenant_id: str, item_id: str, guest: str,
 def _open_deal(tenant_id: str, item_id: str, guest: str, last_contact: str) -> None:
     """An exhausted open deal whose newest stamp is `last_contact`.
 
-    `inquiry_at` is pushed behind it on purpose: `_is_abandoned` takes the
-    *max* of three columns, so leaving the default inquiry stamp newer would
-    make the abandonment assertions answer about the wrong column.
+    `inquiry_at` is pushed far behind it on purpose, to 2025, so that every
+    abandonment assertion built on this helper answers about `last_contact_at`
+    and nothing else. That matters twice over now: `_is_abandoned` compares each
+    column against its *own* bound (VEN-225), so an `inquiry_at` anywhere near
+    either bound would let the inquiry arm decide the outcome and the test would
+    quietly stop being about the column it names. 2025 is behind both bounds
+    under every zone offset, so the inquiry arm always votes "stale" here and is
+    never the deciding one.
     """
     _deal(tenant_id, item_id, guest)
     pipeline.update(tenant_id, SITE, item_id, stage=pipeline.CONTACTED,
@@ -215,7 +247,49 @@ def _open_deal(tenant_id: str, item_id: str, guest: str, last_contact: str) -> N
     with pipeline._conn() as c:
         c.execute(
             "UPDATE deals SET inquiry_at=? WHERE tenant_id=? AND site=? AND item_id=?",
-            ("2025-01-05T09:00:00", str(tenant_id), SITE, item_id))
+            (INQUIRY_FAR_BEHIND, str(tenant_id), SITE, item_id))
+
+
+def _untouched(tenant_id: str, item_id: str, listing_date: date) -> None:
+    """A `new` deal created purely through the real write path — the exact
+    opposite of `_open_deal`, and the population VEN-225 is about.
+
+    Nothing is SQL-stamped afterwards, which is the whole point:
+    `last_contact_at`, `last_guest_reply_at` and `next_action_at` are NULL
+    because `ensure` never writes them, so `inquiry_at` is the newest — and
+    only — stamp, and it is the one the abandonment decision turns on.
+
+    `_open_deal` deliberately steers around this by pushing `inquiry_at` behind
+    the contact stamp, which is precisely why VEN-223's ten tests could not
+    reach the arm where a property-framed `inquiry_at` decides the outcome, and
+    why this defect survived that PR. A fixture that avoids a column cannot
+    fail on it.
+    """
+    item = {"id": item_id, "kind": "lead", "traveler": item_id,
+            "title": f"Unit 1 | Washington, District of Columbia | {item_id}",
+            "received_at": listing_date.strftime("%B %d, %Y")}
+    storage.filter_new(tenant_id, SITE, "lead", [item])
+    pipeline.ensure(tenant_id, SITE, item, None)
+
+
+def _inquiry_only(tenant_id: str, item_id: str, inquiry_at: str) -> None:
+    """An open deal whose only stamp is `inquiry_at`, set to the exact second.
+
+    The write path can only ever store 09:00 (`derive` synthesises
+    `f"{date}T09:00:00"`), so a boundary asserted to the second has to be
+    stamped directly. That is sound here and only here: the shape the write path
+    really produces is asserted separately, from the write path, by
+    `test_inquiry_at_holds_two_frames_in_indistinguishable_shapes`.
+    """
+    _deal(tenant_id, item_id, item_id)
+    with pipeline._conn() as c:
+        c.execute(
+            "UPDATE deals SET inquiry_at=? WHERE tenant_id=? AND site=? AND item_id=?",
+            (inquiry_at, str(tenant_id), SITE, item_id))
+
+
+def _inquiry_at(tenant_id: str, item_id: str) -> str:
+    return pipeline.get(tenant_id, SITE, item_id)["inquiry_at"]
 
 
 def _stage(tenant_id: str, item_id: str) -> str:
@@ -453,6 +527,338 @@ def test_abandonment_bound_is_anchored_to_midnight_not_to_the_hour(
     assert _stage(tenant, "cold") == pipeline.LOST, moved
     assert _stage(tenant, "warm") == pipeline.CONTACTED, moved
     assert moved["lost"] == 1, moved
+
+
+# --- VEN-225: the third column is not in the server frame at all ------------
+#
+# Everything above this line is about two frames. `inquiry_at` makes it three
+# values in two frames inside one column, which is a different shape of problem:
+# not "which frame is this comparison in" but "which frame is this *row* in",
+# and that second question has no answer. The tests below pin what is left once
+# it is admitted to be unanswerable.
+
+
+def test_inquiry_at_holds_two_frames_in_indistinguishable_shapes(
+        tenant, monkeypatch):
+    """VEN-225 AC1 — the premise, asserted from the real write path.
+
+    Green on `main` and on VEN-223: it documents what the column already
+    contains rather than anything this change introduces. It is here because the
+    entire design rests on the *second* assertion — that the two stored shapes
+    are identical — and a design resting on an unasserted fact is resting on a
+    comment.
+
+    `derive` writes `f"{listing_date}T09:00:00"` when the listing's date parses,
+    a zoneless **property**-calendar date, and `_now()` when it does not, a
+    server instant. Both arrive naive, `T`-separated and to the second, so
+    `norm_ts` — which converts only space-separated values, the database's UTC
+    default — passes both through untouched, and no reader downstream can tell
+    which arm wrote a given row.
+    """
+    zone, server_now, prop_date = _zone_where_property_is(BEHIND)
+    assert prop_date != server_now.date(), ("vacuity guard", zone)
+    config.save_settings(tenant, timezone=zone)
+    _freeze(monkeypatch, server_now, pipeline, scheduler)
+
+    listing = prop_date - timedelta(days=STALE)
+    _untouched(tenant, "parsed", listing)
+    # The fallback arm: a `received_at` nothing can parse.
+    unparseable = {"id": "fallback", "kind": "lead", "traveler": "u",
+                   "title": "Unit 1 | Washington, District of Columbia | u",
+                   "received_at": "not a date"}
+    storage.filter_new(tenant, SITE, "lead", [unparseable])
+    pipeline.ensure(tenant, SITE, unparseable, None)
+
+    parsed, fallback = _inquiry_at(tenant, "parsed"), _inquiry_at(tenant, "fallback")
+    # The listing's calendar date at 09:00 — the property's frame, not ours.
+    assert parsed == f"{listing.isoformat()}T09:00:00", (zone, parsed)
+    assert fallback == server_now.isoformat(timespec="seconds"), fallback
+    assert parsed[:10] != fallback[:10], (
+        "vacuity guard: the two write paths must land on different days here, "
+        "or 'indistinguishable' is being asserted of one value")
+
+    # The fact the whole design turns on: nothing about the stored value says
+    # which frame it is in, so no per-row bound can be chosen.
+    for value in (parsed, fallback):
+        assert len(value) == 19 and value[10] == "T", value
+        assert datetime.fromisoformat(value).microsecond == 0, value
+
+    # And such a deal really is one where `inquiry_at` decides: it is open, and
+    # the other two abandonment columns are NULL because `ensure` never wrote
+    # them. This is what `_open_deal` steers around.
+    row = pipeline.get(tenant, SITE, "parsed")
+    assert row["stage"] in pipeline.OPEN_STAGES, row["stage"]
+    assert row["last_contact_at"] is None, row
+    assert row["last_guest_reply_at"] is None, row
+    assert row["next_action_at"] is None, row
+
+
+def test_a_never_contacted_deal_is_not_closed_early_in_the_property_frame(
+        tenant, monkeypatch):
+    """VEN-225 AC2 — the filed defect. **Red on VEN-223, on behaviour.**
+
+    The property is a day behind the server, so the server-frame bound sits a
+    day *later* than the property-frame one. A deal whose only stamp is a listing
+    date `STALE_CLOSE_DAYS` property-days old is therefore past the server bound
+    while not yet past its own, and the pre-fix code closed it — and `mark_lost`
+    also clears `next_action_at`/`next_action_step`, so the sequence that might
+    still have won the deal is cancelled with it. That is the harmful direction:
+    the owner is shown a loss they did not take.
+
+    `cold` is the positive control and `warm` the negative one, on the same deal
+    set, because "edge survived" is equally true of an abandonment arm that has
+    stopped firing at all.
+    """
+    zone, server_now, prop_date = _zone_where_property_is(BEHIND)
+    assert prop_date == server_now.date() - timedelta(days=1), (zone, prop_date)
+    config.save_settings(tenant, timezone=zone)
+
+    # Ages measured in the PROPERTY's calendar — the frame the column is in.
+    _untouched(tenant, "edge", prop_date - timedelta(days=STALE))
+    _untouched(tenant, "cold", prop_date - timedelta(days=STALE + 1))
+    _untouched(tenant, "warm", prop_date - timedelta(days=5))
+
+    _freeze(monkeypatch, server_now, pipeline, scheduler)
+    moved = pipeline.advance_lifecycle(tenant, SITE)
+
+    ctx = (zone, server_now.date(), prop_date, moved)
+    assert _stage(tenant, "cold") == pipeline.LOST, ("positive control", ctx)
+    assert _stage(tenant, "warm") == pipeline.NEW, ("negative control", ctx)
+    assert _stage(tenant, "edge") == pipeline.NEW, ctx
+    assert moved["lost"] == 1, ctx
+
+
+def test_the_server_framed_columns_keep_the_exact_bound(tenant, monkeypatch):
+    """VEN-225 AC3 — the conservative bound is for `inquiry_at` **only**.
+
+    Green on VEN-223, and the test that forbids the tempting simplification of
+    handing the earlier bound to all three columns: `last_contact_at` and
+    `last_guest_reply_at` genuinely are server stamps (`update()` -> `norm_ts`),
+    so widening their bound would delay every genuinely-cold deal the rule
+    exists to close, in exchange for nothing.
+
+    The property must be a day *behind* here. Ahead, the earlier of the two
+    bounds simply *is* the server bound, the two are the same value, and a
+    collapse of the columns onto one bound is invisible — which is why the two
+    VEN-223 guards above, both `AHEAD`, cannot catch it.
+    """
+    zone, server_now, prop_date = _zone_where_property_is(BEHIND)
+    assert prop_date == server_now.date() - timedelta(days=1), (zone, prop_date)
+    config.save_settings(tenant, timezone=zone)
+
+    # `cold` 12h before the SERVER bound, `warm` 12h after it — so a bound
+    # widened to the property frame (a further 24h back) flips `cold` and only
+    # `cold`, and flipping it is the failure this asserts against.
+    _abandonment_pair(tenant, server_now)
+
+    # Vacuity guard on the fixture, not on the code. If `_open_deal` ever stops
+    # pinning `inquiry_at` behind both bounds, the inquiry arm starts deciding
+    # these deals and this test silently becomes a second copy of AC2.
+    server_bound = (datetime.combine(server_now.date(), time(0, 0))
+                    - timedelta(days=STALE))
+    for item_id in ("cold", "warm"):
+        assert _inquiry_at(tenant, item_id) < (
+            server_bound - timedelta(days=2)).isoformat(timespec="seconds"), (
+            "this test must answer about last_contact_at, not inquiry_at")
+
+    _freeze(monkeypatch, server_now, pipeline, scheduler)
+    moved = pipeline.advance_lifecycle(tenant, SITE)
+
+    ctx = (zone, server_now.date(), prop_date, moved)
+    assert _stage(tenant, "cold") == pipeline.LOST, ctx
+    assert _stage(tenant, "warm") == pipeline.CONTACTED, ("positive control", ctx)
+    assert moved["lost"] == 1, ctx
+
+
+def test_each_bound_is_exact_to_the_second_for_its_own_column(tenant):
+    """VEN-225 AC4 — both bounds, both sides, driven by explicit dates.
+
+    No zone and no frozen clock: the two dates are passed in a day apart, which
+    is all "the bounds differ" means, so this says something about the two
+    comparisons themselves rather than about any offset. A stamp one second
+    before its own bound closes; a stamp exactly on it does not — `<` not `<=`,
+    preserved from the `max()` spelling this replaced.
+
+    The pairing is the point. Each column is asserted against the bound that is
+    *not* the other's, so swapping the two bounds over fails here even though
+    every deal keeps a plausible-looking outcome.
+    """
+    today, server_today = "2026-03-09", "2026-03-10"       # property a day behind
+    inquiry_bound = (datetime.fromisoformat(today) - timedelta(days=STALE)
+                     ).isoformat(timespec="seconds")
+    server_bound = (datetime.fromisoformat(server_today) - timedelta(days=STALE)
+                    ).isoformat(timespec="seconds")
+    assert inquiry_bound < server_bound, (inquiry_bound, server_bound)
+
+    one_second = timedelta(seconds=1)
+    _inquiry_only(tenant, "inq-on-bound", inquiry_bound)
+    _inquiry_only(tenant, "inq-a-second-past",
+                  (datetime.fromisoformat(inquiry_bound) - one_second
+                   ).isoformat(timespec="seconds"))
+    _open_deal(tenant, "con-on-bound", "A", server_bound)
+    _open_deal(tenant, "con-a-second-past", "B",
+               (datetime.fromisoformat(server_bound) - one_second
+                ).isoformat(timespec="seconds"))
+
+    moved = pipeline.advance_lifecycle(tenant, SITE, today=today,
+                                       server_today=server_today)
+    stages = _stages(tenant)
+
+    assert stages["inq-on-bound"] == pipeline.NEW, stages
+    assert stages["inq-a-second-past"] == pipeline.LOST, stages
+    assert stages["con-on-bound"] == pipeline.CONTACTED, stages
+    assert stages["con-a-second-past"] == pipeline.LOST, stages
+    assert moved["lost"] == 2, (moved, stages)
+
+
+def test_a_deal_with_no_stamp_at_all_is_never_abandoned(tenant):
+    """VEN-225 AC5 — `_is_abandoned` at the unit level, including its default.
+
+    Preserved behaviour rather than new: the old spelling's `bool(last)` guard
+    said the same thing, and the restatement has to keep saying it. The write
+    path cannot produce a row with all three columns NULL, but a legacy row can,
+    and "we know nothing about this deal" must never read as "this deal is
+    dead" — that close is irreversible without a human.
+
+    The third argument's **default** is asserted here too, because the
+    two-argument call is public API as far as any other caller is concerned: it
+    must fall back to the server bound rather than to no bound at all.
+    """
+    bound = "2026-02-17T00:00:00"
+    old, new = "2026-01-01T00:00:00", "2026-03-01T00:00:00"
+
+    assert pipeline._is_abandoned({}, bound, bound) is False
+    assert pipeline._is_abandoned({"inquiry_at": None, "last_contact_at": None,
+                                   "last_guest_reply_at": None}, bound, bound) is False
+    # Positive controls on the same shape, or the assertions above would also
+    # hold of a function that had stopped returning True at all.
+    assert pipeline._is_abandoned({"inquiry_at": old}, bound, bound) is True
+    assert pipeline._is_abandoned({"last_contact_at": old}, bound, bound) is True
+    assert pipeline._is_abandoned({"inquiry_at": new}, bound, bound) is False
+
+    # The default: with no inquiry bound supplied, `inquiry_at` is held to the
+    # server bound, which is exactly what every pre-VEN-225 caller expected.
+    assert pipeline._is_abandoned({"inquiry_at": old}, bound) is True
+    assert pipeline._is_abandoned({"inquiry_at": new}, bound) is False
+
+
+def test_equal_bounds_make_the_per_column_rule_the_old_max_rule(tenant):
+    """VEN-225 AC6 — the no-property-zone case is a *literal* no-op.
+
+    `advance_lifecycle` derives both bounds from dates that are equal whenever
+    no property timezone is set, and the docstring claims that "every stamp is
+    older than its own bound" is then the same sentence as "the newest stamp is
+    older than the bound". That is an equivalence claim over a function's whole
+    input space, so it is asserted as one, against the pre-VEN-225 spelling
+    written out below — and enumerated rather than sampled, because the case
+    that breaks such a restatement is never the obvious one.
+
+    The shipped `_is_abandoned` is imported; only the reference copy is local.
+    The reverse — comparing two local copies — would assert nothing about what
+    actually runs.
+    """
+    bound = "2026-02-17T00:00:00"
+
+    def old_max_spelling(deal):
+        last = max(pipeline.cmp_ts(deal.get("last_guest_reply_at")),
+                   pipeline.cmp_ts(deal.get("last_contact_at")),
+                   pipeline.cmp_ts(deal.get("inquiry_at")))
+        return bool(last) and last < pipeline.cmp_ts(bound)
+
+    # Either side of the bound, exactly on it, and NULL, for all three columns.
+    values = (None, "2026-01-01T00:00:00", "2026-02-16T23:59:59", bound,
+              "2026-02-17T00:00:01", "2026-03-01T00:00:00")
+    checked = 0
+    for reply in values:
+        for contact in values:
+            for inquiry in values:
+                deal = {"last_guest_reply_at": reply, "last_contact_at": contact,
+                        "inquiry_at": inquiry}
+                # `_guest_is_waiting` short-circuits both spellings identically,
+                # and comparing them there would assert nothing about this change.
+                if pipeline._guest_is_waiting(deal):
+                    continue
+                assert pipeline._is_abandoned(deal, bound, bound) is \
+                    old_max_spelling(deal), deal
+                checked += 1
+    assert checked > 100, ("the grid collapsed to almost nothing", checked)
+    # And the grid really does contain both answers, so agreement is not
+    # agreement on a constant.
+    assert old_max_spelling({"inquiry_at": "2026-01-01T00:00:00"})
+    assert not old_max_spelling({"inquiry_at": "2026-03-01T00:00:00"})
+
+
+def test_untouched_deals_are_unchanged_when_no_property_zone_is_set(
+        tenant, monkeypatch):
+    """VEN-225 AC6, behavioural half — the same claim through the write path.
+
+    The equivalence above is about `_is_abandoned` in isolation; this is about
+    the two bounds `advance_lifecycle` derives, on the population VEN-223's
+    no-zone test never had (it seeds `_open_deal`s, whose `inquiry_at` is pinned
+    out of the way). Two identically seeded tenants, one on the default code
+    path and one on the explicit dates the pre-VEN-225 code computed.
+    """
+    other = "2"
+    config.save_settings(other, host_name="Other Host", timezone="")
+    assert config.get_settings(tenant).get("timezone") in ("", None)
+
+    server_now = datetime.combine(REF_DAY, time(23, 30))
+    server_date = server_now.date()
+    for tid in (tenant, other):
+        _untouched(tid, "edge", server_date - timedelta(days=STALE))
+        _untouched(tid, "cold", server_date - timedelta(days=STALE + 1))
+        _untouched(tid, "warm", server_date - timedelta(days=5))
+
+    _freeze(monkeypatch, server_now, pipeline, scheduler)
+    # With no property zone `local_now` falls back to the server frame, so the
+    # two dates the fix derives are the one date the old code used.
+    assert scheduler.local_now(tenant).date() == server_date
+
+    new_default = pipeline.advance_lifecycle(tenant, SITE)
+    old_behaviour = pipeline.advance_lifecycle(
+        other, SITE, today=server_date.isoformat(),
+        server_today=server_date.isoformat())
+
+    assert new_default == old_behaviour, (new_default, old_behaviour)
+    assert _stages(tenant) == _stages(other), (_stages(tenant), _stages(other))
+    # Non-vacuous: the run closed the cold deal and left the other two.
+    assert new_default["lost"] == 1, new_default
+    assert _stages(tenant) == {"edge": pipeline.NEW, "cold": pipeline.LOST,
+                               "warm": pipeline.NEW}, _stages(tenant)
+
+
+def test_a_deal_in_the_ahead_direction_closes_a_day_late_on_purpose(
+        tenant, monkeypatch):
+    """VEN-225 AC7 — the accepted cost, asserted so it is not a surprise.
+
+    Green before and after. When the property is a day *ahead* of the server the
+    earlier of the two bounds is the server's, so a deal
+    `STALE_CLOSE_DAYS + 1` property-days cold is not closed until the next day's
+    pass. That is deliberate, and it is the price of the fix: a row's frame is
+    unknowable, so a bound can be exact or it can never be early, not both.
+
+    Erring late is the cheap direction, and `STALE_CLOSE_DAYS` already says why
+    — "dropping out of the queue is a display decision and recoverable, closing
+    the deal is a lifecycle decision and shows as a loss". A day of delay on a
+    21-day window is invisible; the next worker pass closes it. Whoever reads
+    this test wanting it to be exact should read that comment first.
+    """
+    zone, server_now, prop_date = _zone_where_property_is(AHEAD)
+    assert prop_date == server_now.date() + timedelta(days=1), (zone, prop_date)
+    config.save_settings(tenant, timezone=zone)
+
+    _untouched(tenant, "cold", prop_date - timedelta(days=STALE + 1))
+    _untouched(tenant, "colder", prop_date - timedelta(days=STALE + 2))
+    _untouched(tenant, "warm", prop_date - timedelta(days=5))
+
+    _freeze(monkeypatch, server_now, pipeline, scheduler)
+    moved = pipeline.advance_lifecycle(tenant, SITE)
+
+    ctx = (zone, server_now.date(), prop_date, moved)
+    assert _stage(tenant, "colder") == pipeline.LOST, ("positive control", ctx)
+    assert _stage(tenant, "warm") == pipeline.NEW, ("negative control", ctx)
+    assert _stage(tenant, "cold") == pipeline.NEW, ("one day late, on purpose", ctx)
+    assert moved["lost"] == 1, ctx
 
 
 # --- the no-op case ---------------------------------------------------------

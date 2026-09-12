@@ -862,9 +862,11 @@ def advance_lifecycle(tenant_id: str, site: str, today: str | None = None,
     horizon = (datetime.fromisoformat(today).date()
                + timedelta(days=PRE_ARRIVAL_DAYS)).isoformat()
     # The OTHER frame, on purpose. `stale_before` is compared against
-    # `last_contact_at` / `last_guest_reply_at` / `inquiry_at`, which `_now()`
-    # writes in server wall clock. Deriving it from `today` above would shift
-    # the abandonment bound by the zone offset and auto-close deals on the
+    # `last_contact_at` and `last_guest_reply_at`, which reach the column only
+    # through `update()` -> `norm_ts`, i.e. server wall clock. (VEN-223 said all
+    # *three* abandonment columns were server stamps; `inquiry_at` is not —
+    # hence the third bound below.) Deriving this one from `today` above would
+    # shift the abandonment bound by the zone offset and auto-close deals on the
     # wrong day — the same correction as VEN-138, in the opposite direction.
     # One rule applied twice: compare each column in the frame it was written
     # in. Kept anchored to midnight (`fromisoformat(...) - 21d`) rather than
@@ -873,6 +875,23 @@ def advance_lifecycle(tenant_id: str, site: str, today: str | None = None,
     server_today = server_today or datetime.now().date().isoformat()
     stale_before = (datetime.fromisoformat(server_today) - timedelta(days=STALE_CLOSE_DAYS)
                     ).isoformat(timespec="seconds")
+    # VEN-225: and the third column needs a third bound. `inquiry_at` holds
+    # values from two write paths — a parsed listing date at 09:00 (the
+    # PROPERTY's calendar, which slips past `norm_ts` untouched because it is
+    # already naive and T-separated) or `_now()` when nothing parsed — and the
+    # stored shapes are indistinguishable, so no reader can tell which frame a
+    # given row is in. An exact bound is therefore unattainable for this column;
+    # the strongest checkable property left is "never early in either frame", so
+    # take the EARLIER of the two bounds and require a deal to be stale in both.
+    # The accepted cost is up to one day late, which `STALE_CLOSE_DAYS` above
+    # already argues is the cheap direction — a deal closed early shows the
+    # owner a loss they did not take. Not a padding constant: `min` of two real
+    # bounds, equal (so a literal no-op) whenever no property zone is set.
+    # Do NOT "improve" this by sniffing the frame off the stored 09:00.
+    inquiry_stale_before = min(
+        stale_before,
+        (datetime.fromisoformat(today) - timedelta(days=STALE_CLOSE_DAYS)
+         ).isoformat(timespec="seconds"))
     moved = {"pre_arrival": 0, "staying": 0, "completed": 0, "lost": 0}
 
     for deal in all_deals(tenant_id, site):
@@ -896,29 +915,46 @@ def advance_lifecycle(tenant_id: str, site: str, today: str | None = None,
             update(tenant_id, site, item_id, stage=PRE_ARRIVAL)
             moved["pre_arrival"] += 1
         elif stage in OPEN_STAGES:
-            if _is_abandoned(deal, stale_before):
+            if _is_abandoned(deal, stale_before, inquiry_stale_before):
                 mark_lost(tenant_id, site, item_id,
                           reason=f"No reply for {STALE_CLOSE_DAYS} days")
                 moved["lost"] += 1
     return moved
 
 
-def _is_abandoned(deal: dict, stale_before: str) -> bool:
+def _is_abandoned(deal: dict, stale_before: str,
+                  inquiry_stale_before: str | None = None) -> bool:
     """Whether an open deal has gone cold with nothing left to try.
 
     Requires the sequence to be *exhausted* (`next_action_at` cleared), not just
     quiet — closing a deal that still has a follow-up queued would cancel the
     very message that might have won it. And a deal where the guest is the last
     one to have spoken is never abandoned; that one is waiting on us.
+
+    Each stamp is compared against the bound for *its own* column rather than a
+    single `max()` against one bound: `last_contact_at` and
+    `last_guest_reply_at` reach the database through `norm_ts`, whose contract
+    is server-local, but `inquiry_at` can be a property-calendar date (VEN-225),
+    and a `max()` across two frames is not a time. "The newest is older than the
+    bound" and "every stamp is older than its bound" are the same sentence when
+    the bounds are equal, so this is a no-op for a tenant with no property zone.
     """
     if deal.get("next_action_at"):
         return False
     if _guest_is_waiting(deal):
         return False
-    last = max(cmp_ts(deal.get("last_guest_reply_at")),
-               cmp_ts(deal.get("last_contact_at")),
-               cmp_ts(deal.get("inquiry_at")))
-    return bool(last) and last < cmp_ts(stale_before)
+    bounds = ((deal.get("last_guest_reply_at"), stale_before),
+              (deal.get("last_contact_at"), stale_before),
+              (deal.get("inquiry_at"), inquiry_stale_before or stale_before))
+    seen = False
+    for value, bound in bounds:
+        stamp = cmp_ts(value)
+        if not stamp:
+            continue
+        seen = True
+        if stamp >= cmp_ts(bound):
+            return False
+    return seen
 
 
 # --- The one state the operator actually thinks in --------------------------
