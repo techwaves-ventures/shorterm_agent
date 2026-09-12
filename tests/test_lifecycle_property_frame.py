@@ -316,29 +316,49 @@ def test_checkin_and_checkout_boundaries_are_exact(tenant):
 
 
 def test_pre_arrival_horizon_moves_with_today(tenant, monkeypatch):
-    """AC3 — `horizon` is derived from the same `today`, inclusive at
+    """AC3 — `horizon` is derived from the **property's** `today`, inclusive at
     exactly `PRE_ARRIVAL_DAYS`.
 
-    Asserted from **two** different `today` values, which is what distinguishes
-    a horizon derived from `today` from one re-read off the clock: a second
-    `datetime.now()` cannot agree with both. The clock is frozen to an instant
-    unrelated to either date so that mutant fails deterministically rather than
-    depending on the day the suite runs.
+    Two axes are varied, because each pins something the other cannot:
+
+      * **two different `today` values**, which distinguishes a horizon derived
+        from `today` from one re-read off the clock — a second `datetime.now()`
+        cannot agree with both;
+      * a `server_today` on a **different day** from `today`, and on the
+        opposite side of it each time round. This is the axis the whole ticket
+        is about and the one this test originally missed: it passed
+        `server_today=today`, and two equal dates make the two frames
+        indistinguishable, so nothing could say which of them `horizon` was
+        anchored to. A horizon anchored to `server_today` survived the entire
+        suite (review R1) — a guest arriving in exactly `PRE_ARRIVAL_DAYS`
+        property-days is then never armed, the third harm the ticket names.
+
+    Offsetting the server in both directions catches that at both boundaries: a
+    server day *behind* drops `edge` out of a misanchored horizon, a server day
+    *ahead* pulls `past` into it. `server_today` reaches nothing else here —
+    these deals are booked, so the abandonment arm it feeds never runs.
+
+    The clock is frozen to an instant unrelated to any of those dates so the
+    re-read-the-clock mutant fails deterministically rather than depending on
+    the day the suite runs.
     """
     _freeze(monkeypatch, datetime.combine(date(2026, 6, 1), time(12, 0)),
             pipeline, scheduler)
 
-    for today in ("2026-03-10", "2026-04-19"):
+    for today, server_days_off in (("2026-03-10", -1), ("2026-04-19", +1)):
         base = date.fromisoformat(today)
+        server_today = (base + timedelta(days=server_days_off)).isoformat()
         edge = (base + timedelta(days=pipeline.PRE_ARRIVAL_DAYS)).isoformat()
         past = (base + timedelta(days=pipeline.PRE_ARRIVAL_DAYS + 1)).isoformat()
         _booked(tenant, f"edge-{today}", "A", check_in=edge)
         _booked(tenant, f"past-{today}", "B", check_in=past)
 
-        pipeline.advance_lifecycle(tenant, SITE, today=today, server_today=today)
+        pipeline.advance_lifecycle(tenant, SITE, today=today,
+                                   server_today=server_today)
 
-        assert _stage(tenant, f"edge-{today}") == pipeline.PRE_ARRIVAL, today
-        assert _stage(tenant, f"past-{today}") == pipeline.BOOKED, today
+        ctx = (today, server_today)
+        assert _stage(tenant, f"edge-{today}") == pipeline.PRE_ARRIVAL, ctx
+        assert _stage(tenant, f"past-{today}") == pipeline.BOOKED, ctx
 
 
 # --- the trap: the abandonment bound must stay in the server frame ----------
@@ -398,6 +418,40 @@ def test_worker_call_path_keeps_the_abandonment_bound_in_the_server_frame(
 
     assert _stage(tenant, "cold") == pipeline.LOST, (zone, moved)
     assert _stage(tenant, "warm") == pipeline.CONTACTED, (zone, moved)
+    assert moved["lost"] == 1, moved
+
+
+def test_abandonment_bound_is_anchored_to_midnight_not_to_the_hour(
+        tenant, monkeypatch):
+    """The comment above `stale_before` claims midnight anchoring; this holds it.
+
+    `pipeline.py` says the bound is kept as `fromisoformat(server_today) - 21d`
+    rather than re-spelled `datetime.now() - 21d`, "which would move the bound by
+    up to a further 24h". Nothing asserted that: every other frozen instant in
+    this file lands on midnight, where the two spellings agree, so the re-spelling
+    survived the whole suite (review R5). Here the server is pinned at 13:45, so
+    the misanchored bound sweeps 13h45m further back and takes `warm` with it.
+
+    Deliberately zone-free — the fixture tenant sets no timezone, so both dates
+    fall back to the server frame and this says something about the *anchor*
+    alone, not about any offset. It is green on `main` too, on purpose: midnight
+    anchoring is behaviour this PR preserves rather than introduces, and a guard
+    over preserved behaviour is supposed to be quiet until someone breaks it.
+    """
+    server_now = datetime.combine(REF_DAY, time(13, 45))
+    assert server_now.time() != time(0, 0), "vacuity guard: midnight hides R5"
+
+    # Straddles the *midnight-anchored* bound by 12h either side, so a bound
+    # dragged forward by the 13h45m time-of-day flips `warm` and only `warm`.
+    _abandonment_pair(tenant, server_now)
+
+    _freeze(monkeypatch, server_now, pipeline, scheduler)
+    moved = pipeline.advance_lifecycle(tenant, SITE)
+
+    # `cold` is the positive control: it is past the bound under either
+    # spelling, so "warm survived" cannot be an abandonment arm that never fired.
+    assert _stage(tenant, "cold") == pipeline.LOST, moved
+    assert _stage(tenant, "warm") == pipeline.CONTACTED, moved
     assert moved["lost"] == 1, moved
 
 
