@@ -479,6 +479,156 @@ def test_ac7c_unparseable_item_never_rederives(tenant, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# AC7d — the fourth row class: a listing date AHEAD of the property's calendar
+#
+# AC7a-c describe the three write paths. They do not reach the case where
+# `_inquiry_stamp`'s clamp fires on a *future* listing date: the stored stamp
+# then lands on the property's today rather than on the listing date, so a
+# predicate that compares the stored stamp's property date against raw `truth`
+# is unequal forever and re-derives on every dashboard load. `received_at`
+# bypasses `inquiry_date`'s future gate entirely, so this class is reachable
+# with any date ahead of the property; `received` reaches it whenever the
+# property's calendar is a day behind the server's.
+# ---------------------------------------------------------------------------
+
+def _count_backfill_writes(tenant_id, items, passes=3) -> list:
+    """Item ids re-derived by `passes` steady-state backfill passes.
+
+    Patches and restores by hand rather than through `monkeypatch`: this is
+    called more than once per test, and `monkeypatch.undo()` would also revert
+    the fixture's `db.DB_PATH` and the frozen clock.
+    """
+    writes = []
+    real_ensure = pipeline.ensure
+    pipeline.ensure = (
+        lambda *a, **k: (writes.append(a[2].get("id")), real_ensure(*a, **k))[1])
+    try:
+        for _ in range(passes):
+            pipeline.backfill(tenant_id, SITE, items, {})
+    finally:
+        pipeline.ensure = real_ensure
+    return writes
+
+
+@pytest.mark.parametrize("field", ["received_at", "received"])
+def test_ac7d_listing_ahead_of_property_converges(tenant, monkeypatch, field):
+    """A listing date one day ahead of the property's calendar does not churn."""
+    zone, server_now, prop_date = _zone_where_property_is(BEHIND)
+    config.save_settings(tenant, timezone=zone)
+    _freeze(monkeypatch, server_now, pipeline, scheduler)
+
+    listing = prop_date + timedelta(days=1)
+    item_id = f"q226_ac7d_{field}"
+    item = _lead(item_id, listing, field)
+    _open(tenant, item)
+    stored = _inquiry_at(tenant, item_id)
+
+    # Vacuity 1: the date must actually survive the gate, or nothing is tested.
+    gate = pipeline._inquiry_gate_today(tenant, server_now)
+    assert pipeline.inquiry_date(item, today=gate) == listing.isoformat(), \
+        f"vacuity: {field} listing {listing} must survive the gate {gate}"
+    # Vacuity 2: the clamp must have fired — that is the whole point of the
+    # class. If the stamp still lands on the listing date, the old predicate
+    # would have converged too and this test proves nothing.
+    assert pipeline._property_date(stored, tenant) != listing.isoformat(), \
+        (f"vacuity: clamp must move the stamp off the listing date; "
+         f"stored={stored} property_date={pipeline._property_date(stored, tenant)}")
+
+    assert _count_backfill_writes(tenant, {item_id: item}) == [], \
+        "a clamped future listing date must converge, not re-derive every load"
+
+    # Positive control, same deal: a genuinely wrong stamp still heals.
+    with pipeline._conn() as c:
+        c.execute(
+            "UPDATE deals SET inquiry_at=? WHERE tenant_id=? AND site=? AND item_id=?",
+            ((server_now - timedelta(days=40)).isoformat(timespec="seconds"),
+             tenant, SITE, item_id))
+    assert _count_backfill_writes(tenant, {item_id: item}) == [item_id], \
+        "control: a stamp on the wrong property day must still be healed once"
+
+
+@pytest.mark.parametrize("zone", ["Pacific/Honolulu", "Pacific/Midway",
+                                  "Pacific/Kiritimati", "America/New_York"])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_ac7d_grid_no_zone_hour_cell_churns(tenant, monkeypatch, zone, offset):
+    """Grid: no (zone, server hour, listing offset) cell re-derives in steady state.
+
+    The regression this pins is narrow — the review found 6 churning cells at
+    Honolulu/Midway around server 09:30-10:30 — so the grid sweeps the hours
+    rather than picking one, and counts every failing cell instead of stopping
+    at the first. `checked` is the positive control: a grid where every cell
+    was vacuous (gate rejected the date) would otherwise pass silently.
+    """
+    config.save_settings(tenant, timezone=zone)
+    churn, checked = [], 0
+    for hour in (0, 9, 10, 13, 21):
+        for field in ("received_at", "received"):
+            server_now = datetime.combine(REF_DAY, time(hour, 30))
+            _freeze(monkeypatch, server_now, pipeline, scheduler)
+            prop_date = scheduler.local_now(tenant, server_now).date()
+            listing = prop_date + timedelta(days=offset)
+            item_id = f"q226_g_{zone[-4:]}_{hour}_{field}_{offset}"
+            item = _lead(item_id, listing, field)
+            gate = pipeline._inquiry_gate_today(tenant, server_now)
+            if pipeline.inquiry_date(item, today=gate) is None:
+                continue  # gate rejected it: no truth, nothing to converge on
+            checked += 1
+            _open(tenant, item)
+            writes = _count_backfill_writes(tenant, {item_id: item})
+            if writes:
+                churn.append((zone, hour, field, listing.isoformat(), len(writes)))
+            _freeze(monkeypatch, server_now, pipeline, scheduler)
+
+    assert checked >= 4, \
+        f"vacuity: grid for {zone} offset +{offset} only exercised {checked} cells"
+    assert churn == [], f"cells re-deriving in steady state: {churn}"
+
+
+# ---------------------------------------------------------------------------
+# AC9 — backfill's settings lookups are fixed per pass, not per deal
+#
+# `dashboard._board`'s contract is "assembled in a fixed number of queries", and
+# `scheduler.tz_for` reaches `config.get_settings`, which has no cache and opens
+# its own connection. Resolving the zone inside the per-item helper made a
+# steady-state pass linear in the deal count (measured: 300 deals -> 600 calls).
+# ---------------------------------------------------------------------------
+
+def _settings_calls_for(tenant_id, n_deals, server_now) -> int:
+    items = {}
+    for i in range(n_deals):
+        item_id = f"q226_ac9_{n_deals}_{i}"
+        item = _lead(item_id, server_now.date() - timedelta(days=5), "received_at")
+        _open(tenant_id, item)
+        items[item_id] = item
+
+    calls = []
+    real = config.get_settings
+    # Hand-rolled patch/restore, not `monkeypatch`: see `_count_backfill_writes`.
+    config.get_settings = lambda *a, **k: (calls.append(a[:1]), real(*a, **k))[1]
+    try:
+        created = pipeline.backfill(tenant_id, SITE, items, {})
+    finally:
+        config.get_settings = real
+    assert created == 0, f"steady state expected; backfill created {created} deals"
+    return len(calls)
+
+
+def test_ac9_backfill_settings_lookups_do_not_scale_with_deal_count(tenant, monkeypatch):
+    """A steady-state backfill pass costs the same settings lookups at 1 deal and at 20."""
+    zone, server_now, _ = _zone_where_property_is(AHEAD)
+    config.save_settings(tenant, timezone=zone)
+    _freeze(monkeypatch, server_now, pipeline, scheduler)
+
+    one = _settings_calls_for(tenant, 1, server_now)
+    twenty = _settings_calls_for(tenant, 20, server_now)
+
+    assert one == twenty, (
+        f"backfill's settings lookups must not scale with the deal count: "
+        f"1 deal -> {one} calls, 20 deals -> {twenty} calls "
+        f"(+{(twenty - one) / 19:.1f} per extra deal)")
+
+
+# ---------------------------------------------------------------------------
 # AC8 — AST: every in-repo call to pipeline.derive passes tenant_id
 # ---------------------------------------------------------------------------
 

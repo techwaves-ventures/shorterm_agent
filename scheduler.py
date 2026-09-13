@@ -42,13 +42,25 @@ def tz_for(tenant_id: str):
         return None
 
 
-def local_now(tenant_id: str, now: datetime | None = None) -> datetime:
+# `tz_for` is an uncached SELECT on its own connection, so a caller looping over
+# many rows of one tenant resolves the zone once and passes it in. `None` is a
+# real, meaningful value here ("no property zone; stay in the server frame"), so
+# "not supplied" needs a sentinel of its own rather than a None default.
+TZ_UNRESOLVED = object()
+
+
+def local_now(tenant_id: str, now: datetime | None = None,
+              tz=TZ_UNRESOLVED) -> datetime:
     """`now` expressed in the tenant's property-local time, as a naive datetime.
 
     Naive on purpose: the stored `last_*_at` stamps are naive local strings, so
     keeping the comparison in one frame avoids mixing aware and naive values.
+
+    Pass `tz` when the zone is already resolved (see `TZ_UNRESOLVED`); the
+    conversion itself stays here so there is exactly one implementation of it.
     """
-    tz = tz_for(tenant_id)
+    if tz is TZ_UNRESOLVED:
+        tz = tz_for(tenant_id)
     if tz is None:
         # No property timezone set: everything stays in the server's frame.
         return (now or datetime.now()).replace(tzinfo=None)
@@ -61,7 +73,7 @@ def local_now(tenant_id: str, now: datetime | None = None) -> datetime:
     return aware.astimezone(tz).replace(tzinfo=None)
 
 
-def server_naive(tenant_id: str, local: datetime) -> datetime:
+def server_naive(tenant_id: str, local: datetime, tz=TZ_UNRESOLVED) -> datetime:
     """`local`, a property-local naive datetime, in the server's naive frame.
 
     The inverse of `local_now`, and the piece that was missing: every frame fix
@@ -72,8 +84,11 @@ def server_naive(tenant_id: str, local: datetime) -> datetime:
     DST note: 09:00 is outside every real DST transition window (00:00-03:00
     local), so `replace(tzinfo=tz)` never produces a nonexistent or ambiguous
     local time for this use case.
+
+    `tz` may be pre-resolved, as in `local_now`.
     """
-    tz = tz_for(tenant_id)
+    if tz is TZ_UNRESOLVED:
+        tz = tz_for(tenant_id)
     if tz is None:
         return local
     return local.replace(tzinfo=tz).astimezone().replace(tzinfo=None)
