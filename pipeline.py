@@ -304,8 +304,21 @@ _MONTHS = {m: i for i, m in enumerate(
 #
 # The year the site meant is the one that puts the date nearest the day we are
 # reading it on. Only three years can ever be in reach, and the winner is always
-# within half a year; anything further away means the month/day cannot be placed
-# (a 29 February with no leap year nearby), and guessing is worse than None.
+# within half a year.
+#
+# The reach bound exists to CHOOSE between candidate years, so it has to stay out
+# of the way when there is nothing to choose. Every month/day except 29 February
+# is a real date in all three years, and one of those three is always within half
+# a year — so for 365 of the 366 inputs the bound never decides anything on its
+# own. 29 February is the exception: it is real in at most one of the three, and
+# applying a disambiguation bound to a single candidate rejected a date that was
+# never ambiguous (a leap-day message read late in that same leap year came back
+# unparseable, and the deal was then stamped with the scrape instant — a
+# six-month-old inquiry shown as brand new). So when nothing is in reach we fall
+# back to the reading year's own candidate, which is the rule this replaced:
+# filling in a year must never LOSE a parse the old rule produced. That still
+# leaves a real None for 29 February with no leap year in reach at all, where the
+# only candidate is a full year out and guessing is worse than None.
 _YEAR_REACH_DAYS = 183
 
 
@@ -315,6 +328,13 @@ def _nearest_year(mon: int, day: int, ref) -> str | None:
     Ties (possible only across a leap year, where the two candidates are 366
     days apart and each 183 away) resolve to the earlier year: the one caller
     that reaches this code is reading dates the guest has already written.
+
+    When no candidate is within reach, `ref`'s own year is used if the date is
+    real there. Only 29 February can get that far (see above), and only ever
+    looking BACKWARDS: 29 February is at most two months ahead of a day in its
+    own year, which is well inside the reach, so a leap day that needs this
+    branch is always 184 to 306 days past. It cannot hand back a future guess.
+    Returns None when even that candidate is unreal.
     """
     best = None
     for year in (ref.year - 1, ref.year, ref.year + 1):
@@ -325,7 +345,12 @@ def _nearest_year(mon: int, day: int, ref) -> str | None:
         gap = abs((candidate - ref).days)
         if gap <= _YEAR_REACH_DAYS and (best is None or gap < best[0]):
             best = (gap, candidate)
-    return best[1].isoformat() if best else None
+    if best is None:
+        try:
+            return datetime(ref.year, mon, day).date().isoformat()
+        except ValueError:
+            return None
+    return best[1].isoformat()
 
 
 def parse_date(value: str | None, today: str | None = None) -> str | None:
