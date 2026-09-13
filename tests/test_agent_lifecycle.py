@@ -32,6 +32,12 @@ import timeframe  # noqa: E402
 SITE = "furnishedfinder"
 UTC = ZoneInfo("UTC")
 
+# The property's zone. Shared by the fixture below and `_days_from_today` on
+# purpose: the moment those two are spelled separately they can drift, and a
+# fixture that pins a property zone while building its dates in the server's is
+# exactly the defect `_days_from_today` documents.
+TENANT_TZ = "America/New_York"
+
 
 @pytest.fixture()
 def tenant(tmp_path, monkeypatch):
@@ -40,7 +46,7 @@ def tenant(tmp_path, monkeypatch):
 
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "t.db")
     tid = "1"
-    config.save_settings(tid, host_name="Test Host", timezone="America/New_York",
+    config.save_settings(tid, host_name="Test Host", timezone=TENANT_TZ,
                          digest_enabled="1", digest_hour="18:00",
                          autopilot="0", check_times="09:00,16:00", last_check_at="",
                          last_digest_at="")
@@ -834,7 +840,69 @@ def test_thread_key_treats_one_guest_as_one_person(tenant):
 
 
 def _days_from_today(n: int) -> str:
-    return (datetime.now() + timedelta(days=n)).date().isoformat()
+    """A `check_in`/`check_out` date n days from today *at the property*.
+
+    These are zoneless property-calendar dates — neither write path reads a
+    clock — and this change moved `advance_lifecycle`'s stage arms into that
+    frame to match. The helper kept building them from `datetime.now()`, the
+    **server's** date, while the fixture pins the property to `TENANT_TZ`. So
+    for the four to five hours a day the two zones disagree the fixture and the
+    code under test were a calendar day apart and every stage assertion below
+    lagged exactly one step: `check_in=_days_from_today(0)` is still tomorrow at
+    the property, `check_out=_days_from_today(-1)` is still today. Green at
+    20:40Z, red at 01:00Z, on a SHA nobody had touched — which is why it got
+    through review.
+
+    Derived straight from `zoneinfo` rather than from `scheduler.local_now`: a
+    fixture that asked the code under test where midnight falls would move with
+    the bug instead of pinning it.
+    """
+    return (datetime.now(ZoneInfo(TENANT_TZ)) + timedelta(days=n)).date().isoformat()
+
+
+@pytest.mark.parametrize("n", [-30, -2, -1, 0, 3, 60])
+def test_the_lifecycle_fixtures_build_their_dates_in_the_property_frame(monkeypatch, n):
+    """A guard on `_days_from_today` itself, not on the pipeline.
+
+    Every stage assertion in this section hands `advance_lifecycle` dates this
+    helper built. If it ever goes back to `datetime.now()` those assertions stop
+    testing the transition and start testing whichever zone the runner happens
+    to be in — passing all day and failing overnight, with nothing in the diff
+    to point at. The server instant is pinned here, so unlike the tests it
+    guards this one answers the same way at every hour, and it calls the real
+    helper rather than restating it, so reverting the helper turns it red.
+
+    Parametrized rather than looped: the first failing offset would otherwise
+    end the test and hide the rest.
+    """
+    frozen = datetime(2026, 9, 13, 1, 30, tzinfo=UTC)  # UTC has rolled over...
+    prop = frozen.astimezone(ZoneInfo(TENANT_TZ)).date()  # ...New York has not
+    assert prop.isoformat() == "2026-09-12"
+
+    # The control. This can only tell the two frames apart if the runner's own
+    # zone disagrees with the property's at the pinned instant, so say so out
+    # loud instead of passing vacuously on a machine set to New York.
+    server = frozen.astimezone().replace(tzinfo=None)
+    assert server.date() != prop, (
+        f"this runner's zone puts it on {server.date()}, the same date as the "
+        f"property at {frozen.isoformat()}; the assertion below is vacuous here")
+
+    class _DT(datetime):
+        """Pins *now* and nothing else — `fromisoformat`, arithmetic and
+        `isinstance` all keep working. Naive for `now()`, matching what the
+        stdlib hands back, so the server-frame spelling stays reachable."""
+
+        @classmethod
+        def now(cls, tz=None):
+            return server if tz is None else frozen.astimezone(tz)
+
+    monkeypatch.setitem(globals(), "datetime", _DT)
+
+    assert _days_from_today(n) == (prop + timedelta(days=n)).isoformat()
+    # Positive control on the same instant: the server frame is a *reachable*,
+    # different answer, so the assertion above is discriminating and not just
+    # restating one arithmetic in two ways.
+    assert _days_from_today(n) != (server.date() + timedelta(days=n)).isoformat()
 
 
 def test_a_booked_guest_moves_to_prearrival_then_staying_then_completed(tenant):
