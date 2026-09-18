@@ -377,17 +377,59 @@ _IDLE_ROUNDS = 6
 _IDLE_SLEEP = 5
 
 
+def can_deliver_in_process() -> bool:
+    """Whether *this* process can drive the browser that a send needs.
+
+    The single source of truth for "may I claim outbox rows?". It lives here
+    rather than in dashboard.py because the claim happens here: `start_drainer`
+    is reached from six call sites in three modules, and two of them
+    (`enqueue_send`, `enqueue_autopilot_reply`) are library calls with no
+    dashboard anywhere in the stack — `/responder/send` reaches the drainer
+    only through `enqueue_send`, so a gate written at the routes would have
+    missed the primary send path.
+
+    `FORCE_WORKER_QUEUE` is read from the environment on every call, not
+    captured at import, so a test can flip the topology without reloading the
+    module.
+    """
+    import os
+
+    import check_leads
+
+    forced_worker = os.getenv("FORCE_WORKER_QUEUE", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+    return check_leads.playwright_available() and not forced_worker
+
+
 def start_drainer(site: str) -> bool:
     """Ensure a background thread is draining the send queue. Idempotent.
 
     Sending drives a real browser and takes tens of seconds, so it must never
     happen on the request thread — the user clicks send and gets their UI back
     immediately, while this delivers and records the outcome.
+
+    Returns False without starting anything when this process cannot deliver.
+    Claiming a row into `sending` is a promise to finish it, and a process with
+    no Playwright cannot keep that promise. It used to make the promise anyway:
+    on the worker-queue topology (serverless web + `worker.py` on one
+    `DATABASE_URL`) the incapable web process could win the claim, and
+    `worker.py` — the only host that can drive a browser — then found nothing
+    queued and moved on. The message waited out `reclaim_stuck_sending` (900s)
+    plus the next agent pass, up to ~20 minutes, to be delivered by the host
+    that was ready for it immediately.
+
+    Gating here cannot gate off that capable host: `worker.py` never calls
+    `start_drainer`, it drives `send_next` directly in its own loop. So the
+    only thing this turns off is a claim that could not have been honoured.
+    Leaving the row `queued` is strictly better than stranding it in `sending`:
+    `queued` is cancelable (see `outbox.CANCELABLE`) and any capable host picks
+    it up on its next pass, where `sending` is neither.
     """
     global _draining
     # Checked before the latch, never after: a disabled call must not leave
     # `_draining` set, or the first enabled call would find itself suppressed.
-    if not background_agents_enabled():
+    if not background_agents_enabled() or not can_deliver_in_process():
         return False
     with _drain_lock:
         if _draining:
