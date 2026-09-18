@@ -16,10 +16,18 @@ Why this shape: the existing modules (storage/models/config/billing/ff_account/
 waitlist) each open their own connection and CREATE TABLE IF NOT EXISTS lazily.
 Keeping that pattern — but pointing it at db.connect() — means the Postgres path
 is a small, centralized surface rather than a rewrite of every query.
+
+Schema creation goes through open_with_schema() rather than running the DDL on
+the caller's own connection. On SQLite the lazy-every-time behavior is kept
+exactly; on Postgres running DDL inside the caller's transaction deadlocks two
+concurrent writers. See open_with_schema for the full reasoning.
 """
+import hashlib
 import os
 import re
 import sqlite3
+import threading
+import zlib
 from pathlib import Path
 
 # Default local file. On a read-only serverless FS this path is never opened as
@@ -121,6 +129,135 @@ def connect() -> Conn:
     return Conn(raw, pg=False)
 
 
+# --- Schema creation -------------------------------------------------------
+# Which (dsn, key) schemas this *process* has already created on Postgres.
+# Keyed by DSN too, so repointing DATABASE_URL mid-process re-runs the DDL.
+_SCHEMA_LOCK = threading.Lock()
+_SCHEMA_DONE: set[tuple[str, str]] = set()
+
+# SQLite runs the DDL on *every* connection (see open_with_schema), and the
+# ADD COLUMN migrations are check-then-act: read the column list, then ALTER
+# what is missing. Two threads opening their first connection to the same file
+# both read the same list and both issue the ALTER, and the loser gets
+# `sqlite3.OperationalError: duplicate column name: ...`. Serialising the DDL
+# per process closes that window. RLock, not Lock, so a `ddl` body that ever
+# opens a nested connection cannot deadlock against itself (no current one
+# does; audited).
+_SQLITE_DDL_LOCK = threading.RLock()
+
+
+def _reset_schema_state() -> None:
+    """Forget the per-process schema latch — for use in a forked child.
+
+    The latch is a claim about *this* process ("I already ran the DDL on this
+    connection's database"). fork() copies it into a child that has run nothing,
+    so without this a forked worker skips a pending ADD COLUMN migration and
+    then fails on the missing column. The lock is rebuilt rather than reused
+    because a lock held by another thread at fork time stays locked forever in
+    the child.
+    """
+    global _SCHEMA_LOCK, _SCHEMA_DONE, _SQLITE_DDL_LOCK
+    _SCHEMA_LOCK = threading.Lock()
+    _SCHEMA_DONE = set()
+    # Same reason as the lock above: a lock held by another thread at fork time
+    # is held forever in the child, and this one is taken on every connection.
+    _SQLITE_DDL_LOCK = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):  # not available on Windows
+    os.register_at_fork(after_in_child=_reset_schema_state)
+
+
+def _advisory_key(key: str) -> int:
+    """Stable 63-bit advisory-lock id for a schema key.
+
+    crc32 rather than hash(): hash() is salted per process, so two processes
+    would take *different* locks and not serialise against each other at all.
+    """
+    return (0x5645_4E31 << 32) | zlib.crc32(key.encode())
+
+
+def _ensure_pg_schema(key: str, ddl) -> None:
+    """Run `ddl` once per process, in its own committed transaction."""
+    dsn = database_url()
+    with _SCHEMA_LOCK:
+        if (dsn, key) in _SCHEMA_DONE:
+            return
+        lock_id = _advisory_key(key)
+        # Not a `with` block: the lock has to be released *after* the commit,
+        # and Conn.__exit__ commits last. Releasing it while the CREATE TABLE is
+        # still uncommitted lets the next process take the lock, not see the
+        # table, and issue its own CREATE — which is precisely the catalog race
+        # (duplicate key in pg_type_typname_nsp_index) this lock exists to stop.
+        c = connect()
+        try:
+            # Session-level, NOT pg_advisory_xact_lock: an xact lock is a silent
+            # no-op under autocommit, and this connection may become an
+            # autocommit/pooled one.
+            c.execute("SELECT pg_advisory_lock(?)", (lock_id,))
+            try:
+                ddl(c)
+                c.raw.commit()
+            except Exception:
+                # Rollback first: the unlock below is itself a statement, and a
+                # failed DDL leaves the transaction aborted so it would be
+                # rejected — masking the real error with InFailedSqlTransaction.
+                c.raw.rollback()
+                raise
+            finally:
+                c.execute("SELECT pg_advisory_unlock(?)", (lock_id,))
+                c.raw.commit()
+        finally:
+            # Closed, never returned to a pool. A session-level lock outlives
+            # its transaction, so a pooled connection that skipped the unlock
+            # would block first-creation for every other process for the life of
+            # that session.
+            c.raw.close()
+        _SCHEMA_DONE.add((dsn, key))
+
+
+def open_with_schema(key: str, ddl, session=None) -> Conn:
+    """Open a connection whose tables are guaranteed to exist.
+
+    `ddl(conn)` creates/migrates this module's tables; `key` names them for the
+    once-per-process latch. `session(conn)` applies per-connection session state
+    (e.g. PRAGMA foreign_keys) and therefore runs on the returned connection
+    every time, on both backends.
+
+    Postgres: the DDL runs once per process on a *separate*, committed
+    connection, and the caller gets a clean one. It must not ride in the
+    caller's transaction — CREATE INDEX IF NOT EXISTS takes a ShareLock on the
+    table even when the index already exists, and holds it to commit. Two
+    writers both take that self-compatible lock, then each blocks upgrading to
+    the RowExclusiveLock its INSERT needs: a lock-upgrade deadlock that kills a
+    drainer mid-pass. A pending ALTER is worse than a deadlock — a nested
+    connection opened underneath it waits on AccessExclusiveLock behind a
+    transaction that is idle waiting on its own client, so there is no cycle for
+    Postgres to detect and the process hangs at boot forever.
+
+    SQLite: `ddl` runs on the returned connection every time, exactly as before.
+    This is deliberate and load-bearing, not an oversight — the test fixtures
+    repoint DB_PATH per test and rely on the schema being created lazily on
+    first use, so a once-per-process latch here hands a later test an empty
+    database.
+    """
+    if not is_postgres():
+        c = connect()
+        if session is not None:
+            session(c)
+        # Serialised, not latched: it still runs on every connection (fixtures
+        # repoint DB_PATH per test and rely on that), but only one thread at a
+        # time, so the check-then-act ADD COLUMN migrations cannot interleave.
+        with _SQLITE_DDL_LOCK:
+            ddl(c)
+        return c
+    _ensure_pg_schema(key, ddl)
+    c = connect()
+    if session is not None:
+        session(c)
+    return c
+
+
 # --- Cross-dialect helpers -------------------------------------------------
 def table_columns(conn: Conn, table: str) -> set[str]:
     """Column names for a table — replaces `PRAGMA table_info(...)`.
@@ -145,6 +282,68 @@ def insert_returning_id(conn: Conn, sql: str, params, id_col: str = "id"):
         cur = conn.execute(f"{sql} RETURNING {id_col}", params)
         return cur.fetchone()[0]
     return conn.execute(sql, params).lastrowid
+
+
+def lock_key(conn: Conn, key: str) -> None:
+    """Serialize this transaction against any other touching the same key.
+
+    Needed because a guard whose predicate spans *rows* cannot be enforced by
+    row-level MVCC. Under Postgres' default READ COMMITTED, two transactions
+    each evaluate `NOT EXISTS (...)` against their own snapshot, neither sees
+    the other's uncommitted row, and when they update *different* rows there is
+    no row lock to serialize them and no EvalPlanQual recheck. Measured on
+    PG 16.14 before this lock: 14/15 concurrent pairs released two messages for
+    one guest, and 15/15 for the insert-shaped guard. SQLite hid it completely —
+    its single writer lock serializes everything, so the same code measured
+    0/150 there. A guard verified only on SQLite is a guard verified on the
+    wrong backend: `DATABASE_URL` is required on the deployed target.
+
+    An advisory lock rather than `SELECT ... FOR UPDATE` because the condition
+    is partly about rows that do not exist yet (insert vs insert), which no row
+    lock can cover. Taken inside the caller's transaction and released when it
+    ends. The hash is computed here rather than with Postgres' `hashtext()` so
+    the key does not depend on an undocumented internal function; collisions
+    only cost unrelated serialization, never correctness.
+
+    No-op on SQLite, which already gives this for free.
+
+    Refuses an autocommit connection rather than degrading on one.
+    `pg_advisory_xact_lock` releases at the end of its transaction, so under
+    autocommit it is taken and dropped by its own statement — a silent no-op
+    that leaves the caller's predicate as racy as it was before, while every
+    SQLite test stays green. That is precisely the combination that shipped a
+    broken guard here once already (the 14/15 above), and `open_with_schema`
+    documents the same hazard for the schema latch, which is why that one uses a
+    *session* lock. The precondition holds today — psycopg defaults
+    `autocommit=False` — so this is not a live bug; it is what makes the next
+    person's pooled-connection change fail loudly instead of quietly.
+    """
+    if not conn.pg:
+        return
+    if getattr(conn.raw, "autocommit", False):
+        raise RuntimeError(
+            "lock_key needs a transactional connection: pg_advisory_xact_lock "
+            "is a no-op under autocommit, silently un-guarding the caller.")
+    # Signed 64-bit, which is what pg_advisory_xact_lock(bigint) accepts.
+    digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+    conn.execute("SELECT pg_advisory_xact_lock(?)",
+                 (int.from_bytes(digest, "big", signed=True),))
+
+
+def insert_returning_id_maybe(conn: Conn, sql: str, params, id_col: str = "id"):
+    """Same, for an INSERT that is allowed to insert nothing. None if it didn't.
+
+    `insert_returning_id` assumes a row was written — on Postgres it subscripts
+    `fetchone()`, and on SQLite `lastrowid` keeps whatever the previous insert
+    on that cursor set. Neither is safe for `INSERT ... SELECT ... WHERE NOT
+    EXISTS`, the shape used to make "write this row only if nothing conflicts"
+    a single statement instead of a read followed by a write.
+    """
+    if conn.pg:
+        row = conn.execute(f"{sql} RETURNING {id_col}", params).fetchone()
+        return row[0] if row else None
+    cur = conn.execute(sql, params)
+    return cur.lastrowid if cur.rowcount else None
 
 
 def sync_serial(conn: Conn, table: str, col: str = "id") -> None:

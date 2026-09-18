@@ -34,15 +34,21 @@ import ff_account  # noqa: E402
 import jobs  # noqa: E402
 from sites import furnishedfinder  # noqa: E402
 
-_FAILURES: list[str] = []
-
-
 def check(cond, msg):
-    if cond:
-        print(f"  ok  {msg}")
-    else:
-        print(f" FAIL {msg}")
-        _FAILURES.append(msg)
+    """Fail the calling test when `cond` is falsey, using `msg` as the reason.
+
+    This raises rather than recording the failure. An earlier version appended
+    to a module-level list that only the `__main__` runner below inspected, so
+    under pytest every test in this file returned normally no matter what the
+    code under test did — 13 tests that were counted as green while asserting
+    nothing (VEN-166).
+
+    Raises AssertionError explicitly instead of using a bare `assert` so the
+    check survives `python -O`, which strips assert statements; `msg` is a
+    pre-computed string, so pytest's assertion rewriting has nothing to add.
+    """
+    if not cond:
+        raise AssertionError(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +280,20 @@ def test_cloudflare_challenge_is_fatal():
           "Cloudflare error has a UI-safe message")
 
 
+def test_lead_detail_email_regex_avoids_quadratic_rescans():
+    print("test_lead_detail_email_regex_avoids_quadratic_rescans")
+    check(furnishedfinder._EMAIL_RE.pattern.startswith(r"(?<![\w.+-])"),
+          "email regex requires the start of a candidate token")
+
+    # Inquiry blocks are capped at 2,500 characters. Exercise that full-size
+    # scrape input before a valid address so a missing boundary guard cannot be
+    # hidden by testing only short, friendly parser fixtures.
+    detail = "Notes:\n" + ("a" * 2500) + "\nEmail:\nlead.person+tag@example-domain.com"
+    facts = furnishedfinder._parse_lead_detail(detail)
+    check(facts.get("email") == "lead.person+tag@example-domain.com",
+          "lead parser still extracts a valid email after a maximal token")
+
+
 def test_ff_login_dialog_invalidates_session_probe():
     print("test_ff_login_dialog_invalidates_session_probe")
 
@@ -323,8 +343,12 @@ def test_ff_login_dialog_invalidates_session_probe():
 
 
 def _expire_worker():
-    from datetime import datetime, timedelta
-    old = (datetime.now() - timedelta(seconds=jobs.WORKER_TTL_SECONDS + 60)).isoformat(timespec="seconds")
+    # Offset-aware, matching what `jobs.heartbeat()` actually writes (VEN-137).
+    # A naive stamp here would still expire the worker, but it would route every
+    # reap/offline test in this file down the legacy-naive compatibility branch
+    # in `worker_online()`, leaving the real shipped path with no coverage.
+    from datetime import datetime, timedelta, timezone
+    old = (datetime.now(timezone.utc) - timedelta(seconds=jobs.WORKER_TTL_SECONDS + 60)).isoformat(timespec="seconds")
     with jobs._conn() as c:
         c.execute("UPDATE ff_worker SET last_seen=? WHERE id=1", (old,))
 
@@ -424,22 +448,35 @@ def test_retry_cooldown_blocks_burst():
 
 
 if __name__ == "__main__":
-    test_connect_states()
-    test_jobs_queue()
-    test_public_state()
-    test_serverless_refresh_routing()
-    test_force_worker_queue_routing()
-    test_cloudflare_challenge_is_fatal()
-    test_ff_login_dialog_invalidates_session_probe()
-    test_reap_stale_running_job()
-    test_worker_restart_recovery()
-    test_hard_cap_backstop()
-    test_magic_link_required_error()
-    test_retry_cooldown_blocks_burst()
+    # Same tests, same order, as pytest collects them. `check()` now raises, so
+    # each test is run in its own try/except to keep this runner's "report every
+    # failing test" behaviour instead of aborting on the first one.
+    _TESTS = [
+        test_connect_states,
+        test_jobs_queue,
+        test_public_state,
+        test_serverless_refresh_routing,
+        test_force_worker_queue_routing,
+        test_cloudflare_challenge_is_fatal,
+        test_lead_detail_email_regex_avoids_quadratic_rescans,
+        test_ff_login_dialog_invalidates_session_probe,
+        test_reap_stale_running_job,
+        test_worker_restart_recovery,
+        test_hard_cap_backstop,
+        test_magic_link_required_error,
+        test_retry_cooldown_blocks_burst,
+    ]
+    failed: list[str] = []
+    for _test in _TESTS:
+        try:
+            _test()
+        except AssertionError as exc:
+            print(f" FAIL {_test.__name__}: {exc}")
+            failed.append(_test.__name__)
     print()
-    if _FAILURES:
-        print(f"{len(_FAILURES)} FAILURE(S):")
-        for f in _FAILURES:
-            print(f"  - {f}")
+    if failed:
+        print(f"{len(failed)} FAILING TEST(S):")
+        for name in failed:
+            print(f"  - {name}")
         sys.exit(1)
     print("ALL TESTS PASSED")

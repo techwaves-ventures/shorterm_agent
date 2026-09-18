@@ -29,6 +29,7 @@ from flask import (
     url_for,
 )
 from flask_wtf.csrf import CSRFProtect
+from werkzeug.exceptions import RequestEntityTooLarge
 from flask_login import (
     LoginManager,
     current_user,
@@ -44,6 +45,7 @@ import config
 import crypto
 import ff_account
 import inbound
+import inbound_rejects
 import jobs
 import models
 import outbox
@@ -53,6 +55,7 @@ import runner
 import scheduler
 import sequences
 import storage
+import timeframe
 import waitlist
 
 SITE = "furnishedfinder"
@@ -88,6 +91,15 @@ app.config.update(
     PERMANENT_SESSION_LIFETIME=timedelta(days=14),
     # Reject oversized request bodies before they're parsed.
     MAX_CONTENT_LENGTH=2 * 1024 * 1024,
+    # Bulk form data has its own, smaller limit, and this app never set it —
+    # so a framework default governed it. That default moved from `None` to
+    # 500_000 in an upgrade nobody asked for (`requirements.txt` pins `flask`
+    # but not `werkzeug`), landing *below* `inbound.MAX_PAYLOAD_BYTES`. The
+    # effect was that a public endpoint's binding limit was a number this
+    # project had never chosen, and an over-limit body was refused by the
+    # framework before `inbound.accept` could refuse it with the app's own
+    # reason code. Tied to that constant so the two can't drift apart again.
+    MAX_FORM_MEMORY_SIZE=inbound.MAX_PAYLOAD_BYTES,
 )
 
 # --- CSRF ------------------------------------------------------------------
@@ -185,29 +197,20 @@ def _can_deliver_in_process() -> bool:
     return automation.can_deliver_in_process()
 
 
-def _no_capable_sender(queued: int) -> bool:
-    """True when messages are waiting and no process in the deployment can send.
-
-    Gating `start_drainer` made a misconfigured deploy quiet instead of loud.
-    Before the gate, an approved message on a Playwright-less host with no
-    worker went `sending` -> `failed` fast and the card said "Send failed";
-    after it, the row correctly stays `queued` — and would sit there forever
-    with the UI cheerfully reporting "Queued to send…", because nothing exists
-    to pick it up. `queued` is the right *state*; silence about it is not.
-
-    Deliberately conservative: it fires only when this process cannot deliver
-    AND no worker has heartbeated inside `jobs.WORKER_TTL_SECONDS` AND there is
-    actually something waiting. A healthy worker-queue deployment never sees
-    it, so it stays a real signal rather than permanent Vercel wallpaper.
-    """
-    if queued <= 0 or _can_deliver_in_process():
-        return False
-    try:
-        return not jobs.worker_online()
-    except Exception:
-        # Never let a banner check break the dashboard render.
-        app.logger.exception("Could not determine worker liveness")
-        return False
+# Gating `start_drainer` makes a misconfigured deploy quiet instead of loud: an
+# approved message on a Playwright-less host with no worker used to go
+# `sending` -> `failed` fast and say "Send failed", and now correctly stays
+# `queued` — but would sit there with the UI reporting "Queued to send…" and
+# nothing alive to pick it up. `queued` is the right *state*; silence about it
+# is not, and the operator asked for that misconfiguration to be surfaced.
+#
+# That surface is deliberately NOT built here. It needs a signal that means
+# "something drains the outbox", and the only liveness signal this codebase has
+# — `jobs.worker_online()` — does not mean that: `worker.run_once` heartbeats
+# and then claims a *scrape job*, never touching the outbox, and
+# `chrome_task_server.py` calls it on every authenticated `/v1/wake`. A banner
+# keyed off it suppresses itself in exactly the deployment it exists to warn
+# about. Tracked as VEN-240, which owns inventing the right beacon.
 
 
 def _live_state(tenant_id: str) -> dict:
@@ -216,9 +219,14 @@ def _live_state(tenant_id: str) -> dict:
     On a host with Playwright (local/worker-host dashboard) the scrape runs
     in-process, so the live state comes from the runner. On serverless (Vercel,
     no Playwright) scrapes are worker-backed via the shared DB, so the state is
-    projected from the tenant's latest job. Same shape either way."""
+    projected from the tenant's latest job. Same shape either way — which is why
+    the in-process branch goes through `public_state`: the runner's `run_token`
+    is an in-process correlation value with no counterpart in the job
+    projection and no meaning to a client, and everything reached from here is
+    served to one (`/api/status`, `/otp`, `/refresh`, and the `state | tojson`
+    inlined into every dashboard page)."""
     if check_leads.playwright_available() and not _use_worker_queue():
-        return runner.get_state(tenant_id)
+        return runner.public_state(tenant_id)
     return jobs.public_state(tenant_id)
 
 
@@ -252,6 +260,24 @@ def _item_by_id(tenant_id: str, item_id: str) -> dict | None:
     return storage.get_item(tenant_id, SITE, item_id)
 
 
+@app.template_filter("sched_local")
+def _sched_local(value, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """Render a schedule stamp in the operator's property timezone.
+
+    `scheduled_at`/`next_action_at` are stored absolute so that the host which
+    writes a schedule and the host which acts on it agree (see `timeframe`).
+    That frame is plumbing, and showing it to a host would be a regression in its
+    own right: this dashboard's whole premise is the property's local schedule,
+    so "due 15:00" has to mean 15:00 where the property is, not on a dyno.
+
+    Falls back to the server's zone when the tenant hasn't configured one, which
+    is what `scheduler.tz_for` already promises everywhere else.
+    """
+    tenant_id = getattr(current_user, "tenant_id", None)
+    local = timeframe.to_zone(value, scheduler.tz_for(tenant_id) if tenant_id else None)
+    return local.strftime(fmt) if local else "—"
+
+
 # ---------------------------------------------------------------------------
 # Command-center view model (deals + lifecycle + agent queue)
 # ---------------------------------------------------------------------------
@@ -270,13 +296,15 @@ def _board(tenant_id: str) -> dict:
     # existing install picks up the lifecycle without a migration step.
     pipeline.backfill(tenant_id, SITE, items, responses, config.get_units(tenant_id))
     deals = pipeline.all_deals(tenant_id, SITE)
-    pending = {
-        m["item_id"]: m
-        for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
-    }
-    send_states = outbox.latest_by_item(tenant_id, SITE)
-    # Self-heal on view: requeue sends stranded by a crashed process, and make
-    # sure something is draining if messages are waiting (e.g. after a restart).
+    # Self-heal on view: requeue sends stranded by a crashed process.
+    #
+    # This runs *before* the outbox reads below, not after. It writes rows the
+    # board then renders — a stranded `sending` row becomes `queued` — so
+    # reading first meant the one render that performed the reclaim described
+    # the state it had just replaced: still "Sending…", still absent from
+    # "Waiting to send", still offering no way to clear it, while an
+    # /api/send-states poll moments later already said `queued`. The render that
+    # fixes something is the render that most needs to show it.
     #
     # The reclaim is *still* deliberately not gated on
     # `_can_deliver_in_process()` — reaffirmed, but the argument for it has
@@ -298,6 +326,26 @@ def _board(tenant_id: str) -> dict:
     # for that guest again. Recovering a row you did not strand is safe; the
     # thing that must be gated is *claiming* one, and that now is.
     outbox.reclaim_stuck_sending()
+
+    pending = {
+        m["item_id"]: m
+        for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
+    }
+    send_rows = outbox.rows_by_item(tenant_id, SITE)
+    # One clock for the whole render. Both surfaces that describe a send read
+    # dueness off it — the card's label via `send_state` and the "Waiting to
+    # send" caption via `row_deferred` — and taking `timeframe.now()` twice lets
+    # a render that straddles a scheduled time caption one row as still upcoming
+    # and label the same row as due, on one page, from one request.
+    now_iso = timeframe.now()
+    # Kept *after* the reads, unlike the reclaim above. This one spawns a thread
+    # that writes the very rows just read, claiming `queued` into `sending`; in
+    # front of the reads it would race its own render, so a board could show
+    # "Sending…" for a row whose claim had not been made when the page was
+    # composed, and the two outbox reads above could straddle the claim and
+    # disagree with each other. The reclaim has no such problem — it is
+    # synchronous and finishes before the reads begin. "Heal before reading"
+    # applies to the write this request completes, not to the one it starts.
     if _can_deliver_in_process() and outbox.queued_tenants():
         automation.start_drainer(SITE)
 
@@ -308,7 +356,10 @@ def _board(tenant_id: str) -> dict:
             "item": item,
             "response": responses.get(deal["item_id"]),
             "pending": pending.get(deal["item_id"]),
-            "send": send_states.get(deal["item_id"]),
+            # The derived state, not the raw row: the template gates the
+            # in-flight display and the disabled button on `send.in_flight`,
+            # which is not a column.
+            "send": outbox.send_state(send_rows.get(deal["item_id"]), now_iso),
             "age": pipeline.humanize_age(deal.get("inquiry_at")),
             "age_hours": pipeline.age_hours(deal.get("inquiry_at")),
             "stage_label": pipeline.STAGE_LABELS.get(deal.get("stage"), deal.get("stage")),
@@ -318,7 +369,6 @@ def _board(tenant_id: str) -> dict:
 
     by_id = {d["item_id"]: d for d in deals}
     auto_settings = automation.settings_for(tenant_id)
-    counts = outbox.counts(tenant_id, SITE)
     needs = [card(d) for d in pipeline.needs_action(deals, responses)]
     all_cards = sorted(
         (card(d) for d in deals),
@@ -337,13 +387,64 @@ def _board(tenant_id: str) -> dict:
             for m in outbox.for_tenant(tenant_id, SITE, (outbox.PENDING,))
             if m["item_id"] in by_id
         ],
-        "outbox_counts": counts,
+        # Every approved row that is holding its guest's card — waiting on a
+        # drainer, on its scheduled time, or already going out. These were
+        # rendered nowhere, which is what made the release guard indefensible: a
+        # row in flight refuses approve/retry/send for its guest, and with no row
+        # on the page and no cancel control the operator could neither see what
+        # was blocking them nor clear it — the only escape was hand-POSTing
+        # /outbox/<id>/cancel. `queued` is in `outbox.CANCELABLE` and that route
+        # already answers 200, so the affordance was the only missing piece. It
+        # matters most where no drainer runs at all: there the block is not a
+        # window, it is permanent.
+        #
+        # The set is `IN_FLIGHT`, not `QUEUED`, because it has to match the
+        # predicate that does the refusing (`_in_flight_terms`). Listing only the
+        # clearable half meant an operator could cancel every blocker the page
+        # showed and still be 409'd with nothing left to click — a page that is
+        # complete about what it can fix and silent about what it cannot. A
+        # `sending` row renders read-only (see `outbox.CANCELABLE`: an in-flight
+        # browser send genuinely cannot be called off, and a button that would
+        # 409 is not an affordance), so the section answers "what is holding this
+        # guest" completely and is honest about which of it you can act on.
+        #
+        # Derived from `send_rows` — already a whole-table read for this tenant —
+        # rather than a seventh `for_tenant` query, because the board's query
+        # count is fixed by design and asserted as such. Ordered as `for_tenant`
+        # orders, so the section reads oldest-due first.
+        #
+        # Three flags, not one. `cancelable` decides whether a control is offered
+        # at all and has to track the predicate the route enforces; `sending` and
+        # `deferred` decide the wording. `cancelable` and `sending` coincide
+        # today only because `CANCELABLE` excludes exactly `SENDING`, and a
+        # caption reading itself off an unrelated permission is the shape of this
+        # ticket's original defect.
+        #
+        # `deferred` is the one the caption was missing. Without it the section
+        # had a single "is it sending" bit and wrote the *stamp* for everything
+        # else, so a due `queued` row — the common case, since deferral is the
+        # quiet-hours exception — was captioned "sends <a time already past>".
+        # It comes from `outbox.row_deferred`, the same predicate `send_state`
+        # uses for the card, so the two surfaces cannot describe one row in two
+        # tenses. Computed against a single `now` for the whole render: taken
+        # per row, a board straddling the boundary could caption two identically
+        # scheduled rows differently.
+        "blocking_sends": [
+            {**card(by_id[m["item_id"]]), "pending": m,
+             "cancelable": m["status"] in outbox.CANCELABLE,
+             "sending": m["status"] == outbox.SENDING,
+             "deferred": outbox.row_deferred(m, now_iso)}
+            for m in sorted(
+                (m for rows in send_rows.values() for m in rows
+                 if m["status"] in outbox.IN_FLIGHT and m["item_id"] in by_id),
+                key=lambda m: (m.get("scheduled_at") or "", m["id"]),
+            )
+        ],
+        "outbox_counts": outbox.counts(tenant_id, SITE),
         # `steps` is a set internally (membership tests); listify so the board
         # stays JSON-serializable for /api/board.
         "automation": {**auto_settings, "steps": sorted(auto_settings["steps"])},
         "stale_count": max(0, len(deals) - len(needs)),
-        # Misconfiguration surface: queued work and nothing alive to send it.
-        "no_capable_sender": _no_capable_sender(counts.get(outbox.QUEUED, 0)),
     }
 
 
@@ -398,19 +499,79 @@ def inbound_email():
     mail providers retry on non-2xx, which would replay a message we already
     deliberately rejected.
     """
-    supplied = (
-        request.headers.get("X-Inbound-Secret")
-        or request.args.get("secret")
-        or (request.form.get("secret") if request.form else "")
-        or ""
-    )
-    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    # Reading the body is itself a way this route can fail, so it sits inside a
+    # guard rather than above one. `MAX_CONTENT_LENGTH` makes werkzeug raise
+    # `RequestEntityTooLarge` out of any of the three accesses below, and Flask
+    # renders that as a 413 without ever entering the body of this view — which
+    # broke the flat-202 contract in the one place it matters most. A real
+    # FurnishedFinder notification carrying photos over the cap got a 413, the
+    # provider retried it forever because providers retry on non-2xx, the lead
+    # never landed, and nothing reached `inbound_rejects` for the operator to
+    # see. Answering 202 drops that message once instead of loudly and
+    # repeatedly, and keeps the response identical to every other outcome here.
+    #
+    # The raise is observed at the `request.form` access below, not at
+    # `get_data` — form parsing applies the smaller form-memory limit — so
+    # narrowing this guard to the read alone would not hold. Everything that
+    # touches the request body belongs inside it.
     try:
-        tenant_id, item = inbound.accept(
-            payload, supplied, raw_size=request.content_length or 0
+        # Measured first, before anything reads `request.form` or `get_json`.
+        #
+        # `content_length` is None when the provider streams the body with
+        # chunked transfer-encoding, and `or 0` collapsed "unknown" into
+        # "empty" — so the size check in `accept` skipped itself and a 1.9 MB
+        # body sent chunked reached the parser while the identical body sent
+        # with the header was rejected. Falling back to the bytes actually read
+        # closes that.
+        #
+        # The ordering is the whole trick: form and multipart parsing drains
+        # the stream, after which `get_data` returns empty and the fallback
+        # silently yields 0 again — which is what the mail providers we target
+        # actually POST. Reading (and caching) the body up front leaves form
+        # parsing below working off the cache, so every content type gets a
+        # real measurement.
+        raw_size = request.content_length
+        if raw_size is None:
+            raw_size = len(request.get_data(cache=True))
+
+        supplied = (
+            request.headers.get("X-Inbound-Secret")
+            or request.args.get("secret")
+            or (request.form.get("secret") if request.form else "")
+            or ""
         )
+        payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    except RequestEntityTooLarge:
+        # Caught here and not with an `errorhandler`: a global one would also
+        # turn every oversized upload elsewhere in the dashboard into a
+        # success. This endpoint is the only one with a reason to swallow it.
+        # No body detail in the log — the message is over a megabyte and may be
+        # a stranger's, since this runs before the provider secret is checked.
+        app.logger.warning(
+            "Inbound email rejected: body exceeds MAX_CONTENT_LENGTH (%s bytes declared)",
+            request.content_length,
+        )
+        return ("", 202)
+
+    try:
+        tenant_id, item = inbound.accept(payload, supplied, raw_size=raw_size)
     except inbound.Rejected as e:
         app.logger.warning("Inbound email rejected: %s", e)
+        # Keep the ones that represent a *lost lead*. A rejection that never got
+        # past the provider secret is a probe, not a lead, and this endpoint is
+        # public — persisting those would let a stranger fill the operator's
+        # screen and disk. `inbound.Rejected` carries the distinction.
+        if e.tenant_id and e.code in inbound.RECORDABLE_CODES:
+            try:
+                # No reason text: the row carries operator-facing copy keyed on
+                # the code. `str(e)` is the audit string and it is already in
+                # the log line above — for `sender_not_allowed` it also embeds
+                # the raw sender, which does not belong on the review page.
+                inbound_rejects.record(e.tenant_id, SITE, e.code, "", payload)
+            except Exception:
+                # Never let bookkeeping change the reply: the flat 202 is what
+                # keeps this endpoint from telling a prober which addresses exist.
+                app.logger.exception("Could not record rejected inbound")
         return ("", 202)
     except Exception:
         app.logger.exception("Inbound email handling failed")
@@ -418,9 +579,13 @@ def inbound_email():
 
     try:
         is_new = inbound.store(tenant_id, item, SITE)
+        # Not "duplicate": `store` also returns False when the item was new and
+        # the board write failed, and calling that a duplicate is how a lead
+        # awaiting backfill reads as routine noise in the log. `store` warns
+        # with the item id on that path, so the distinction is one line above.
         app.logger.info(
             "Inbound %s for tenant %s (%s)",
-            item.get("kind"), tenant_id, "new" if is_new else "duplicate",
+            item.get("kind"), tenant_id, "new" if is_new else "not newly ingested",
         )
         if is_new and os.getenv("ANTHROPIC_API_KEY"):
             # Draft immediately — answering fast is the entire point of taking
@@ -429,6 +594,174 @@ def inbound_email():
     except Exception:
         app.logger.exception("Could not store inbound item")
     return ("", 202)
+
+
+def _reject_or_404(tenant_id: str, rid: int) -> dict:
+    """Load a rejected inbound row, refusing anything outside the caller's tenant."""
+    row = inbound_rejects.get(tenant_id, SITE, rid)
+    if not row:
+        abort(404, "No such message.")
+    return row
+
+
+@app.route("/inbound/rejected")
+@login_required
+def inbound_rejected():
+    """Forwarded emails we couldn't read — the operator's recovery queue."""
+    tenant_id = current_user.tenant_id
+    return render_template(
+        "rejected.html",
+        nav_active="dashboard",
+        account=current_user.email,
+        is_operator=current_user.is_operator,
+        rows=inbound_rejects.open_for_tenant(tenant_id, SITE),
+    )
+
+
+@app.route("/inbound/rejected/<int:rid>/retry", methods=["POST"])
+@login_required
+def inbound_rejected_retry(rid):
+    """Re-run the current parser over a stored message.
+
+    The point of this button is the day after a parser fix ships: the leads that
+    were lost to the old gap can be recovered without asking the guest to write
+    again.
+    """
+    tenant_id = current_user.tenant_id
+    row = _reject_or_404(tenant_id, rid)
+    if row["status"] != inbound_rejects.OPEN:
+        # A stale tab still shows rows that have since been handled elsewhere.
+        flash("That message was already handled.")
+        return redirect(url_for("inbound_rejected"))
+
+    from sites import ff_email
+
+    # Pass the mail `Date` the way the webhook does. Without it two sends of the
+    # same words are indistinguishable: a message id hashes a stamp that falls
+    # back to this argument, and the body fingerprint strips quoted history — so
+    # a guest's ordinary re-send ("Any update?" again, with the earlier exchange
+    # quoted underneath) recovered onto the *first* message's deal and was
+    # silently absorbed while the operator was told it had been recovered.
+    #
+    # When there is no stored mail date, pass what the webhook passes: nothing.
+    # `extract_date` returns "" when the payload carries no usable `Date`, so an
+    # empty string is the webhook's own input and matching it is what keeps the
+    # two paths deriving the *same* id. Substituting `received_at` here — our own
+    # write clock, which the webhook never sees — derives a different id for the
+    # same email, so a later re-delivery is no longer recognised as a duplicate
+    # and queues a second autopilot reply to a guest who wrote once.
+    #
+    # It is not a useful fallback anyway: it is second-precision, so the bulk
+    # forward it was meant to separate still collapses onto one id. Rows
+    # predating the column are not the narrow case they were described as
+    # either — a brand-new row stores `mail_date=''` whenever the payload has no
+    # date at all, so this is simply the ordinary no-date shape and it is logged
+    # rather than left silent.
+    if not row.get("mail_date"):
+        app.logger.info(
+            "Retrying rejected inbound row %s with no stored mail date; its "
+            "message id is derived the same way the webhook derived it, so a "
+            "same-subject re-send may share that id", rid,
+        )
+    item = ff_email.parse(row["subject"] or "", row["body"] or "",
+                          received_at=row.get("mail_date") or "")
+    if not item:
+        # Keyed on why the row was captured, not on where this attempt stopped:
+        # a row rejected for its sender is an allowlist problem, and saying only
+        # "still couldn't read this email" would replace the fact the host can
+        # act on with one they can't.
+        inbound_rejects.update_reason(
+            tenant_id, SITE, rid,
+            inbound_rejects.retry_failed_reason(row.get("reason_code", "")),
+        )
+        flash("Still couldn't read that email — it stays on this list.")
+        return redirect(url_for("inbound_rejected"))
+
+    # Claim the row before doing any work. The UPDATE is conditional on the row
+    # still being open, so a double-submit (or two tabs) can't both proceed to
+    # create a deal — the loser sees no rows changed and stops here.
+    if not inbound_rejects.mark_recovered(tenant_id, SITE, rid, item.get("id", "")):
+        flash("That message was already handled.")
+        return redirect(url_for("inbound_rejected"))
+
+    # `inbound.recover`, not `store`: it writes the board first and reports what
+    # it actually did, where `store` records its dedup row first and swallows a
+    # board failure while still returning success. Both of this path's earlier
+    # defects came out of that ordering — a failed recovery told the operator the
+    # lead was safe, and poisoned the dedup so no later retry could ever reach the
+    # board again.
+    #
+    # `already_had_it` matters as much as `on_board`. Re-applying a message that
+    # was ingested earlier is not a harmless no-op: it cancels the deal's queued
+    # follow-up and re-opens drafting, so a second click on a stale row would
+    # queue a second reply to a guest who only wrote once.
+    try:
+        already_had_it, on_board = inbound.recover(tenant_id, item, SITE)
+    except Exception:
+        app.logger.exception("Could not store recovered inbound item")
+        already_had_it, on_board = False, False
+
+    # Hand the row back when the guest didn't reach the board — a message marked
+    # recovered with nothing to show for it is the silent loss this page exists
+    # to end.
+    #
+    # Keyed on why the row was captured, exactly as the parse-failure branch
+    # above is. This attempt stopped somewhere else, but a `sender_not_allowed`
+    # row's actionable fact is still the allowlist, and a hardcoded "try again"
+    # here replaced the one thing the host could do with one they cannot.
+    if not on_board:
+        inbound_rejects.reopen(
+            tenant_id, SITE, rid,
+            inbound_rejects.board_failed_reason(row.get("reason_code", "")),
+        )
+        flash("Read that email, but couldn't open the lead — it stays on this list.")
+        return redirect(url_for("inbound_rejected"))
+
+    # Same follow-through the webhook gives a lead that parsed first time. A
+    # recovered lead is a *late* lead, so it needs the draft more, not less —
+    # and an email-only tenant has no scheduled pass that would pick it up.
+    #
+    # Gated on this attempt having been the one that ingested it, which is the
+    # recovery-path equivalent of the webhook's `is_new`: it drafts a threaded
+    # reply (an existing conversation, so nothing "new" is on screen, but the
+    # guest is waiting on an answer) and stays quiet when the retry found the
+    # item already ingested. A presence test got this backwards and left every
+    # recovered reply undrafted while the identical webhook reply was drafted.
+    # Note this is the full ingest follow-through, so with the scheduler on it
+    # can send, not just draft — which is why the already-ingested case must not
+    # fall through to here.
+    #
+    # A lead gets one more question asked of it. Since `store` keeps its item
+    # through a board failure, `backfill` can put that lead on the board on any
+    # dashboard load — and backfill opens deals without drafting anything. So
+    # "already ingested" stopped implying "already answered", and gating on it
+    # alone left a recovered lead on the board that no path had ever drafted:
+    # the webhook skipped it because the board refused it, and the retry skipped
+    # it because the dedup row had outlived the failure. The response store
+    # answers this directly for a lead, and it is also the safer gate — a second
+    # click cannot double-draft something already drafted.
+    should_draft = not already_had_it or not inbound.already_answered(tenant_id, item, SITE)
+    if should_draft and os.getenv("ANTHROPIC_API_KEY"):
+        try:
+            runner.draft_ingested(tenant_id, SITE, item)
+        except Exception:
+            app.logger.exception("Could not draft recovered inbound item")
+
+    flash("Recovered — %s is on your board." % (item.get("title") or "the lead"))
+    return redirect(url_for("index"))
+
+
+@app.route("/inbound/rejected/<int:rid>/dismiss", methods=["POST"])
+@login_required
+def inbound_rejected_dismiss(rid):
+    """Take a message off the list. The row is kept as a record, not deleted."""
+    tenant_id = current_user.tenant_id
+    _reject_or_404(tenant_id, rid)
+    if inbound_rejects.dismiss(tenant_id, SITE, rid):
+        flash("Dismissed.")
+    else:
+        flash("That message was already handled.")
+    return redirect(url_for("inbound_rejected"))
 
 
 @app.route("/pilot", methods=["POST"])
@@ -606,6 +939,7 @@ def index():
         crypto_ready=crypto.available(),
         board=_board(tenant_id),
         state=_live_state(tenant_id),
+        rejected_count=inbound_rejects.count_open(tenant_id, SITE),
         has_api_key=bool(os.getenv("ANTHROPIC_API_KEY")),
         billing_label=billing.status_label(billing.get_subscription(tenant_id)),
     )
@@ -714,17 +1048,32 @@ def _entry_text(item: dict) -> str:
     return ""
 
 
-def _sent_state(tenant_id: str, item_id: str, response: dict | None) -> str:
+def _sent_state(tenant_id: str, item_id: str, response: dict | None,
+                text: str | None = None) -> str:
     """Why the approve-and-send control must not be offered, or "" if it may be.
 
     Two distinct "already handled" cases, both of which previously still showed
     an enabled Approve & send button over the text that had just gone out:
     a reply that has been delivered, and one that is queued or mid-flight.
+
+    Two callers asking two different questions, so they must hand in two
+    different operands. The renderer asks *"should I offer the button?"* about
+    the draft on screen and passes nothing, so this falls back to the stored
+    draft — the right answer for a page that is showing exactly that text. The
+    send route asks *"may these words go out?"* and must pass `text`, because
+    the words that reach the guest are the ones in the operator's textarea,
+    which the stored draft stops tracking the moment a guest reply produces a
+    fresh one. Reading the draft for both is this ticket's defect: a stale tab
+    replaying delivered text was compared against a draft that had moved on,
+    found different, and released a second copy of a message the guest had.
+
+    This stays a pre-read, and it is not the guarantee — it is the fast, legible
+    refusal in front of one. The guarantee is `outbox._already_sent_terms`, on
+    the write, where a concurrent send cannot slip between the test and the act.
     """
-    msgs = [m for m in outbox.for_tenant(tenant_id, SITE, outbox.IN_FLIGHT)
-            if m["item_id"] == item_id]
-    if msgs:
-        return outbox.STATUS_LABELS.get(msgs[0]["status"], "Sending…")
+    state = outbox.send_state(outbox.rows_by_item(tenant_id, SITE).get(item_id))
+    if state and state["in_flight"]:
+        return state["label"]
     if (response or {}).get("status") == "sent":
         at = (response or {}).get("sent_at") or ""
         return f"Sent{' ' + str(at) if at else ''}."
@@ -737,12 +1086,20 @@ def _sent_state(tenant_id: str, item_id: str, response: dict | None) -> str:
     # whether these exact words have gone out before. Comparing the text rather
     # than merely "has ever sent" is what still lets the thread reopen: a fresh
     # draft for the guest's new question is different text, and is offered.
-    draft = ((response or {}).get("draft") or "").strip()
+    words = ((response or {}).get("draft") if text is None else text) or ""
+    words = words.strip()
     delivered = [b.strip() for b in outbox.sent_bodies(tenant_id, SITE, item_id)]
-    if delivered and (not draft or draft in set(delivered)):
-        # Either these exact words already went out, or a reply went out and
-        # there is no new draft to put in its place (a failed re-draft clears
-        # it). Neither is something to offer a send button for.
+    if delivered and words and words in set(delivered):
+        # These exact words already went out. Worded through the same constant
+        # the write-side refusal uses, so the route cannot answer one fact two
+        # ways depending on which of its guards happened to fire first.
+        return outbox.ALREADY_SENT_LABEL
+    if delivered and not words:
+        # A reply went out and there is no new draft to put in its place (a
+        # failed re-draft clears it) — nothing to offer a send button *for*.
+        # Only the renderer can reach this: the send route rejects empty text
+        # before it gets here, and having been handed words explicitly, an empty
+        # stored draft says nothing about whether they may go out.
         return "Sent."
     return ""
 
@@ -882,6 +1239,60 @@ def _own_message_or_404(tenant_id: str, msg_id: int) -> dict:
     return msg
 
 
+def _send_refusal(tenant_id: str, item_id: str, body: str | None, *,
+                  exclude_id: int | None = None) -> str:
+    """Why a release the write already refused was refused — in the one place.
+
+    Every operator-initiated send path carries the same two guards, so it must
+    carry the same two explanations; the send button reaching for its own
+    sentence is how a body-duplicate refusal came to announce that "another send
+    for this guest was already under way" when nothing was under way at all —
+    the send had finished, which is precisely why the replay got this far.
+
+    Order is deliberate. An in-flight blocker is named first because it is the
+    one the operator can act on: it is rendered on the board with a working
+    "Don't send", so naming it points at the way out. A duplicate has no such
+    escape and saying so is the whole of the answer.
+    """
+    blocker = outbox.in_flight_for_item(tenant_id, SITE, item_id,
+                                        exclude_id=exclude_id)
+    if blocker:
+        return outbox.row_label(blocker)
+    if body and outbox.body_already_sent(tenant_id, SITE, item_id, body,
+                                         exclude_id=exclude_id):
+        return outbox.ALREADY_SENT_LABEL
+    # Refused, yet nothing explains it any more — the blocking row settled
+    # between the write and this read. Don't invent a reason; say what is true.
+    return "Another send for this guest was already under way."
+
+
+def _release_refusal(tenant_id: str, msg: dict | None, msg_id: int,
+                     from_statuses: tuple, body: str | None = None) -> str:
+    """Word a refusal `outbox.release_to_send` has already decided.
+
+    Read *after* the write refused, never before it: this is the explanation,
+    not the guard. Deciding from a read like this one is exactly the race the
+    CAS closes, and a second copy of the rule here would drift from it.
+
+    Worded through `outbox.row_label`, not `STATUS_LABELS`. The raw mapping has
+    no deferred branch, so for one row the card said "Scheduled to send" while
+    clicking its sibling popped `already "Queued to send…"` — the same row named
+    two ways on two surfaces, which is this ticket's own defect one layer up.
+    The refusal is still decided by the write; only the wording is shared.
+
+    `body` is the text this release would have delivered — the edited text where
+    the caller supplied one, otherwise None, meaning the row's own. It mirrors
+    the `COALESCE` in the guard, so the sentence resolves the same comparand the
+    UPDATE did rather than a second guess at it.
+    """
+    if not msg:
+        return "That message is no longer there."
+    if msg["status"] not in from_statuses:
+        return outbox.row_label(msg)
+    return _send_refusal(tenant_id, msg["item_id"], body or msg.get("body"),
+                         exclude_id=msg_id)
+
+
 @app.route("/outbox/<int:msg_id>/approve", methods=["POST"])
 @login_required
 def outbox_approve(msg_id):
@@ -892,13 +1303,23 @@ def outbox_approve(msg_id):
     # actually posts to — this is the primary approval surface, and it had none.
     # A sent message re-approved here went back on the queue and was delivered a
     # second time.
-    if msg["status"] not in outbox.APPROVABLE:
-        return jsonify({
-            "ok": False, "already": True,
-            "error": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
-        }), 409
     (text,) = _form("text")
-    outbox.approve(msg_id, (text or "").strip() or None)
+    # One statement decides and writes. Both refusals this answers 409 for used
+    # to be reads taken before the write: the row's own status (a sent row
+    # re-approved goes back on the queue and is delivered twice), and a
+    # *different* row of the same guest already going out (two rows per item is
+    # ordinary, not exotic — releasing the quiet one puts a second message into
+    # a thread mid-delivery). Read-then-write let two concurrent approves both
+    # answer 200 with two rows in flight; the guards are now WHERE terms on the
+    # UPDATE, so exactly one call can win. See `outbox.release_to_send`.
+    body = (text or "").strip() or None
+    released, msg = outbox.release_to_send(
+        msg_id, from_statuses=outbox.APPROVABLE, body=body)
+    if not released:
+        return jsonify({"ok": False, "already": True,
+                        "error": _release_refusal(
+                            tenant_id, msg, msg_id, outbox.APPROVABLE,
+                            body=body)}), 409
     automation.start_drainer(SITE)  # deliver in the background; don't block the click
     return jsonify({"ok": True, "counts": outbox.counts(tenant_id, SITE)})
 
@@ -919,7 +1340,18 @@ def outbox_cancel(msg_id):
             "ok": False, "already": True,
             "error": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
         }), 409
-    outbox.cancel(msg_id)
+    # The check above is the common case; this one is the race. A drainer can
+    # claim the row between that read and this write, and `cancel` refuses when
+    # it does — so the answer has to come from what was actually written, not
+    # from the earlier read. Reporting `ok` unconditionally is how a message the
+    # operator called off still reached the guest, under a green toast.
+    row = outbox.cancel(msg_id)
+    if not row or row["status"] != outbox.CANCELED:
+        status = (row or {}).get("status")
+        return jsonify({
+            "ok": False, "already": True,
+            "error": outbox.STATUS_LABELS.get(status, status),
+        }), 409
     return jsonify({"ok": True, "counts": outbox.counts(tenant_id, SITE)})
 
 
@@ -1003,21 +1435,20 @@ def autopilot_toggle():
         # worker runs the schedule; the in-process thread is only the execution
         # engine for single-host deploys. Refusing the toggle here would have
         # made autopilot unreachable on the deployment it is documented for.
-        in_process = _can_deliver_in_process()
-        if in_process:
+        #
+        # The message names who will honour the setting and stops there. It
+        # deliberately does not claim the worker is *up*: `jobs.worker_online()`
+        # tracks the scrape-job worker, not whatever drains the outbox, so a
+        # liveness claim read off it would be wrong in both directions. VEN-240
+        # owns surfacing "nothing can send" once a beacon exists that means it.
+        if _can_deliver_in_process():
             automation.start_scheduler(SITE)
             flash(f"Autopilot is on — checking {scheduler.next_run(tenant_id)} "
                   "and replying to good-fit leads automatically.")
-        elif jobs.worker_online():
+        else:
             flash(f"Autopilot is on — checking {scheduler.next_run(tenant_id)} "
                   "and replying to good-fit leads automatically. Checks run on "
                   "the worker service for this deployment.")
-        else:
-            # Saved, but nothing is running to act on it. Say so plainly rather
-            # than reporting a schedule that no process will ever honour.
-            flash("Autopilot is on, but no worker service is currently running "
-                  "— this host cannot run checks itself, so nothing will be "
-                  "checked or sent until the worker is back.")
     else:
         flash("Autopilot is off. Checks and replies are manual again.")
     return redirect(url_for("automations"))
@@ -1044,7 +1475,10 @@ def refresh():
     tenant_id = current_user.tenant_id
     if check_leads.playwright_available() and not _use_worker_queue():
         # Browser is available here: run the scrape in-process (local/worker host).
-        return jsonify(runner.start_scrape(tenant_id))
+        # Not routed through `_live_state`: when a run is already active for this
+        # same tenant, `start_scrape` returns the live `_state` directly, so a
+        # refresh during an in-flight send would echo that send's token.
+        return jsonify(runner.without_run_token(runner.start_scrape(tenant_id)))
     # Serverless (Vercel): can't run Playwright in-process. Enqueue a job for the
     # off-Vercel worker that shares this DB, and report the worker-backed state.
     jobs.enqueue(tenant_id)
@@ -1116,11 +1550,28 @@ def responder_send():
     # Hiding the button is not a guard: a double-click, a stale tab or a
     # back-button replay all re-POST this, and every one of them used to put a
     # second copy of the same message in front of the guest.
+    # Ask about the text being *posted*, not the one in storage. They are the
+    # same string right up until a guest reply swaps the draft out, and that is
+    # exactly when the stale tab this guards against still holds the old one.
     blocked = _sent_state(tenant_id, item_id,
-                          storage.get_responses(tenant_id, SITE).get(item_id))
+                          storage.get_responses(tenant_id, SITE).get(item_id),
+                          text=text.strip())
     if blocked:
         return jsonify({"ok": False, "already": True, "error": blocked}), 409
     msg = automation.enqueue_send(tenant_id, SITE, item_id, text.strip())
+    if msg is None:
+        # The guard above is a read, so it cannot see a send that started
+        # between it and the insert — two clicks both passed it and both queued.
+        # `enqueue_send` now refuses at the write, and this is that refusal:
+        # same 409 as the pre-read, because to the operator it is the same fact.
+        # Worded through `_send_refusal`, like every other release path — this
+        # route carries the same refusal twice, and answering it here on its own
+        # meant a duplicate got explained as a send still under way, about a
+        # send that had already finished.
+        return jsonify({
+            "ok": False, "already": True,
+            "error": _send_refusal(tenant_id, item_id, text.strip()),
+        }), 409
     return jsonify({
         "ok": True,
         "queued": True,
@@ -1135,14 +1586,16 @@ def api_send_states():
     """Per-item delivery state, polled by the cards after a send is queued."""
     tenant_id = current_user.tenant_id
     states = {}
-    for item_id, msg in outbox.latest_by_item(tenant_id, SITE).items():
-        states[item_id] = {
-            "status": msg["status"],
-            "label": outbox.STATUS_LABELS.get(msg["status"], msg["status"]),
-            "error": msg.get("error"),
-            "step": msg.get("step_label"),
-            "in_flight": msg["status"] in outbox.IN_FLIGHT,
-        }
+    # Same rule as the server-rendered card and `_sent_state`. Keyed off the
+    # newest row this used to disagree with both: it reported an item idle
+    # while an older row of its own was still in flight, and the page cannot
+    # recover from that — it re-enables the button on what the poll tells it.
+    for item_id, rows in outbox.rows_by_item(tenant_id, SITE).items():
+        state = outbox.send_state(rows)
+        if state:
+            states[item_id] = {
+                k: state[k] for k in ("status", "label", "error", "step", "in_flight")
+            }
     return jsonify(states)
 
 
@@ -1154,7 +1607,17 @@ def outbox_retry(msg_id):
     msg = _own_message_or_404(tenant_id, msg_id)
     if msg["status"] != outbox.FAILED:
         return jsonify({"ok": False, "error": "only failed messages can be retried"}), 400
-    outbox.set_status(msg_id, outbox.QUEUED, error="")
+    # Retrying is releasing a message to a guest, so it takes the same guard as
+    # the approve buttons. It had none: a failed row was re-queued while a
+    # *sibling* row for the same guest was still `sending`, answering 200 with
+    # two messages in flight. The per-route guard next door did not reach here —
+    # which is why the check now lives on the write itself.
+    released, msg = outbox.release_to_send(
+        msg_id, from_statuses=(outbox.FAILED,), error="")
+    if not released:
+        return jsonify({"ok": False, "already": True,
+                        "error": _release_refusal(
+                            tenant_id, msg, msg_id, (outbox.FAILED,))}), 409
     automation.start_drainer(SITE)
     return jsonify({"ok": True})
 
@@ -1322,6 +1785,16 @@ def _settings_context(tenant_id: str, settings: dict, units: list[dict] | None =
         "ingest_mode": config.ingest_mode(tenant_id),
         "inbound_address": inbound.address_for(tenant_id),
         "inbound_ready": inbound.configured(),
+        # Shown even when zero: "nothing was lost" is the answer the host
+        # actually wants, and they can only trust it if it's stated.
+        "rejected_open": inbound_rejects.count_open(tenant_id, SITE),
+        "rejected_total": inbound_rejects.count_all(tenant_id, SITE),
+        # Capacity pressure. At the ceiling the queue starts turning new
+        # unreadable emails away rather than deleting ones it already holds,
+        # and the host is the only person who can clear it — so they have to be
+        # told here, not only in a server log they will never read.
+        "rejected_unreviewed": inbound_rejects.count_unreviewed(tenant_id, SITE),
+        "rejected_ceiling": inbound_rejects.MAX_UNREVIEWED,
     }
 
 

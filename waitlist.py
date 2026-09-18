@@ -9,8 +9,7 @@ from datetime import datetime
 import db
 
 
-def _conn() -> db.Conn:
-    c = db.connect()
+def _ddl(c) -> None:
     c.execute(
         """CREATE TABLE IF NOT EXISTS waitlist (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -20,7 +19,10 @@ def _conn() -> db.Conn:
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )"""
     )
-    return c
+
+
+def _conn() -> db.Conn:
+    return db.open_with_schema("waitlist", _ddl)
 
 
 def add(email: str, market: str = "", units: str = "") -> None:

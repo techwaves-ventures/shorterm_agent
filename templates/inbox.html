@@ -147,7 +147,7 @@
               <span>{{ r.stage_label }}</span>
               {% if r.deal.check_in %}<span>Check-in {{ r.deal.check_in }}</span>{% endif %}
               {% if r.deal.unit_id %}<span>{{ r.deal.unit_id }}</span>{% endif %}
-              {% if r.deal.next_action_at %}<span>Next step {{ r.deal.next_action_at[:10] }}</span>{% endif %}
+              {% if r.deal.next_action_at %}<span>Next step {{ r.deal.next_action_at|sched_local('%Y-%m-%d') }}</span>{% endif %}
             </div>
           </div>
           <div class="row__side">

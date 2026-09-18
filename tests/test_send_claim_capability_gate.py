@@ -61,10 +61,32 @@ def tenant(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_drainer_leaks():
-    """`_draining` is module global. A test that legitimately starts a drainer
+def _only_this_gate_answers(monkeypatch):
+    """Two fixtures' worth of setup, because both hazards are the same hazard:
+    something other than the gate under test deciding the outcome.
+
+    `_draining` is a module global. A test that legitimately starts a drainer
     would otherwise make the *next* test's `start_drainer` return False for the
-    wrong reason — idempotency, not the gate — and quietly pass."""
+    wrong reason — idempotency, not the gate — and quietly pass.
+
+    `DISABLE_BACKGROUND_AGENTS` is the same failure from outside the file.
+    `tests/conftest.py` sets it suite-wide (VEN-162, keeping daemon threads out
+    of the test process), and `start_drainer` refuses on *either* gate. So with
+    the conftest default in force every "incapable host claims nothing"
+    assertion here passes whether or not this ticket's fix exists at all —
+    measured, not theorised: deleting the capability gate from `start_drainer`
+    left the whole suite byte-identical. Re-enabling background agents for this
+    file makes the capability gate the only thing that can answer, which is the
+    only way these tests test anything.
+
+    Turning it back on is safe here because no test in this file leaves a live
+    thread behind: every one but `test_a_capable_process_still_starts_one` runs
+    with the gate closed, and that one stubs `_drain_loop` and joins.
+    """
+    monkeypatch.setenv("DISABLE_BACKGROUND_AGENTS", "0")
+    assert automation.background_agents_enabled() is True, (
+        "the sibling gate is still closed, so `start_drainer` would refuse "
+        "without ever consulting the capability gate these tests exist to pin")
     automation._draining = False
     yield
     automation._draining = False
@@ -117,6 +139,11 @@ def test_a_capable_process_still_starts_one(tenant, monkeypatch):
     monkeypatch.setattr(automation, "_drain_loop", lambda site: None)
     assert automation.can_deliver_in_process() is True
     assert automation.start_drainer(SITE) is True
+    for t in _drainer_threads():
+        t.join(timeout=5)
+    assert not [t for t in _drainer_threads() if t.is_alive()], (
+        "the stubbed drainer thread outlived its test and would keep opening "
+        "connections to whichever temp database the next test installs")
 
 
 def test_responder_send_does_not_claim_the_row(tenant, incapable):
@@ -186,89 +213,32 @@ def test_queued_is_a_recoverable_resting_state(tenant):
 
 
 # ---------------------------------------------------------------------------
-# Q1: the misconfiguration must stay visible
+# The render path
 # ---------------------------------------------------------------------------
 
 
-def test_no_capable_sender_fires_when_nothing_can_send(tenant, incapable,
-                                                       monkeypatch):
-    """Operator decision Q1 (`visible_surface`): gating made a broken deploy
-    quiet. Before the gate an approved message failed fast and said so; after
-    it the row correctly stays `queued` and the card says "Queued to send…"
-    forever. `queued` is the right state; silence about it is not."""
-    import dashboard
-    import jobs
+def test_the_board_render_does_not_claim_queued_rows(tenant, incapable,
+                                                     monkeypatch):
+    """Driven through `_board`, because the self-heal on view is a call site.
 
-    monkeypatch.setattr(jobs, "worker_online", lambda: False)
-    assert dashboard._no_capable_sender(queued=1) is True
-
-
-def test_no_capable_sender_is_silent_when_a_worker_is_alive(tenant, incapable,
-                                                            monkeypatch):
-    """A healthy worker-queue deployment is the *normal* case for an incapable
-    web process. If the banner fired there it would be permanent wallpaper and
-    would stop meaning anything."""
-    import dashboard
-    import jobs
-
-    monkeypatch.setattr(jobs, "worker_online", lambda: True)
-    assert dashboard._no_capable_sender(queued=1) is False
-
-
-def test_no_capable_sender_is_silent_with_nothing_queued(tenant, incapable,
-                                                         monkeypatch):
-    import dashboard
-    import jobs
-
-    monkeypatch.setattr(jobs, "worker_online", lambda: False)
-    assert dashboard._no_capable_sender(queued=0) is False
-
-
-def test_no_capable_sender_is_silent_on_a_capable_host(tenant, monkeypatch):
-    import dashboard
-    import jobs
-
-    monkeypatch.delenv("FORCE_WORKER_QUEUE", raising=False)
-    monkeypatch.setattr(jobs, "worker_online", lambda: False)
-    assert dashboard._no_capable_sender(queued=5) is False, (
-        "a single-host install with no separate worker is not misconfigured — "
-        "it delivers in-process, and must never see this banner")
-
-
-def test_the_banner_never_breaks_the_render(tenant, incapable, monkeypatch):
-    """A liveness lookup is a DB read and can fail. It must not take the
-    dashboard down with it."""
-    import dashboard
-    import jobs
-
-    def boom():
-        raise RuntimeError("worker table unavailable")
-
-    monkeypatch.setattr(jobs, "worker_online", boom)
-    with dashboard.app.test_request_context():
-        assert dashboard._no_capable_sender(queued=1) is False
-
-
-def test_board_reports_the_stall_to_the_template(tenant, incapable, monkeypatch):
-    """Driven through `_board`, because a helper nobody calls is not a surface.
-
-    This is the assertion that would have caught the banner being computed and
-    then dropped on the floor before reaching the template context.
+    `_board` reclaims stranded rows and then starts a drainer if anything is
+    waiting, on every dashboard render. It is the one call site that fires
+    without anybody clicking anything, so on a serverless host it is also the
+    most frequent — an ungated one would re-claim a row the operator just got
+    back roughly as fast as they could reload the page.
     """
     import dashboard
-    import jobs
 
-    monkeypatch.setattr(jobs, "worker_online", lambda: False)
     _deal(tenant)
-    automation.enqueue_send(tenant, SITE, "s1", "Hi there!")
+    msg = automation.enqueue_send(tenant, SITE, "s1", "Hi there!")
 
     with dashboard.app.test_request_context():
         board = dashboard._board(tenant)
 
     assert board["outbox_counts"]["queued"] == 1
-    assert board["no_capable_sender"] is True, (
-        "the dashboard renders a queued message with no process alive to send "
-        "it and says nothing about it")
+    assert outbox.get(msg["id"])["status"] == outbox.QUEUED, (
+        "rendering the board claimed a row this host cannot deliver")
+    assert not _drainer_threads()
 
 
 # ---------------------------------------------------------------------------
@@ -295,3 +265,98 @@ def test_autopilot_stays_reachable_through_the_shared_db(tenant, incapable):
         "the autopilot setting did not survive the write, so worker.py cannot "
         "see it and gating the in-process scheduler really would disable the "
         "feature")
+
+
+@pytest.fixture()
+def web_client(tmp_path, monkeypatch):
+    """A logged-in client for the one route that has to be driven end to end.
+
+    The toggle's behaviour is split across a gate, a settings write and two
+    different flash messages, and only the route composes them. Asserting on
+    the helpers would have let the route keep the gate and lose the write, or
+    keep both and still tell the operator the wrong thing.
+    """
+    import dashboard
+    import db
+    import ff_account
+    import models
+
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "ven149web.db")
+    monkeypatch.setattr(pipeline, "_TS_NORMALIZED", False, raising=False)
+    monkeypatch.setenv("INSECURE_COOKIES", "1")
+
+    email, password = "ven149-host@example.com", "a-perfectly-fine-passphrase"
+    user = models.create_user(email, password)
+    tid = str(user.tenant_id)
+    config.save_settings(tid, host_name="Test Host", timezone="America/New_York",
+                         onboarded="1")
+    # `autopilot_toggle` is `@scrape_allowed`; without a connected account the
+    # route 302s to the connect page and never reaches the gate.
+    ff_account.connect(tid, "ff@example.com")
+    ff_account.mark_state(tid, "connected")
+
+    dashboard.app.config["TESTING"] = True
+    dashboard.app.config["WTF_CSRF_ENABLED"] = False
+    c = dashboard.app.test_client()
+    resp = c.post("/login", data={"email": email, "password": password})
+    assert resp.status_code == 302, f"login did not authenticate: {resp.status_code}"
+    return c, tid
+
+
+def _scheduler_threads():
+    return [t for t in threading.enumerate() if t.name == "autopilot-scheduler"]
+
+
+def test_the_toggle_saves_the_setting_without_starting_a_local_scheduler(
+        web_client, incapable):
+    """`start_scheduler` in `autopilot_toggle` is the sixth call site, and the
+    one the central gate in `start_drainer` does not cover.
+
+    It matters because of what the thread does, not because of the thread: the
+    scheduler loop calls `start_drainer` every 60s for the life of the process,
+    so before this an incapable host that had autopilot switched on tried to
+    claim rows on a timer, forever — where boot (`_start_background_agents`)
+    had always declined to start that same thread on that same host.
+
+    Both halves are asserted, because dropping either is a live failure mode:
+    the write must survive (it is what `worker.py` reads), and no thread may
+    start (it is what the ticket is about).
+    """
+    import scheduler
+
+    client, tid = web_client
+    before = len(_scheduler_threads())
+
+    resp = client.post("/autopilot", data={"autopilot": "1",
+                                           "check_times": "09:00,16:00"})
+
+    assert resp.status_code == 302
+    assert scheduler.is_on(tid) is True, (
+        "gating the scheduler swallowed the setting, so worker.py will never "
+        "run the schedule either — the feature really is off")
+    assert len(_scheduler_threads()) == before, (
+        "an incapable host started the autopilot scheduler; that thread calls "
+        "start_drainer every 60s for the life of the process")
+
+
+def test_the_toggle_tells_an_incapable_host_who_will_run_the_checks(
+        web_client, incapable):
+    """Operator intent, minus the claim we cannot support.
+
+    The flash names the worker service as the thing that honours the schedule.
+    It deliberately does not say whether that service is *up*: the only
+    liveness signal available is `jobs.worker_online()`, which tracks the
+    scrape-job worker rather than anything that drains the outbox, so a
+    liveness claim read off it would be wrong in both directions (VEN-240).
+    """
+    client, _tid = web_client
+
+    resp = client.post("/autopilot", data={"autopilot": "1",
+                                           "check_times": "09:00,16:00"},
+                       follow_redirects=True)
+    body = resp.get_data(as_text=True)
+
+    assert "Autopilot is on" in body
+    assert "worker service for this deployment" in body, (
+        "the operator gets the single-host wording on a host that will not run "
+        "a single check itself")

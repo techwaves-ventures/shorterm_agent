@@ -16,6 +16,7 @@ drained separately (see `send_next`) because platform replies drive real Chrome
 one at a time.
 """
 import logging
+import os
 import threading
 import time
 
@@ -25,6 +26,7 @@ import pipeline
 import responder
 import sequences
 import storage
+import timeframe
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +95,9 @@ def start_prearrival(tenant_id: str, site: str, item_id: str,
 
 
 def _due(deal: dict, now_iso: str) -> bool:
+    """Has the deal's next step come due? Both sides must be in the schedule
+    frame (see `timeframe`) — this is a text compare, so a mismatched frame is
+    silently off by the offset rather than an error."""
     when = deal.get("next_action_at")
     return bool(when) and str(when) <= now_iso
 
@@ -104,9 +109,10 @@ def run_due(tenant_id: str, site: str, limit: int = 25) -> dict:
     message lands in the outbox as `queued` (auto-send armed and permitted) or
     `pending_approval` (everything else).
     """
-    from datetime import datetime
-
-    now_iso = datetime.now().isoformat(timespec="seconds")
+    # Absolute, not host-local: this gates `next_action_at` (written by whichever
+    # host last advanced the deal) and is also what the retry path writes back
+    # via `_plus_hour`, so a local reading would drift the schedule every pass.
+    now_iso = timeframe.now()
     auto = settings_for(tenant_id)
     units = config.get_units(tenant_id)
     summary = {"drafted": 0, "auto_queued": 0, "skipped": 0, "errors": 0}
@@ -198,6 +204,15 @@ def _plus_hour(now_iso: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Both failure branches in `send_next` can land on a message that really did
+# reach the guest — the runner drives a browser, and it fails *after* the reply
+# box as readily as before it. The card renders a primary "Retry send" beside
+# whatever error is stored, so the text is the only thing standing between an
+# operator and a second copy of the same message. Same register as the
+# abandoned-send wording in `outbox`, from one constant so the two can't drift.
+MAY_HAVE_REACHED_GUEST = "may already have reached the guest; check before retrying"
+
+
 def send_next(tenant_id: str, site: str, timeout: int = 300) -> dict | None:
     """Deliver the oldest queued message via the existing reply path.
 
@@ -215,7 +230,14 @@ def send_next(tenant_id: str, site: str, timeout: int = 300) -> dict | None:
         outbox.set_status(msg["id"], outbox.FAILED, error="stored item not found")
         return msg
     # Claim it before dispatching so a second drainer can't pick up the same row.
-    outbox.set_status(msg["id"], outbox.SENDING)
+    # The claim has to be a compare-and-set for that sentence to be true:
+    # `next_queued` is a separate read, so two drainers can both see `queued`,
+    # and an unguarded write would let both dispatch. It would also silently
+    # re-claim a row the operator cancelled in the gap. Losing the CAS means
+    # someone else owns this row now — leave it alone.
+    if not outbox.set_status(msg["id"], outbox.SENDING,
+                             only_from=(outbox.QUEUED,)):
+        return None
     state = runner.send_reply(tenant_id, site, item, msg["body"])
     # A busy runner means another run owns the browser; put it back and retry
     # later. Nothing was dispatched, so the claim's attempt is refunded — see
@@ -227,25 +249,70 @@ def send_next(tenant_id: str, site: str, timeout: int = 300) -> dict | None:
     # send_reply dispatches to a background thread and returns immediately, so
     # its return value says nothing about delivery. Wait for the run to reach a
     # terminal state before recording an outcome — otherwise a failed send is
-    # stored as `sent` and the follow-up cadence advances on a message the guest
-    # never received.
+    # stored as `sent`, and the operator is never offered the retry that would
+    # have got the message to the guest.
+    #
+    # This loop records the row's *outcome*; it does not advance the deal. The
+    # worker does that, at the moment the reply actually lands — see
+    # `runner._send_worker`. Doing both here fired `after_contact` twice per
+    # delivered send (once from inside the worker, once here), and it is not
+    # idempotent, so the deal jumped two steps and the guest was never sent
+    # Followup 1.
+    #
+    # "The run" has to mean *this* dispatch. `runner._state` is one
+    # process-global slot, so a not-running snapshot only ever proved that the
+    # run which last touched that slot had finished. When this send's own
+    # terminal state was overwritten before a 2-second poll saw it — by a
+    # scrape, or by the next drained message — the loop read the replacement's
+    # outcome as this row's, and a send that failed was recorded `sent`. The
+    # token `send_reply` handed back is what distinguishes them.
+    run_token = state.get("run_token")
+    if not run_token:
+        # Accepted-looking, but with no way to tell this run's outcome from
+        # anyone else's. Fail closed: a wrongly-failed row is retried, while a
+        # wrongly-sent one silently strands the guest and advances the cadence
+        # past them.
+        error = ("could not correlate the send run; delivery outcome unknown — "
+                 f"{MAY_HAVE_REACHED_GUEST}")
+        outbox.set_status(msg["id"], outbox.FAILED, error=error)
+        _notify_failure(msg, error)
+        return msg
+
     deadline = time.time() + timeout
     while time.time() < deadline:
-        snapshot = runner.get_state(tenant_id)
-        if not snapshot.get("running"):
-            if snapshot.get("status") == "error":
-                error = snapshot.get("message") or "send failed"
+        # This run's own recorded outcome first, the live slot only as a
+        # fallback. The token stopped this loop adopting someone else's
+        # outcome; it could not give this run back its own, because the slot it
+        # was published to is global and the next run overwrites it. A scrape
+        # claiming the runner inside this two-second gap left a genuinely
+        # delivered send recorded `failed`. The record is keyed by this
+        # dispatch's token, so by construction it can only ever answer with
+        # this run's own outcome — the acceptance rule below is unchanged.
+        outcome = runner.take_send_outcome(run_token, tenant_id)
+        if outcome is None:
+            snapshot = runner.get_state(tenant_id)
+            # All three conditions, not just `not running`. A mismatched or
+            # absent token belongs to someone else's run; an implicit status
+            # like `idle` or `busy` is not an outcome this send ever reported.
+            if (snapshot.get("run_token") == run_token
+                    and not snapshot.get("running")
+                    and snapshot.get("status") in ("done", "error")):
+                outcome = snapshot
+        if outcome is not None:
+            if outcome.get("status") == "error":
+                error = outcome.get("message") or "send failed"
                 outbox.set_status(msg["id"], outbox.FAILED, error=error)
                 _notify_failure(msg, error)
             else:
                 outbox.set_status(msg["id"], outbox.SENT)
-                after_contact(tenant_id, site, msg["item_id"])
             return msg
         time.sleep(2)
 
-    outbox.set_status(msg["id"], outbox.FAILED,
-                      error="timed out waiting for the send to finish")
-    _notify_failure(msg, "the send timed out")
+    # Still not finished. Honest as a timeout — but a worker running past the
+    # deadline may be running past it *inside* the reply it already delivered.
+    error = f"timed out waiting for the send to finish — {MAY_HAVE_REACHED_GUEST}"
+    outbox.set_status(msg["id"], outbox.FAILED, error=error)
+    _notify_failure(msg, f"the send timed out — {MAY_HAVE_REACHED_GUEST}")
     return msg
 
 
@@ -264,6 +331,37 @@ def _notify_failure(msg: dict, reason: str) -> None:
         )
     except Exception:
         log.exception("Could not send failure notification")
+
+
+# ---------------------------------------------------------------------------
+# Long-lived background threads
+# ---------------------------------------------------------------------------
+
+
+def background_agents_enabled() -> bool:
+    """Whether this process may spawn the long-lived background threads.
+
+    Consulted at the two spawn points below rather than at their callers: both
+    are reachable from several places (`start_drainer` from six, including three
+    request routes), so gating a caller only moves the leak to the next one.
+
+    Default **on**, opt out with DISABLE_BACKGROUND_AGENTS=1. Every hosted
+    entrypoint (`Procfile`, `render.yaml`, `Dockerfile`) starts the app by
+    *importing* `dashboard`, so making the start explicit instead — the obvious
+    alternative — would leave autopilot silently dead on every deploy that kept
+    importing the module. The comment above `dashboard._start_background_agents()`
+    records that exact failure happening once already. A default whose breakage
+    is silent in production and invisible in CI is the wrong default even when
+    it is the cleaner design; this direction makes a mis-set gate show up as a
+    flaking suite, which tests can catch.
+
+    The test suite opts out (`tests/conftest.py`): a daemon thread outlives the
+    test that spawned it and keeps opening connections to whichever temp
+    database is current, which made unrelated tests fail sporadically (VEN-162).
+    """
+    return os.getenv("DISABLE_BACKGROUND_AGENTS", "").strip().lower() not in (
+        "1", "true", "yes",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -329,7 +427,13 @@ def start_drainer(site: str) -> bool:
     it up on its next pass, where `sending` is neither.
     """
     global _draining
-    if not can_deliver_in_process():
+    # Two independent reasons to refuse, both checked before the latch, never
+    # after: a refused call must not leave `_draining` set, or the first
+    # permitted call would find itself suppressed. They are not redundant —
+    # `background_agents_enabled` asks whether this process may spawn
+    # background threads at all (VEN-162), `can_deliver_in_process` asks
+    # whether it could finish the send it would be claiming.
+    if not background_agents_enabled() or not can_deliver_in_process():
         return False
     with _drain_lock:
         if _draining:
@@ -412,6 +516,9 @@ def start_scheduler(site: str = "furnishedfinder") -> bool:
     Idempotent — only one scheduler thread per process.
     """
     global _scheduling
+    # Before the latch, for the same reason as in `start_drainer`.
+    if not background_agents_enabled():
+        return False
     with _sched_lock:
         if _scheduling:
             return False
@@ -464,7 +571,23 @@ def enqueue_send(tenant_id: str, site: str, item_id: str, body: str,
         step_id=step_id, step_label=step_label, body=body,
         auto=True,  # the human just approved it by clicking send
         reason="Approved by you",
+        # Returns None rather than stacking a second message onto a delivery
+        # already under way. The caller's own "is anything in flight?" read
+        # cannot carry that weight: two clicks both read "nothing" before either
+        # inserted, and both inserted. Same rule as `outbox.release_to_send`,
+        # insert-shaped instead of update-shaped.
+        unless_in_flight=True,
+        # And nothing rather than words this guest already has. The flag above
+        # only sees a delivery still under way, so it is blind to a replay that
+        # arrives once the first send has settled: a stale tab re-POSTs the text
+        # it was opened with, and the caller's pre-read compares that against a
+        # stored draft which has since moved on. Same rule, different axis — not
+        # "two at once" but "the same words twice". See
+        # `outbox._already_sent_terms`.
+        unless_body_sent=True,
     )
+    if msg is None:
+        return None
     start_drainer(site)
     return msg
 

@@ -120,7 +120,7 @@ def login():
     payload, error = _auth.verify()
     if error:
         return error
-    state = runner.start_scrape(_tenant(payload))
+    state = runner.without_run_token(runner.start_scrape(_tenant(payload)))
     return jsonify({"ok": True, "state": state})
 
 
@@ -129,7 +129,7 @@ def state():
     payload, error = _auth.verify()
     if error:
         return error
-    return jsonify({"ok": True, "state": runner.get_state(_tenant(payload))})
+    return jsonify({"ok": True, "state": runner.public_state(_tenant(payload))})
 
 
 @app.post("/v1/otp")
@@ -144,7 +144,7 @@ def otp():
     if not isinstance(code, str):
         return _json_error(400, "code must be a string")
     ok = runner.submit_otp(tenant_id, code)
-    return jsonify({"ok": ok, "state": runner.get_state(tenant_id)})
+    return jsonify({"ok": ok, "state": runner.public_state(tenant_id)})
 
 
 @app.post("/v1/leads")
@@ -182,7 +182,9 @@ def reply():
     item = _item_by_id(tenant_id, item_id)
     if not item:
         return _json_error(404, "item not found")
-    state = runner.send_reply(tenant_id, SITE, item, text)
+    # The token this dispatch minted stays in-process: it correlates a poll
+    # against this process's own slot and means nothing to a remote caller.
+    state = runner.without_run_token(runner.send_reply(tenant_id, SITE, item, text))
     return jsonify({"ok": True, "state": state})
 
 

@@ -120,8 +120,7 @@ def ingest_mode(tenant_id: str) -> str:
     return INGEST_BROWSER if value == INGEST_BROWSER else INGEST_EMAIL
 
 
-def _conn() -> db.Conn:
-    c = db.connect()
+def _ddl(c) -> None:
     c.execute(
         """CREATE TABLE IF NOT EXISTS tenant_settings (
             tenant_id TEXT PRIMARY KEY,
@@ -140,7 +139,10 @@ def _conn() -> db.Conn:
     for col, decl in _ADDED_COLUMNS.items():
         if col not in have:
             c.execute(f"ALTER TABLE tenant_settings ADD COLUMN {col} {decl}")
-    return c
+
+
+def _conn() -> db.Conn:
+    return db.open_with_schema("config", _ddl)
 
 
 def _defaults(tenant_id: str) -> dict:

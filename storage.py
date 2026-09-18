@@ -14,8 +14,7 @@ import db
 from db import DB_PATH  # re-exported for backward-compatible imports
 
 
-def _conn():
-    c = db.connect()
+def _ddl(c) -> None:
     # Schemas below are the CURRENT (multi-tenant) shape — tenant_id is part of
     # the primary key. Fresh databases get this directly; pre-existing
     # single-user databases are migrated by _migrate_tenant_id() below.
@@ -56,8 +55,14 @@ def _conn():
     for col, decl in (("tenant_email", "TEXT"), ("emailed_at", "TIMESTAMP")):
         if col not in have:
             c.execute(f"ALTER TABLE responses ADD COLUMN {col} {decl}")
+    # A destructive rebuild (CREATE/INSERT SELECT/DROP/RENAME), not idempotent
+    # DDL. It stays inside the schema step so it runs under the advisory lock
+    # and commits before any caller statement — never concurrently with one.
     _migrate_tenant_id(c)
-    return c
+
+
+def _conn():
+    return db.open_with_schema("storage", _ddl)
 
 
 def _migrate_tenant_id(c) -> None:
@@ -156,6 +161,50 @@ def filter_new(tenant_id: str, site: str, kind: str, items: Iterable[dict]) -> l
                     (payload, tenant_id, site, kind, iid),
                 )
     return new
+
+
+def already_seen(tenant_id: str, site: str, kind: str, item_id: str) -> bool:
+    """Whether this item has been ingested before — without recording it.
+
+    `filter_new` answers the same question but *records as it asks*, which makes
+    it useless to a caller that needs to know beforehand whether to act: asking
+    is indistinguishable from consuming. Recovery needs to tell "this message was
+    already applied" from "this message is new", and must not mark the second one
+    seen until the board write has actually happened.
+    """
+    if not item_id:
+        return False
+    with _conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM seen WHERE tenant_id=? AND site=? AND kind=? AND item_id=?",
+            (tenant_id, site, kind, str(item_id)),
+        ).fetchone()
+    return row is not None
+
+
+def forget(tenant_id: str, site: str, kind: str, item_id: str) -> bool:
+    """Drop an item's dedup row so it can be ingested again. True if one went.
+
+    The counterpart to `filter_new` recording *before* the work happens. That
+    ordering is deliberate — it is a single atomic claim, so two concurrent
+    deliveries of one item can't both proceed — but it means a caller whose
+    downstream write then fails has already promised the item was handled.
+    Leaving that row is the silent loss the inbound-rejects table exists to end:
+    nothing is on the board, and every later delivery short-circuits at the
+    dedup and never reaches the board either.
+
+    So a caller that records first must be able to take it back. `seen` then
+    carries an invariant worth relying on — an item marked seen actually landed
+    — which is what lets the retry path stop guessing from presence.
+    """
+    if not item_id:
+        return False
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM seen WHERE tenant_id=? AND site=? AND kind=? AND item_id=?",
+            (tenant_id, site, kind, str(item_id)),
+        )
+        return bool(cur.rowcount)
 
 
 def get_recent(tenant_id: str, site: str, kind: str, limit: int = 20) -> list[dict]:

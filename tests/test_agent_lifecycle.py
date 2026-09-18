@@ -27,6 +27,7 @@ import pipeline  # noqa: E402
 import scheduler  # noqa: E402
 import sequences  # noqa: E402
 import storage  # noqa: E402
+import timeframe  # noqa: E402
 
 SITE = "furnishedfinder"
 UTC = ZoneInfo("UTC")
@@ -180,7 +181,11 @@ def test_prearrival_scheduling_is_anchored_to_check_in():
     deal = {"check_in": "2026-09-01", "check_out": "2026-12-01",
             "inquiry_at": "2026-07-01T09:00:00", "last_contact_at": None}
     week_before = sequences.find_step(sequences.PREARRIVAL, "pre_arrival_week")
-    assert sequences.due_at(deal, week_before).startswith("2026-08-25")
+    # `due_at` returns an absolute stamp (VEN-134), so read the local day back
+    # out rather than off the stored digits — on a host far enough east or west
+    # those digits are a different calendar date for the same instant.
+    scheduled = timeframe.to_zone(sequences.due_at(deal, week_before))
+    assert scheduled.strftime("%Y-%m-%d") == "2026-08-25"
     # Unschedulable without the anchor rather than guessing a date.
     assert sequences.due_at({"check_in": None}, week_before) is None
 
@@ -188,9 +193,29 @@ def test_prearrival_scheduling_is_anchored_to_check_in():
 def test_quiet_hours_push_sends_out_of_the_night():
     deal = {"check_in": "2026-09-01", "inquiry_at": "2026-07-01T09:00:00"}
     welcome = sequences.find_step(sequences.PREARRIVAL, "welcome")
-    when = sequences.due_at(deal, welcome)
-    hour = int(when[11:13])
-    assert sequences.QUIET_START.hour <= hour <= sequences.QUIET_END.hour
+    # The stored stamp is absolute, so convert before asserting: reading
+    # `when[11:13]` only tested the clamp on hosts whose offset happened to keep
+    # the digits in range — it passed on UTC and Los Angeles while failing on
+    # Auckland.
+    #
+    # Be precise about what this proves. `to_zone(..., tz=None)` renders in the
+    # *host* zone, which is the same zone `_clamp_quiet_hours` computed in, so
+    # this round-trips by construction and passes in every timezone. It pins the
+    # clamp's existence — delete `_clamp_quiet_hours` and the 3am case below
+    # fails — but it is blind to the clamp running in the *wrong* zone, which is
+    # the question the guest's wall clock actually asks. That one is VEN-141's,
+    # and is pinned as a strict xfail in
+    # `test_schedule_frame_cross_host.py::test_quiet_hours_clamp_uses_the_property_zone`.
+    local = timeframe.to_zone(sequences.due_at(deal, welcome))
+    assert sequences.QUIET_START.hour <= local.hour <= sequences.QUIET_END.hour
+
+    # ...but that case never reaches the clamp: check-in anchors at 09:00 and
+    # welcome is +4h, so 13:00 is already daytime and the assertion above holds
+    # with the clamp deleted entirely (verified). Drive a 3am send as well, which
+    # is the thing the guard actually exists to prevent.
+    pushed = timeframe.to_zone(sequences.next_send_time(datetime(2026, 9, 1, 3, 0)))
+    assert pushed.hour == sequences.QUIET_START.hour, \
+        "a 3am send must be pushed to the start of waking hours"
 
 
 # --- scheduler: acting unattended -------------------------------------------

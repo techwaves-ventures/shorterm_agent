@@ -106,8 +106,7 @@ def _init_stripe() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _conn() -> db.Conn:
-    c = db.connect()
+def _ddl(c) -> None:
     c.execute(
         """CREATE TABLE IF NOT EXISTS subscriptions (
             tenant_id TEXT PRIMARY KEY,
@@ -120,7 +119,10 @@ def _conn() -> db.Conn:
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )"""
     )
-    return c
+
+
+def _conn() -> db.Conn:
+    return db.open_with_schema("billing", _ddl)
 
 
 def get_subscription(tenant_id: str) -> dict:

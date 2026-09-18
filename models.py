@@ -53,11 +53,19 @@ def validate_password(password: str) -> None:
         raise WeakPassword("Password is too repetitive — please pick another.")
 
 
-def _conn() -> db.Conn:
-    """Open the shared DB and ensure the auth tables exist (idempotent)."""
-    c = db.connect()
+def _session(c) -> None:
+    """Per-connection session state — NOT schema.
+
+    PRAGMA foreign_keys is per-connection and defaults to OFF, so it must be
+    re-applied to every connection handed out. Folding it into the
+    once-per-process schema step would silently disable FK enforcement for the
+    life of the process, with a fully green test suite.
+    """
     if not c.pg:
         c.execute("PRAGMA foreign_keys = ON")  # Postgres enforces FKs natively
+
+
+def _ddl(c) -> None:
     c.execute(
         """CREATE TABLE IF NOT EXISTS tenants (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,7 +92,11 @@ def _conn() -> db.Conn:
             locked_until TEXT
         )"""
     )
-    return c
+
+
+def _conn() -> db.Conn:
+    """Open the shared DB and ensure the auth tables exist (idempotent)."""
+    return db.open_with_schema("models", _ddl, session=_session)
 
 
 def _now() -> datetime:

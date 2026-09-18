@@ -1,0 +1,1194 @@
+"""VEN-131: the dashboard card must carry the item's real send state.
+
+`templates/dashboard.html` gated its in-flight display on `send.in_flight`, but
+the card carried the raw outbox row, whose keys are `outbox._COLS`. There is no
+`in_flight` column, so the branch was dead: a `sending` message rendered no
+state at all, `trackSends()` never resumed on load, and the card sat in "Needs
+you now" with a live Approve & send over a message already going out.
+
+The repo has no `GET /dashboard` test at all, which is why a dead Jinja branch
+survived — a suite of 314 passing tests is entirely blind to this page. These
+are the first, so they are deliberately explicit about the *seed*: two traps
+here each produce a silent vacuous pass.
+
+1. Without `ff_account.connect` + `mark_state("connected")`, the FF-verification
+   gate swallows the whole board **and** the inline script, so every "is the
+   string absent" assertion passes over a blank page.
+2. `_board` calls `reclaim_stuck_sending()` on the read path, so a `sending` row
+   whose `approved_at` is empty is silently requeued mid-test. Seeding through
+   `add() -> QUEUED -> SENDING` writes the stamps that keeps it in flight.
+
+Hence the positive control in `_assert_card_rendered`: assert the card *is*
+there before asserting anything about it, or an empty page proves whatever you
+like.
+
+Not every test here fails without the fix, and the earlier claim that they all
+did was measured false: run against a bare `6f62a57`, 15 fail and 7 pass. Five
+of the seven are deliberate settled-state controls and are supposed to pass on
+both trees. The other two were vacuous and are fixed in place — see
+`test_sent_state_agrees_too` and `test_the_board_issues_no_more_queries_than_before`.
+State the number, not the adjective: "every test fails on base" is exactly the
+kind of claim that persuades the next reviewer to skip checking.
+"""
+import os
+import re
+import tempfile
+
+import pytest
+
+os.environ.setdefault("SQLITE_PATH", tempfile.mktemp(suffix=".db"))
+os.environ.setdefault("FF_CRED_KEY", "c9jwUi0L-fUjf3wjbq74M0lK3ah7fmEfGhjxZ7RehQk=")
+os.environ.setdefault("SECRET_KEY", "test-secret")
+
+import config  # noqa: E402
+import ff_account  # noqa: E402
+import outbox  # noqa: E402
+import pipeline  # noqa: E402
+import storage  # noqa: E402
+
+SITE = "furnishedfinder"
+EMAIL = "host@example.com"
+PASSWORD = "a-perfectly-fine-passphrase"
+
+SCRIPT_RE = re.compile(r"<script\b.*?</script>", re.S | re.I)
+
+
+@pytest.fixture()
+def tenant(tmp_path, monkeypatch):
+    """A logged-in-able tenant whose dashboard actually renders a board."""
+    import db
+    import models
+
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "ven131.db")
+    monkeypatch.setattr(pipeline, "_TS_NORMALIZED", False, raising=False)
+    monkeypatch.setenv("INSECURE_COOKIES", "1")
+
+    user = models.create_user(EMAIL, PASSWORD)
+    tid = str(user.tenant_id)
+    config.save_settings(tid, host_name="Test Host", timezone="America/New_York",
+                         onboarded="1")
+    # Trap 1: without a connected FF account the template renders the
+    # verification note *instead of* the board.
+    ff_account.connect(tid, "ff@example.com")
+    ff_account.mark_state(tid, "connected")
+    return tid
+
+
+@pytest.fixture()
+def client(tenant, monkeypatch):
+    import automation
+    import dashboard
+
+    # The read path starts a drainer, which would deliver the fixture out from
+    # under the assertions.
+    monkeypatch.setattr(automation, "start_drainer", lambda *a, **k: None)
+    dashboard.app.config["TESTING"] = True
+    dashboard.app.config["WTF_CSRF_ENABLED"] = False
+    c = dashboard.app.test_client()
+    resp = c.post("/login", data={"email": EMAIL, "password": PASSWORD})
+    # Positive control: a CSRF 400 or a failed login impersonates every defect
+    # below by rendering a page with no card on it.
+    assert resp.status_code == 302, f"login did not authenticate: {resp.status_code}"
+    return c
+
+
+def _deal(tenant_id, item_id, *, guest="Dana R."):
+    item = {"id": item_id, "kind": "lead", "traveler": guest,
+            "title": f"Unit | {guest}", "property_name": ""}
+    storage.filter_new(tenant_id, SITE, "lead", [item])
+    pipeline.ensure(tenant_id, SITE, item, None)
+    storage.save_response(tenant_id, SITE, "lead", item_id,
+                          status="draft", draft="Hi Dana, yes it's free.",
+                          reason="good fit", confidence="high")
+    return item
+
+
+def _row(tenant_id, item_id, status, *, body="hello"):
+    """One outbox row driven into `status` the way the app drives it.
+
+    `auto=True` lands straight in `queued` with `approved_at` stamped, which is
+    what keeps trap 2 shut: a `sending` row with an empty `approved_at` is
+    silently requeued by the reclaim on the dashboard read path.
+    """
+    msg = outbox.add(tenant_id, SITE, item_id, sequence="presale",
+                     step_id="intro", step_label="First reply",
+                     body=body, auto=status != outbox.PENDING)
+    msg_id = msg["id"]
+    assert outbox.get(msg_id)["status"] == (
+        outbox.PENDING if status == outbox.PENDING else outbox.QUEUED
+    ), "precondition: add() did not land in the status this helper assumes"
+    if status in (outbox.PENDING, outbox.QUEUED):
+        return msg_id
+    outbox.set_status(msg_id, status)
+    assert outbox.get(msg_id)["status"] == status
+    return msg_id
+
+
+def _rows_for(tenant_id, item_id):
+    """Every row for one item, read without going through the new helper.
+
+    The regression tests must fail on the base commit for the *filed* reason —
+    an `AttributeError` on an API that base does not have would prove nothing.
+    """
+    with outbox._conn() as c:
+        return c.execute(
+            "SELECT id, status FROM outbox WHERE tenant_id=? AND site=? "
+            "AND item_id=? ORDER BY id ASC",
+            (str(tenant_id), SITE, str(item_id)),
+        ).fetchall()
+
+
+def _dashboard_html(client):
+    resp = client.get("/dashboard")
+    assert resp.status_code == 200, f"/dashboard returned {resp.status_code}"
+    return resp.get_data(as_text=True)
+
+
+def _server_html(html):
+    """The markup with every <script> stripped — i.e. what renders before JS."""
+    return SCRIPT_RE.sub("", html)
+
+
+def _assert_card_rendered(html, item_id):
+    """The positive control every negative assertion below depends on."""
+    assert f'id="msg-{item_id}"' in html or f'id="send-{item_id}"' in html, (
+        "precondition failed: the card is not on the page at all, so any "
+        "assertion about its contents would pass vacuously"
+    )
+
+
+def _button(html, elem_id):
+    m = re.search(r"<button[^>]*\bid=\"%s\"[^>]*>" % re.escape(elem_id), html)
+    assert m, f"no button with id={elem_id!r} in the rendered page"
+    return m.group(0)
+
+
+# --------------------------------------------------------------------------
+# 1-3: the filed defect
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status,label", [
+    (outbox.SENDING, "Sending…"),
+    (outbox.QUEUED, "Queued to send…"),
+])
+def test_an_in_flight_send_is_visible_in_the_server_rendered_page(
+        client, tenant, status, label):
+    """AC1: the state is in the markup, not conjured later by a fetch."""
+    _deal(tenant, "s1")
+    _row(tenant, "s1", status)
+
+    html = _dashboard_html(client)
+    _assert_card_rendered(html, "s1")
+    assert label in _server_html(html), (
+        f"a {status} message renders no in-flight state on /dashboard "
+        f"before any JS runs"
+    )
+
+
+@pytest.mark.parametrize("status", [outbox.SENDING, outbox.QUEUED])
+def test_the_approve_button_is_disabled_in_the_server_html(client, tenant, status):
+    """AC2: disabled by the server. JS disabling it needs a round-trip, and
+    every load before that lands offers a send over a live one."""
+    _deal(tenant, "s1")
+    _row(tenant, "s1", status)
+
+    html = _server_html(_dashboard_html(client))
+    _assert_card_rendered(html, "s1")
+    assert "disabled" in _button(html, "send-s1"), (
+        "Approve & send is live in the server HTML over an in-flight message"
+    )
+
+
+def test_the_poll_is_armed_on_load_with_no_user_action(client, tenant):
+    """AC3/AC9: `trackSends()` runs on load, so state is picked up without a
+    click and a send that starts later in the session is still seen."""
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING)
+
+    html = _dashboard_html(client)
+    _assert_card_rendered(html, "s1")
+    scripts = "\n".join(SCRIPT_RE.findall(html))
+
+    # Anchored to top-level indentation on purpose: `sendReply` also calls
+    # `trackSends()`, and a loose `\s*` match finds *that* one and passes on a
+    # page whose poll is never armed on load at all.
+    assert re.search(r"^      trackSends\(\);$", scripts, re.M), (
+        "nothing arms the delivery poll on load (the call inside sendReply "
+        "only runs after a click)"
+    )
+    # The old else-branch fetched once and started no interval, so a send that
+    # began later in the session was never picked up.
+    assert 'if (s.status === "failed" || s.status === "sent") renderSendState' \
+        not in scripts, "the one-shot fallback still short-circuits the poll"
+
+
+@pytest.mark.parametrize("status", [outbox.SENDING, outbox.QUEUED])
+def test_an_in_flight_button_carries_its_resting_caption(client, tenant, status):
+    """Found in the browser, not by the suite.
+
+    `setBusy` caches `innerHTML` the first time it makes a button busy and
+    restores it on the way out. Server-rendering the caption as "Sending…"
+    poisoned that cache: when the send settled, `setBusy(btn, false)` handed the
+    button back **enabled and still captioned "Sending…"** — a live control
+    claiming to be mid-send, which is the ticket's own complaint inverted.
+    """
+    _deal(tenant, "s1")
+    _row(tenant, "s1", status)
+
+    html = _server_html(_dashboard_html(client))
+    btn = _button(html, "send-s1")
+    assert 'data-label="Approve &amp; send"' in btn, (
+        "no resting caption, so setBusy will restore this button to whatever "
+        "the server rendered while it was in flight"
+    )
+
+
+def test_the_client_tests_in_flight_before_status(client, tenant):
+    """The shared helper does not close the defect on its own.
+
+    `renderSendState` branched on `status` first: `sent`, then `failed`, then
+    `in_flight`. A faithful feed of `status:"failed", in_flight:true` — an
+    effective state this fix can now produce — therefore lands in the `failed`
+    branch, which runs `btn.disabled = false; btn.textContent = "Retry send"`
+    and re-enables the button over a queued send.
+
+    Asserted structurally because this branch is JS and the suite is Python;
+    the behaviour itself is exercised in the browser (see the PR evidence).
+    Without this, reverting the reordering leaves the whole suite green.
+    """
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING)
+    scripts = "\n".join(SCRIPT_RE.findall(_dashboard_html(client)))
+
+    body = re.search(r"function renderSendState\(id, s\) \{(.*?)\n      \}",
+                     scripts, re.S)
+    assert body, "renderSendState is not in the rendered page"
+    body = body.group(1)
+
+    at_in_flight = body.find("s.in_flight")
+    at_failed = body.find('s.status === "failed"')
+    at_sent = body.find('s.status === "sent"')
+    assert at_in_flight != -1 and at_failed != -1 and at_sent != -1
+    assert at_in_flight < at_failed and at_in_flight < at_sent, (
+        "renderSendState decides on `status` before `in_flight`, so an "
+        "effective status of failed/sent re-enables the button over a send "
+        "that is still in flight"
+    )
+    # The in-flight branch must not fall through into the ones that re-enable.
+    assert "return;" in body[at_in_flight:at_failed], (
+        "the in-flight branch falls through to a branch that re-enables"
+    )
+
+
+def test_the_two_surfaces_do_not_disagree_about_the_wording(client, tenant):
+    """The server card and the poll are meant to be one rule, and printed two
+    different strings for one state: the card said "Queued to send…" and the
+    first poll rewrote the same button to "Queued…". The label is the server's,
+    so there is one place it can be changed.
+    """
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.QUEUED)
+
+    html = _dashboard_html(client)
+    # Comments stripped: the first version of this test matched the comment that
+    # *explains* the old wording and failed on a correct page.
+    code = re.sub(r"//[^\n]*", "", "\n".join(SCRIPT_RE.findall(html)))
+
+    assert outbox.STATUS_LABELS[outbox.QUEUED] in _server_html(html)
+    assert '"Queued…"' not in code, (
+        "the poll carries its own copy of the wording, which drifted from the "
+        "server's the moment either changed"
+    )
+    assert "s.label" in code, "the poll no longer renders the server's label"
+    assert client.get("/api/send-states").get_json()["s1"]["label"] == (
+        outbox.STATUS_LABELS[outbox.QUEUED])
+
+
+def test_starting_a_send_does_not_wait_out_the_idle_backoff(client, tenant):
+    """`trackSends()` returns early once the poll is armed — and it is armed for
+    the life of the page and never cleared. It left `idleTicks` at 4, so a send
+    started during an idle stretch showed nothing for up to 15s: the tick that
+    would have rendered it was skipped four times first.
+
+    Structural, like the branch-order tripwire: the reset must happen *before*
+    the early return, or arming order decides whether it runs.
+    """
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.QUEUED)
+    scripts = "\n".join(SCRIPT_RE.findall(_dashboard_html(client)))
+
+    body = re.search(r"async function trackSends\(\) \{(.*?)\n      \}",
+                     scripts, re.S)
+    assert body, "trackSends is not in the rendered page"
+    body = body.group(1)
+
+    at_reset = body.find("idleTicks = 0")
+    at_return = body.find("if (sendPoll) return;")
+    assert at_reset != -1, "trackSends never resets the idle-skip counter"
+    assert at_return != -1, "the early return this test guards is gone"
+    assert at_reset < at_return, (
+        "idleTicks is reset after the early return, so every call but the first "
+        "leaves the backoff in place and the send goes unrendered for ~15s"
+    )
+
+
+# --------------------------------------------------------------------------
+# 4: the divergence — what separates the correct fix from the cheap one
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("newer", [outbox.PENDING, outbox.CANCELED, outbox.FAILED])
+def test_an_older_in_flight_row_beats_a_newer_settled_one(client, tenant, newer):
+    """AC4. Two rows for one item is ordinary: `enqueue_autopilot_reply` has no
+    per-item dedupe, so one scrape returning two messages in a thread queues
+    two. Last-write-wins then reports the item idle while the older row is
+    genuinely going out — the exact state this ticket exists to prevent.
+    """
+    _deal(tenant, "s1")
+    in_flight = _row(tenant, "s1", outbox.SENDING, body="first")
+    _row(tenant, "s1", newer, body="second")
+
+    assert outbox.get(in_flight)["status"] == outbox.SENDING, (
+        "precondition: the older row is still in flight"
+    )
+
+    html = _server_html(_dashboard_html(client))
+    _assert_card_rendered(html, "s1")
+    assert "Sending…" in html, (
+        f"an older `sending` row is invisible behind a newer `{newer}` row"
+    )
+    assert "disabled" in _button(html, "send-s1"), (
+        f"Approve & send is live over an in-flight send because a newer "
+        f"`{newer}` row won the card"
+    )
+
+
+def test_the_api_agrees_with_the_card_on_the_divergence(client, tenant):
+    """AC6: the page polls this endpoint, so if it keeps the cheap rule the
+    client is told to re-enable the button and cannot recover."""
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING, body="first")
+    _row(tenant, "s1", outbox.CANCELED, body="second")
+
+    state = client.get("/api/send-states").get_json()["s1"]
+    assert state["in_flight"] is True, (
+        "/api/send-states reports an item idle while one of its own rows is "
+        "in flight"
+    )
+    assert state["status"] == outbox.SENDING
+
+
+def test_sent_state_agrees_too(client, tenant):
+    """AC6 for the third caller — /responder/send and the thread page both read
+    `_sent_state`.
+
+    Billed as proof of this change, this was vacuous: base `_sent_state` already
+    filtered `for_tenant(..., IN_FLIGHT)` by item, so it already had any-in-flight
+    semantics and passed on `6f62a57` unchanged. Kept as a regression guard on
+    the agreement, and given the case that does discriminate — an item holding
+    both a `queued` and a `sending` row must be described by the `sending` one.
+    Taking the first in-flight row by id said "Queued to send…" over a message a
+    browser was already delivering, which reads as "there is still time".
+    """
+    import dashboard
+
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING, body="first")
+    _row(tenant, "s1", outbox.CANCELED, body="second")
+
+    blocked = dashboard._sent_state(tenant, "s1", {"status": "draft",
+                                                   "draft": "something new"})
+    assert blocked == "Sending…", (
+        f"_sent_state offered the send button over an in-flight row: {blocked!r}"
+    )
+
+    # The discriminating case: older row `queued`, newer row `sending`.
+    _deal(tenant, "s2")
+    _row(tenant, "s2", outbox.QUEUED, body="first")
+    _row(tenant, "s2", outbox.SENDING, body="second")
+
+    assert dashboard._sent_state(tenant, "s2", None) == "Sending…", (
+        "an item with a live browser send was described by its merely-queued row"
+    )
+    grouped = outbox.rows_by_item(tenant, SITE)["s2"]
+    assert [m["status"] for m in grouped] == [outbox.QUEUED, outbox.SENDING], (
+        "precondition: the seed did not produce queued-then-sending in id order, "
+        "so 'first in-flight row by id' and 'the sending one' would not differ"
+    )
+    assert outbox.send_state(grouped)["status"] == outbox.SENDING
+    assert client.get("/api/send-states").get_json()["s2"]["label"] == "Sending…"
+
+
+# --------------------------------------------------------------------------
+# 5: D1 — the server-side double-send this route still accepted
+# --------------------------------------------------------------------------
+
+def test_approving_a_sibling_row_mid_flight_is_refused(client, tenant):
+    """AC5. `outbox_approve` checked only the row being approved, so the second
+    Approve & send button released a *second* message into a thread already
+    mid-delivery and answered 200. VEN-127's 409 covers /responder/send, not
+    this route."""
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING, body="first")
+    pending = _row(tenant, "s1", outbox.PENDING, body="second")
+
+    before = len(_rows_for(tenant, "s1"))
+    resp = client.post(f"/outbox/{pending}/approve", data={"text": "second"})
+
+    assert resp.status_code == 409, (
+        f"approve released a second message while one was in flight: "
+        f"{resp.status_code} {resp.get_data(as_text=True)[:200]}"
+    )
+    assert outbox.get(pending)["status"] == outbox.PENDING, (
+        "the sibling row was released despite the refusal"
+    )
+    assert len(_rows_for(tenant, "s1")) == before, (
+        "the refused approve still added a row"
+    )
+
+
+def test_the_second_approve_button_is_inert_while_a_sibling_is_in_flight(
+        client, tenant):
+    """The UI half of the same defect: that button had no `id` at all, so the
+    poll could never reach it however correct the state feed became."""
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING, body="first")
+    pending = _row(tenant, "s1", outbox.PENDING, body="second")
+
+    html = _server_html(_dashboard_html(client))
+    btn = _button(html, f"approve-ob-{pending}")
+    assert "disabled" in btn, (
+        "the awaiting-approval Approve & send is live over an in-flight sibling"
+    )
+
+
+def test_approve_still_works_when_nothing_is_in_flight(client, tenant):
+    """The guard must not swallow the ordinary case — a 409 for everyone is
+    also a way to make this test file green."""
+    _deal(tenant, "s1")
+    pending = _row(tenant, "s1", outbox.PENDING, body="only")
+
+    resp = client.post(f"/outbox/{pending}/approve", data={"text": "only"})
+    assert resp.status_code == 200, resp.get_data(as_text=True)[:200]
+    assert outbox.get(pending)["status"] == outbox.QUEUED
+
+
+# --------------------------------------------------------------------------
+# 6: every remaining way to put a second message in front of one guest
+#
+# The guard was added per route, and per-route missed a route three times on
+# this ticket: the send button, then the second approve button, then
+# `/outbox/<id>/retry`. So these test the *choke point* — for each surface that
+# can move a row into `IN_FLIGHT`, and for the interleaving as well as the
+# sequence, because a check-then-act guard passes every sequential test.
+# --------------------------------------------------------------------------
+
+def _in_flight_count(tenant_id, item_id):
+    return sum(status in outbox.IN_FLIGHT
+               for _id, status in _rows_for(tenant_id, item_id))
+
+
+def test_retrying_beside_an_in_flight_sibling_is_refused(client, tenant):
+    """`/outbox/<id>/retry` re-queued a failed row while a sibling of the same
+    item was still `sending`, and answered 200 — two messages in flight to one
+    guest. It carried no sibling guard at all; the approve route's guard did not
+    reach it, which is the argument for guarding the write instead of the route.
+    """
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING, body="first")
+    failed = _row(tenant, "s1", outbox.FAILED, body="second")
+
+    resp = client.post(f"/outbox/{failed}/retry")
+
+    assert resp.status_code == 409, (
+        f"retry released a second message while one was in flight: "
+        f"{resp.status_code} {resp.get_data(as_text=True)[:200]}"
+    )
+    assert resp.get_json()["error"] == "Sending…", resp.get_json()
+    assert outbox.get(failed)["status"] == outbox.FAILED
+    assert _in_flight_count(tenant, "s1") == 1
+
+
+def test_retry_still_works_when_nothing_is_in_flight(client, tenant):
+    """The control for the test above — refusing every retry is also green."""
+    _deal(tenant, "s1")
+    failed = _row(tenant, "s1", outbox.FAILED, body="only")
+
+    resp = client.post(f"/outbox/{failed}/retry")
+    assert resp.status_code == 200, resp.get_data(as_text=True)[:200]
+    assert outbox.get(failed)["status"] == outbox.QUEUED
+
+
+def test_two_approvals_racing_cannot_both_win(client, tenant):
+    """The guard was a read taken before the write, so two requests that both
+    read "nothing in flight" both released. Driven at the layer the route calls,
+    with both reads forced to complete before either write.
+
+    Measured on the read-then-write shape this replaces: two concurrent approves
+    both returned 200 and left two rows `queued`.
+    """
+    _deal(tenant, "s1")
+    a = _row(tenant, "s1", outbox.PENDING, body="first")
+    b = _row(tenant, "s1", outbox.PENDING, body="second")
+
+    import threading
+    barrier = threading.Barrier(2)
+    won = {}
+
+    def approve(msg_id):
+        barrier.wait()
+        for _ in range(200):      # SQLite serializes writers; retry the lock
+            try:
+                won[msg_id] = outbox.release_to_send(
+                    msg_id, from_statuses=outbox.APPROVABLE)[0]
+                return
+            except Exception as exc:            # pragma: no cover - lock only
+                if "locked" not in str(exc).lower():
+                    raise
+        won[msg_id] = "never got the lock"
+
+    threads = [threading.Thread(target=approve, args=(m,)) for m in (a, b)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert sorted(won.values(), key=str) == [False, True], (
+        f"both concurrent approvals were told they had released a message: {won}"
+    )
+    assert _in_flight_count(tenant, "s1") == 1, (
+        f"two messages in flight for one guest: {_rows_for(tenant, 's1')}"
+    )
+
+
+def test_the_send_button_cannot_queue_two_by_racing_itself(client, tenant):
+    """`/responder/send` reads `_sent_state` and then *inserts*. Two clicks that
+    both read before either inserted both queued a message: measured 137 of 150
+    concurrent pairs put two messages in front of one guest, and the button
+    being disabled client-side is not a guard against a stale tab or a replay.
+
+    The insert now carries the same condition, so this is the insert-shaped half
+    of the same rule `release_to_send` applies to updates.
+    """
+    import automation
+
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING, body="already going out")
+
+    assert automation.enqueue_send(tenant, SITE, "s1", "second") is None, (
+        "a second message was queued while one was already in flight"
+    )
+    assert _in_flight_count(tenant, "s1") == 1
+
+    resp = client.post("/responder/send", data={"item_id": "s1", "text": "second"})
+    assert resp.status_code == 409, resp.get_data(as_text=True)[:200]
+    assert _in_flight_count(tenant, "s1") == 1
+
+
+def test_the_send_route_answers_409_when_only_the_insert_refuses(
+        client, tenant, monkeypatch):
+    """The `msg is None` branch, with the pre-read blinded so it cannot answer.
+
+    Without this the branch had **zero** coverage: the test above posts to
+    /responder/send and gets its 409 from the `_sent_state` pre-read, never from
+    the refusal path. Replacing the branch with `if False:` left all 31 other
+    tests passing, and the route then answered
+    `{"ok": true, "queued": true, "message_id": null}` on a refused insert —
+    telling the operator a message was queued when nothing was written.
+
+    The pre-read is stubbed out precisely because it masks the branch. That is
+    the only honest way to reach a race-losing insert from a single-threaded
+    test: in production the pre-read passes because the competing send had not
+    landed yet, which is the whole reason the insert has to refuse.
+    """
+    import dashboard
+
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING, body="already going out")
+    monkeypatch.setattr(dashboard, "_sent_state", lambda *a, **k: "")
+
+    resp = client.post("/responder/send", data={"item_id": "s1", "text": "second"})
+
+    assert resp.status_code == 409, (
+        f"the route reported success for an insert that wrote nothing: "
+        f"{resp.status_code} {resp.get_data(as_text=True)[:200]}"
+    )
+    assert resp.get_json()["error"] == "Sending…", resp.get_json()
+    assert _in_flight_count(tenant, "s1") == 1
+
+
+def test_the_send_button_still_queues_when_the_thread_is_idle(client, tenant):
+    """Control: the guard must not refuse the ordinary first send."""
+    import automation
+
+    _deal(tenant, "s1")
+    msg = automation.enqueue_send(tenant, SITE, "s1", "hello")
+    assert msg is not None and msg["status"] == outbox.QUEUED
+    assert _in_flight_count(tenant, "s1") == 1
+
+
+def test_the_guard_lives_on_the_write_not_on_the_route(client, tenant):
+    """The reason the three tests above can be trusted not to rot.
+
+    Each of those drives one route. This asserts the property that makes a
+    *fourth* route safe by construction: `set_status` refuses to move a row into
+    `queued` beside an in-flight sibling, so a new caller cannot reach the write
+    without the check. A route-level guard would leave this passing while the
+    next route is added unguarded.
+    """
+    _deal(tenant, "s1")
+    _row(tenant, "s1", outbox.SENDING, body="first")
+    pending = _row(tenant, "s1", outbox.PENDING, body="second")
+
+    assert outbox.set_status(pending, outbox.QUEUED,
+                             unless_sibling_in_flight=True) is False
+    assert outbox.get(pending)["status"] == outbox.PENDING
+
+    # ...and `only_from` is the other half: a settled row cannot be re-released
+    # even with nothing in flight beside it.
+    _deal(tenant, "s2")
+    sent = _row(tenant, "s2", outbox.SENT, body="already read")
+    assert outbox.set_status(sent, outbox.QUEUED,
+                             only_from=outbox.APPROVABLE) is False
+    assert outbox.get(sent)["status"] == outbox.SENT
+
+    # Both guards off is still the old unconditional write, so callers that pass
+    # neither are unaffected.
+    assert outbox.set_status(sent, outbox.CANCELED) is True
+
+
+def test_a_row_is_not_its_own_blocker(client, tenant):
+    """`NOT EXISTS (... id<>outbox.id ...)`: a row already `queued` must still be
+    writable, or the drainer's own `queued`->`sending` claim would deadlock and
+    nothing would ever be delivered."""
+    _deal(tenant, "s1")
+    queued = _row(tenant, "s1", outbox.QUEUED, body="only")
+
+    assert outbox.set_status(queued, outbox.SENDING,
+                             unless_sibling_in_flight=True) is True
+    assert outbox.get(queued)["status"] == outbox.SENDING
+
+
+# --------------------------------------------------------------------------
+# 7: the states that must not change
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("status", [outbox.SENT, outbox.FAILED, outbox.CANCELED])
+def test_settled_states_leave_the_button_live_or_not_as_before(
+        client, tenant, status):
+    """AC7: only in-flight items change. A fix that disables the button
+    whenever any row exists would pass every test above."""
+    _deal(tenant, "s1")
+    _row(tenant, "s1", status)
+
+    html = _server_html(_dashboard_html(client))
+    _assert_card_rendered(html, "s1")
+    assert "disabled" not in _button(html, "send-s1"), (
+        f"a `{status}` row disabled the server-rendered button, which is a "
+        f"behaviour change beyond this ticket"
+    )
+    assert "Sending…" not in html and "Queued to send…" not in html
+
+
+def test_a_card_with_no_outbox_row_is_untouched(client, tenant):
+    _deal(tenant, "s1")
+
+    html = _server_html(_dashboard_html(client))
+    _assert_card_rendered(html, "s1")
+    assert "disabled" not in _button(html, "send-s1")
+
+
+# --------------------------------------------------------------------------
+# 8: the shared rule itself
+# --------------------------------------------------------------------------
+
+def test_send_state_is_pure_and_falls_back_to_the_newest_row():
+    """Single-row items — the common case — must read exactly as
+    reading the newest row alone made them read (`latest_by_item`, since
+    removed as the last caller went away)."""
+    assert outbox.send_state(None) is None
+    assert outbox.send_state([]) is None
+
+    rows = [{"id": 1, "status": outbox.SENT, "error": None, "step_label": "a"},
+            {"id": 2, "status": outbox.FAILED, "error": "boom", "step_label": "b"}]
+    state = outbox.send_state(rows)
+    assert state["status"] == outbox.FAILED and state["in_flight"] is False
+    assert state["error"] == "boom" and state["step"] == "b"
+
+    rows.insert(0, {"id": 0, "status": outbox.QUEUED, "error": None,
+                    "step_label": "z"})
+    state = outbox.send_state(rows)
+    assert state["status"] == outbox.QUEUED and state["in_flight"] is True
+    assert state["label"] == "Queued to send…"
+
+
+def test_the_board_issues_no_more_queries_than_before(client, tenant, monkeypatch):
+    """AC8: `rows_by_item` reads every row for the tenant once and groups them in
+    Python, so a card may ask it anything without paying per card.
+
+    This asserted `<= 12` against a measured 6 — 2x slack, which made it vacuous
+    for the regression its own docstring named: adding a second whole-table read
+    alongside the grouped one still passed. Two assertions now, because there are
+    two distinct regressions and a single number catches only one:
+
+    * **constant** in the number of items — a read moved inside `card()` is an
+      N+1, and it is the one that gets worse in production, not in this test;
+    * a **tight** absolute bound, so a second full read added alongside the
+      grouped one has to be a deliberate change to this number rather than
+      slack someone else already paid for.
+    """
+    import dashboard
+
+    def board_conn_count(n_items, first_item):
+        for i in range(n_items):
+            item = f"{first_item}{i}"
+            _deal(tenant, item, guest=f"Guest {i}")
+            _row(tenant, item, outbox.SENDING)
+        calls = {"n": 0}
+        real_conn = outbox._conn
+
+        def counting_conn(*a, **k):
+            calls["n"] += 1
+            return real_conn(*a, **k)
+
+        monkeypatch.setattr(outbox, "_conn", counting_conn)
+        dashboard._board(tenant)
+        monkeypatch.setattr(outbox, "_conn", real_conn)
+        return calls["n"]
+
+    few = board_conn_count(5, "q")
+    many = board_conn_count(15, "r")   # 20 items on the board by now
+
+    assert few == many, (
+        f"_board opened {few} outbox connections for 5 items and {many} for 20 — "
+        f"it scales with the board, which is the per-card N+1 this design avoids"
+    )
+    assert few <= 6, (
+        f"_board opened {few} outbox connections; 6 is the measured cost of the "
+        f"grouped read. A higher number means a whole-table read was added "
+        f"alongside it rather than replacing it — raise this deliberately."
+    )
+
+
+# ---------------------------------------------------------------------------
+# VEN-170: the guard read the stored draft and the route shipped the posted text
+# ---------------------------------------------------------------------------
+#
+# `_sent_state` promised in its docstring to answer "have these exact words gone
+# out before". Its parameters could not: it was handed `response.draft`, while
+# `/responder/send` delivered the operator's posted `text`. Those two strings are
+# equal right up until a guest reply swaps the stored draft out — which is
+# exactly the moment a tab left open from the previous send is still holding the
+# old one. Replay it and the guard compared the *new* draft against the delivered
+# set, found a difference, and released a byte-identical second copy.
+#
+# So the tests below are all built around one shape: make the proxy diverge from
+# the operand, then act. A test that sends and replays without re-drafting in
+# between passes on the base commit — the accidental agreement of the two is why
+# this survived certification (see `test_replay_before_a_redraft_was_never_the_gap`,
+# which is that control, and is supposed to pass on both trees).
+#
+# Measured against `ce16ee7`, one at a time, in a clean worktree:
+#   test_stale_tab_replay_after_redraft_is_refused          FAILS on base
+#   test_thread_reopens_for_genuinely_new_words             passes on base (inverse)
+#   test_retry_refuses_a_body_already_delivered             FAILS on base
+#   test_approve_with_edited_text_matching_a_sent_body      FAILS on base
+#   test_duplicate_refusal_does_not_claim_a_send_in_flight  FAILS on base
+#   test_replay_before_a_redraft_was_never_the_gap          passes on base (control)
+
+
+def _deliver(tenant_id, item_id, body, *, sent_at="2026-08-23T10:00:00"):
+    """Finish a send the way `runner._send_worker` finishes one.
+
+    Both halves matter. The outbox row going `sent` is what `sent_bodies` reads;
+    the response row being re-stamped `status="sent", draft=<body>` is what made
+    the old guard *look* right, because it left the stored draft equal to the
+    text just delivered.
+    """
+    rows = [r for r in outbox.rows_by_item(tenant_id, SITE)[item_id]
+            if r["body"] == body and r["status"] != outbox.SENT]
+    assert rows, f"precondition: no unsent row carrying {body[:30]!r} to deliver"
+    outbox.set_status(rows[0]["id"], outbox.SENT)
+    storage.update_response(tenant_id, SITE, item_id, status="sent", draft=body,
+                            sent_at=sent_at)
+
+
+def _redraft(tenant_id, item_id, body):
+    """The guest replied, so a fresh draft replaces the delivered one.
+
+    This is the ordinary, *correct* reopening of a thread — not an edge case.
+    It is also the only step that separates the stored draft from the words the
+    guest actually has, which is the whole of the defect.
+    """
+    storage.update_response(tenant_id, SITE, item_id, status="draft", draft=body,
+                            sent_at="")
+
+
+T2 = "Hi Dana, yes the unit is free from June 1. Rent is $2,400/mo."
+T3 = "Hi Dana, parking is included and there's a spot out front."
+
+
+def test_stale_tab_replay_after_redraft_is_refused(client, tenant):
+    """The filed defect, through the real routes.
+
+    Send edited text, deliver it, let a guest reply produce a new draft, then
+    replay the old text from a tab that never saw any of that. The guest must
+    not receive the same words twice.
+    """
+    _deal(tenant, "v1")
+    assert client.post("/responder/send",
+                       data={"item_id": "v1", "text": T2}).status_code == 200, (
+        "precondition: the first send must be accepted")
+    _deliver(tenant, "v1", T2)
+    _redraft(tenant, "v1", T3)
+    assert storage.get_responses(tenant, SITE)["v1"]["draft"] == T3, (
+        "precondition: the stored draft has moved on, so the old guard's proxy "
+        "and its real operand now disagree — without this the test is vacuous")
+
+    resp = client.post("/responder/send", data={"item_id": "v1", "text": T2})
+
+    assert resp.status_code == 409, (
+        f"a stale tab replayed text the guest already had and was answered "
+        f"{resp.status_code}: {resp.get_json()}")
+    bodies = [b for _, b in _bodies_for(tenant, "v1")]
+    assert bodies.count(T2) == 1, (
+        f"{bodies.count(T2)} copies of the same message queued for one guest: "
+        f"{bodies}")
+
+
+def test_thread_reopens_for_genuinely_new_words(client, tenant):
+    """The inverse, and the release gate.
+
+    A guard keyed on "has this guest ever been sent something" would pass the
+    test above and silently stop the product from ever answering a lead twice.
+    That failure is worse than the duplicate — it is invisible to the operator,
+    and it looks like nothing happening. Different words must still go out.
+    """
+    _deal(tenant, "v2")
+    assert client.post("/responder/send",
+                       data={"item_id": "v2", "text": T2}).status_code == 200
+    _deliver(tenant, "v2", T2)
+    _redraft(tenant, "v2", T3)
+
+    resp = client.post("/responder/send", data={"item_id": "v2", "text": T3})
+
+    assert resp.status_code == 200, (
+        f"the thread could not reopen: a genuinely new reply was refused "
+        f"{resp.status_code} {resp.get_json()} — this is a lockout, not a fix")
+    bodies = [b for _, b in _bodies_for(tenant, "v2")]
+    assert T3 in bodies, f"the new reply was not queued: {bodies}"
+
+
+def test_replay_before_a_redraft_was_never_the_gap(client, tenant):
+    """Control: this one passes on the base commit too, and must keep passing.
+
+    Replay the delivered text *without* a guest reply in between and the stored
+    draft still happens to equal it, so even the old proxy-based guard refuses.
+    Kept explicitly so nobody reads the test above as "replays were unguarded" —
+    they were guarded exactly while the proxy and the operand agreed, which is
+    the general shape worth remembering: a guard reading a stand-in for the real
+    operand passes every test that never makes the two diverge.
+    """
+    _deal(tenant, "v3")
+    assert client.post("/responder/send",
+                       data={"item_id": "v3", "text": T2}).status_code == 200
+    _deliver(tenant, "v3", T2)
+    assert storage.get_responses(tenant, SITE)["v3"]["draft"] == T2, (
+        "precondition: no re-draft, so the stored draft still equals the "
+        "delivered text — that agreement is what this control is about")
+
+    resp = client.post("/responder/send", data={"item_id": "v3", "text": T2})
+    assert resp.status_code == 409, f"unexpected {resp.status_code}"
+
+
+def test_retry_refuses_a_body_already_delivered(client, tenant):
+    """`/outbox/<id>/retry` releases to a guest too, so it takes the same rule.
+
+    A failed row whose text a *sibling* already delivered — the send that
+    succeeded on a later attempt while this row's error was still on screen.
+    Retrying it re-delivers words the guest has.
+    """
+    _deal(tenant, "v4")
+    delivered_id = _row(tenant, "v4", outbox.SENT, body=T2)
+    failed_id = _row(tenant, "v4", outbox.FAILED, body=T2)
+    assert outbox.get(delivered_id)["status"] == outbox.SENT
+    assert outbox.in_flight_for_item(tenant, SITE, "v4") is None, (
+        "precondition: nothing in flight, so only the body guard can refuse — "
+        "otherwise the sibling guard answers this and the test proves nothing")
+
+    resp = client.post(f"/outbox/{failed_id}/retry")
+
+    assert resp.status_code == 409, (
+        f"a failed row was re-queued with words the guest already had: "
+        f"{resp.status_code} {resp.get_json()}")
+    assert outbox.get(failed_id)["status"] == outbox.FAILED, (
+        "the row was released despite the 409 — the refusal is not on the write")
+
+
+def test_approve_with_edited_text_matching_a_sent_body_is_refused(client, tenant):
+    """The `COALESCE` branch: approve carries its own body, retry does not.
+
+    One guard term serves both, so the edited text — not the row's stored body —
+    has to be what the UPDATE compares. Seeded so the row's own body is *new*
+    and only the operator's edit is a duplicate: if the guard read the row
+    instead of the edit, this would pass while the guest got two copies.
+    """
+    _deal(tenant, "v5")
+    _row(tenant, "v5", outbox.SENT, body=T2)
+    pending_id = _row(tenant, "v5", outbox.PENDING, body=T3)
+    assert outbox.get(pending_id)["body"] == T3, (
+        "precondition: the row's own body is not the duplicate; only the edit is")
+    assert outbox.in_flight_for_item(tenant, SITE, "v5") is None
+
+    resp = client.post(f"/outbox/{pending_id}/approve", data={"text": T2})
+
+    assert resp.status_code == 409, (
+        f"approve released an operator edit the guest already had: "
+        f"{resp.status_code} {resp.get_json()}")
+    assert outbox.get(pending_id)["status"] == outbox.PENDING
+
+
+def test_release_body_guard_stays_inside_its_tenant_item_scope(tenant):
+    """The update guard must cross one scope axis at a time.
+
+    A sent body refuses a replay for the same tenant/item, but the same body is
+    valid for another item or another tenant. Holding every other key fixed is
+    what makes the latter two assertions pin the item and tenant correlations.
+    """
+    delivered_id = _row(tenant, "release-scope-a", outbox.SENT, body=CANNED)
+    replay_id = _row(tenant, "release-scope-a", outbox.PENDING, body=CANNED)
+    other_item_id = _row(
+        tenant, "release-scope-b", outbox.PENDING, body=CANNED)
+    other_tenant_id = _row(
+        "a-different-tenant", "release-scope-a", outbox.PENDING, body=CANNED)
+
+    assert outbox.get(delivered_id)["status"] == outbox.SENT
+    assert outbox.in_flight_for_item(
+        tenant, SITE, "release-scope-a") is None
+    assert outbox.in_flight_for_item(
+        tenant, SITE, "release-scope-b") is None
+    assert outbox.in_flight_for_item(
+        "a-different-tenant", SITE, "release-scope-a") is None
+
+    replay_released, _ = outbox.release_to_send(
+        replay_id, from_statuses=outbox.APPROVABLE)
+    other_item_released, _ = outbox.release_to_send(
+        other_item_id, from_statuses=outbox.APPROVABLE)
+    other_tenant_released, _ = outbox.release_to_send(
+        other_tenant_id, from_statuses=outbox.APPROVABLE)
+
+    assert replay_released is False, (
+        "precondition: the same tenant/item/body replay was released")
+    assert other_item_released is True, (
+        "the sent-body guard escaped its item scope")
+    assert other_tenant_released is True, (
+        "the sent-body guard escaped its tenant scope")
+
+
+def test_duplicate_refusal_does_not_claim_a_send_in_flight(client, tenant):
+    """The refusal has to name the real reason.
+
+    With the guard in place the replay is correctly refused — and then explained
+    by `in_flight_for_item`, which returns None for a body duplicate, so the
+    route fell through to a hardcoded "another send ... was already under way".
+    Nothing is under way; the send finished, which is *why* the replay got this
+    far. This is the only test standing on that sentence.
+    """
+    _deal(tenant, "v6")
+    assert client.post("/responder/send",
+                       data={"item_id": "v6", "text": T2}).status_code == 200
+    _deliver(tenant, "v6", T2)
+    _redraft(tenant, "v6", T3)
+    assert outbox.in_flight_for_item(tenant, SITE, "v6") is None, (
+        "precondition: nothing is in flight, so any in-flight wording is false")
+
+    error = client.post("/responder/send",
+                        data={"item_id": "v6", "text": T2}).get_json()["error"]
+
+    assert "under way" not in error.lower(), (
+        f"a duplicate was explained as a send still in progress: {error!r}")
+    assert error == outbox.ALREADY_SENT_LABEL, (
+        f"the duplicate refusal is worded off-script: {error!r}")
+
+
+def test_the_write_refuses_a_replay_the_preread_let_through(client, tenant,
+                                                            monkeypatch):
+    """The guarantee, not the courtesy in front of it.
+
+    Every other test here is answered by the `_sent_state` pre-read, which is
+    the fast legible refusal — and which, being a read, cannot see a send that
+    lands between it and the insert. Measured: with the pre-read left in place,
+    deleting the write-side guard outright (`unless_body_sent` off in
+    `enqueue_send`, or its clause dropped from `add`) broke *nothing* in this
+    file. Those mutations survived a full battery until this test existed.
+
+    Stubbing the pre-read is the only honest way to reach the write from a
+    single-threaded test, and it is the same device the in-flight sibling case
+    next door uses: in production the pre-read passes because the competing send
+    had not landed yet, which is exactly why the insert has to refuse for itself.
+
+    Also the only test standing on the *wording* of the post-write refusal.
+    `in_flight_for_item` returns None for a body duplicate, so this branch fell
+    through to "another send ... was already under way" — about a send that had
+    finished, which is why the replay reached the write at all.
+    """
+    import dashboard
+
+    _deal(tenant, "v7")
+    assert client.post("/responder/send",
+                       data={"item_id": "v7", "text": T2}).status_code == 200
+    _deliver(tenant, "v7", T2)
+    _redraft(tenant, "v7", T3)
+    assert outbox.in_flight_for_item(tenant, SITE, "v7") is None, (
+        "precondition: nothing in flight, so neither the sibling guard nor an "
+        "in-flight wording can account for what this asserts")
+    monkeypatch.setattr(dashboard, "_sent_state", lambda *a, **k: "")
+
+    resp = client.post("/responder/send", data={"item_id": "v7", "text": T2})
+
+    assert resp.status_code == 409, (
+        f"with the pre-read disabled the write let a duplicate through: "
+        f"{resp.status_code} {resp.get_json()}")
+    bodies = [b for _, b in _bodies_for(tenant, "v7")]
+    assert bodies.count(T2) == 1, (
+        f"{bodies.count(T2)} copies queued for one guest: {bodies}")
+    error = resp.get_json()["error"]
+    assert "under way" not in error.lower(), (
+        f"the post-write refusal explained a duplicate as a live send: {error!r}")
+    assert error == outbox.ALREADY_SENT_LABEL, (
+        f"the two refusal sites word one fact differently: {error!r}")
+
+
+def _bodies_for(tenant_id, item_id):
+    """Rows for one item read straight from SQL — see `_rows_for`.
+
+    Deliberately not `rows_by_item`: these tests must fail on the base commit
+    for the filed reason, not with an AttributeError on an API base lacks.
+    """
+    with outbox._conn() as c:
+        return c.execute(
+            "SELECT id, body FROM outbox WHERE tenant_id=? AND site=? "
+            "AND item_id=? ORDER BY id ASC",
+            (str(tenant_id), SITE, str(item_id)),
+        ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# VEN-170 review finding: the add()-side guard escaped its tenant/item scope
+# ---------------------------------------------------------------------------
+#
+# `outbox.add` interpolates its two optional clauses into
+#
+#     WHERE sib.tenant_id=? AND sib.site=? AND sib.item_id=? AND {terms}
+#
+# and `terms` OR-joins them when both flags are set. SQL binds AND tighter than
+# OR, so unparenthesized that reads `(tenant AND site AND item AND in_flight)
+# OR (already_sent)` — the already-sent half escapes the scope and is evaluated
+# against every row in the table. `automation.enqueue_send` sets both flags, so
+# it was live on the send button: one delivered body locked that exact text out
+# for every other guest and every other tenant, permanently, behind the very
+# "already under way" sentence this ticket exists to stop showing.
+#
+# The tests above could not see it, and the reason is structural rather than an
+# oversight: every one of them varies the *body* on a single item, where the
+# over-broad predicate and the correct one give the same answer. These hold the
+# body FIXED and vary the item and the tenant, which is the only pair of axes
+# that tells the two predicates apart. The 548-test suite and the 7-mutation
+# battery both ran green on the unfixed tree — the battery because every mutant
+# in it *weakens* the guard, and this defect over-broadens it.
+#
+# Measured one at a time against the unparenthesized head `f8307f1`:
+#   test_a_reply_sent_to_one_guest_does_not_lock_out_another   FAILS
+#   test_the_add_flags_together_stay_inside_their_scope         FAILS
+#   test_the_scoped_replay_is_still_refused                     passes (inverse)
+
+CANNED = "Hi! Yes, the unit is available for those dates. Let me know."
+
+
+def test_a_reply_sent_to_one_guest_does_not_lock_out_another(client, tenant):
+    """AC2 ("a genuinely new reply is still accepted") across two guests.
+
+    The existing AC2 test varies the body on one item. This one holds the body
+    fixed and varies the item, which is where an unscoped predicate shows.
+    """
+    _deal(tenant, "lockout-a", guest="Dana R.")
+    _deal(tenant, "lockout-b", guest="Sam T.")
+
+    assert client.post("/responder/send",
+                       data={"item_id": "lockout-a", "text": CANNED}
+                       ).status_code == 200, "precondition: first send refused"
+    _deliver(tenant, "lockout-a", CANNED)
+
+    # Preconditions: rule out the sibling guards, or a pass proves nothing
+    # about scope. Counted in SQL because `for_tenant` is not item-scoped.
+    assert outbox.in_flight_for_item(tenant, SITE, "lockout-b") is None
+    assert _bodies_for(tenant, "lockout-b") == [], (
+        "precondition: the second guest has no outbox rows at all")
+
+    resp = client.post("/responder/send",
+                       data={"item_id": "lockout-b", "text": CANNED})
+
+    assert resp.status_code == 200, (
+        "a guest who has received nothing was refused the host's standard "
+        f"reply because another guest got it: {resp.status_code} "
+        f"{resp.get_json()}")
+
+
+def test_the_scoped_replay_is_still_refused(client, tenant, monkeypatch):
+    """The inverse: scoping the guard must not defang it.
+
+    Same fixed body as the test above, same delivered state — only the item is
+    the same one. This is the case the guard exists for, and it is what stops
+    "just widen the scope until nothing is refused" from passing as a fix.
+
+    `_sent_state` is stubbed for the reason this ticket already recorded once:
+    it is scoped per-item, so it answers this replay first (with `Sent
+    <stamp>.`) and the write-side predicate — the one whose scoping this whole
+    section is about — is never reached. Measured: without the stub this test
+    passes even on a tree with the guarded branch deleted outright.
+    """
+    import dashboard
+
+    _deal(tenant, "lockout-a", guest="Dana R.")
+    assert client.post("/responder/send",
+                       data={"item_id": "lockout-a", "text": CANNED}
+                       ).status_code == 200
+    _deliver(tenant, "lockout-a", CANNED)
+    assert outbox.in_flight_for_item(tenant, SITE, "lockout-a") is None, (
+        "precondition: nothing in flight, so the in-flight half of the OR "
+        "cannot account for the refusal below")
+    monkeypatch.setattr(dashboard, "_sent_state", lambda *a, **k: "")
+
+    resp = client.post("/responder/send",
+                       data={"item_id": "lockout-a", "text": CANNED})
+
+    assert resp.status_code == 409
+    assert resp.get_json()["error"] == outbox.ALREADY_SENT_LABEL, (
+        "the duplicate refusal must name the duplicate, not a phantom send")
+
+
+def test_the_add_flags_together_stay_inside_their_scope(tenant):
+    """Both flags at the unit level — the only combination that was broken.
+
+    Either flag alone is a single clause with nothing to OR against, so it was
+    always correctly scoped; asserting the single-flag cases would pass on both
+    trees and prove nothing. All three axes are asserted in one test on purpose:
+    the same delivered row must refuse the replay *and* permit the other two,
+    and a fix that trades one for the other is what this is watching for.
+    """
+    def _add(tid, item, body):
+        return outbox.add(tid, SITE, item, sequence="presale", step_id="intro",
+                          step_label="Reply", body=body, reason="r", auto=True,
+                          unless_in_flight=True, unless_body_sent=True)
+
+    first = _add(tenant, "scope-a", CANNED)
+    assert first is not None
+    outbox.set_status(first["id"], outbox.SENDING)
+    outbox.set_status(first["id"], outbox.SENT)
+
+    replay = _add(tenant, "scope-a", CANNED)
+    other_guest = _add(tenant, "scope-b", CANNED)
+    other_tenant = _add("a-different-tenant", "scope-a", CANNED)
+
+    assert replay is None, "precondition: the duplicate guard still holds"
+    assert other_guest is not None, "another guest of this host was locked out"
+    assert other_tenant is not None, "ANOTHER TENANT was locked out"

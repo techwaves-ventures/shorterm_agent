@@ -115,8 +115,16 @@ def test_login_starts_scrape_for_tenant(monkeypatch):
 
 def test_state_defaults_to_operator_tenant(monkeypatch):
     seen = {}
-    monkeypatch.setattr(browser_server.runner, "get_state",
-                        lambda tid=None: seen.setdefault("tid", tid) or {"status": "idle"})
+
+    # Not `seen.setdefault(...) or {...}`: setdefault returns the tenant id,
+    # which is truthy, so that form short-circuits and hands the route the
+    # *string* "1" as the run state. Nothing asserted on the state, so it went
+    # unnoticed until a caller tried to read a field off it.
+    def fake_state(tid=None):
+        seen.setdefault("tid", tid)
+        return {"status": "idle"}
+
+    monkeypatch.setattr(browser_server.runner, "get_state", fake_state)
     client = browser_server.app.test_client()
     res = _post(client, "/v1/state", {}, "state-1")
     assert res.status_code == 200
