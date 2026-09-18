@@ -382,18 +382,25 @@ def can_deliver_in_process() -> bool:
 
     The single source of truth for "may I claim outbox rows?". It lives here
     rather than in dashboard.py because the claim happens here: `start_drainer`
-    is reached from six call sites in three modules, and two of them
-    (`enqueue_send`, `enqueue_autopilot_reply`) are library calls with no
-    dashboard anywhere in the stack — `/responder/send` reaches the drainer
-    only through `enqueue_send`, so a gate written at the routes would have
-    missed the primary send path.
+    is reached from six call sites across this module and dashboard.py, and
+    three of them (`_scheduler_loop`, `enqueue_send`,
+    `enqueue_autopilot_reply`) are library calls with no dashboard anywhere in
+    the stack — `/responder/send` reaches the drainer only through
+    `enqueue_send`, so a gate written at the routes would have missed the
+    primary send path.
 
     `FORCE_WORKER_QUEUE` is read from the environment on every call, not
     captured at import, so a test can flip the topology without reloading the
     module.
-    """
-    import os
 
+    `check_leads` is imported here rather than at module scope on purpose: it
+    pulls in the scraper and its optional Playwright dependency, and this
+    module's contract is that nothing in it touches a browser. The import is
+    cheap after the first call — `sys.modules` answers it — and cannot fail
+    where a module-scope one would not have: both entrypoints that can reach
+    this (`dashboard.py`, `worker.py`) already import `check_leads` at their
+    own module scope, so by the time anything calls this it is loaded.
+    """
     import check_leads
 
     forced_worker = os.getenv("FORCE_WORKER_QUEUE", "").strip().lower() in (
