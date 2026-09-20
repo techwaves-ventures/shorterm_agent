@@ -291,13 +291,55 @@ _MONTHS = {m: i for i, m in enumerate(
      "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
 
 
-def parse_date(value: str | None) -> str | None:
+# A yearless date ('Jul. 18' — the message-list style) is only half a calendar
+# date, and the half the site left out is the one that decides how old the
+# inquiry is. Filling in *this* year is right for most of the year and wrong in
+# exactly the window that matters: across New Year it is off by twelve months in
+# whichever direction hurts. A December lead read in January became eleven months
+# in the FUTURE (so the future gate dropped it and the deal was stamped brand
+# new); a 'Jan. 1' message read while the server clock still said 31 December
+# became 364 days in the PAST, which is past both LIVE_WINDOW_DAYS and
+# STALE_CLOSE_DAYS — so a guest who had just written in was silently closed as
+# `lost` without anyone answering them.
+#
+# The year the site meant is the one that puts the date nearest the day we are
+# reading it on. Only three years can ever be in reach, and the winner is always
+# within half a year; anything further away means the month/day cannot be placed
+# (a 29 February with no leap year nearby), and guessing is worse than None.
+_YEAR_REACH_DAYS = 183
+
+
+def _nearest_year(mon: int, day: int, ref) -> str | None:
+    """`mon`/`day` in whichever of the three candidate years sits closest to `ref`.
+
+    Ties (possible only across a leap year, where the two candidates are 366
+    days apart and each 183 away) resolve to the earlier year: the one caller
+    that reaches this code is reading dates the guest has already written.
+    """
+    best = None
+    for year in (ref.year - 1, ref.year, ref.year + 1):
+        try:
+            candidate = datetime(year, mon, day).date()
+        except ValueError:
+            continue  # 29 February in a year that has none.
+        gap = abs((candidate - ref).days)
+        if gap <= _YEAR_REACH_DAYS and (best is None or gap < best[0]):
+            best = (gap, candidate)
+    return best[1].isoformat() if best else None
+
+
+def parse_date(value: str | None, today: str | None = None) -> str | None:
     """Normalize the date shapes FurnishedFinder emits into ISO `YYYY-MM-DD`.
 
     Handles the row style ('7/18/26', '9/1/2026'), the detail style
     ('July 18, 2026', 'Feb. 10, 2026') and the message-list style ('Jul. 18',
-    which carries no year — assumed to be the current one). Returns None when
-    nothing parses, so callers can degrade rather than guess.
+    which carries no year — filled in as the year that puts it nearest `today`,
+    see `_nearest_year`). Returns None when nothing parses, so callers can
+    degrade rather than guess.
+
+    `today` is the ISO date the yearless shape is read relative to, defaulting
+    to the server's — same shape and same default as `advance_lifecycle`, so a
+    caller that knows the property's own calendar day can pass it instead.
     """
     if not value:
         return None
@@ -319,9 +361,12 @@ def parse_date(value: str | None) -> str | None:
         if not mon:
             return None
         day = int(m.group(2))
-        year = int(m.group(3)) if m.group(3) else datetime.now().year
+        if not m.group(3):
+            ref = (datetime.fromisoformat(today).date() if today
+                   else datetime.now().date())
+            return _nearest_year(mon, day, ref)
         try:
-            return datetime(year, mon, day).date().isoformat()
+            return datetime(int(m.group(3)), mon, day).date().isoformat()
         except ValueError:
             return None
     return None
