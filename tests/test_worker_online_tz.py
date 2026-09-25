@@ -319,7 +319,7 @@ def test_legacy_naive_row_survives_an_ambiguous_wall_clock():
     old -- so a live worker reports OFFLINE and `reap_stale()` destroys its
     in-flight jobs, on a single-host deploy that has no timezone split at all.
     This fix's fallback avoids that by reusing the pre-fix subtraction verbatim,
-    and this pins that it stays that way: the promise in `_now_utc` is that the
+    and this pins that it stays that way: the promise in `jobs._now_utc` is that the
     legacy branch is never *newly* wrong, and an untested promise is a wish.
     """
     tz = _fold_tz()

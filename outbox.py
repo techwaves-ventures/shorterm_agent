@@ -148,30 +148,6 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def _now_utc() -> str:
-    """An *absolute* stamp, for the one column compared across processes.
-
-    Every other timestamp here is naive local wall-clock, which is fine while a
-    single host both writes and reads it. `sending_at` is not that column: it is
-    written by whichever process claims the send and read by whoever reclaims,
-    and on the worker-queue topology those are different hosts sharing one
-    `DATABASE_URL` — the worker may sit in any timezone while the web dyno runs
-    UTC. Comparing a naive stamp across that boundary is off by the offset, and
-    in the dangerous direction it makes a one-second-old live send look hours
-    stale and hands it to a second drainer, delivering the message twice.
-
-    So this column carries its offset. Deliberately narrow: `_now()` is shared
-    with `approved_at`/`sent_at`/`created_at`, which record when something
-    happened for a human to read and are never compared across hosts.
-
-    `scheduled_at` used to be on that list and should not have been — it is
-    written by the drafting/approving host and gated by the draining host, the
-    same split this stamp exists for. It is fixed separately rather than here,
-    because it is compared with SQL `<=` and `ORDER BY` and so cannot carry an
-    offset suffix without breaking that lexicographic compare. See `timeframe`.
-    """
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
 
 def _row(row) -> dict | None:
     return dict(zip(_COLS, row)) if row else None
@@ -624,14 +600,15 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
     The comparison is absolute, not wall-clock: the claiming process and the
     reclaiming one are different hosts on the worker-queue topology, and a naive
     stamp read across that boundary is off by the offset — westward it makes a
-    live send look stale and delivers it twice. See `_now_utc`. A stamp that
+    live send look stale and delivers it twice. See `db.utc_now_sql`. A stamp that
     predates that column carrying its offset is therefore not judged at all,
     only replaced; ages are measured on the pass after.
     """
-    now = datetime.now(timezone.utc)
-    cutoff = now.timestamp() - max_age_seconds
     requeued = 0
     with _conn() as c:
+        # Both ends of the age comparison from the one shared clock.
+        now = db.utc_now(c)
+        cutoff = now.timestamp() - max_age_seconds
         rows = c.execute(
             f"{_SELECT} WHERE status=?", (SENDING,)
         ).fetchall()
@@ -643,12 +620,12 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
                 stamp = datetime.fromisoformat(str(msg.get("sending_at") or ""))
             except ValueError:
                 # Unknown start time: assume it began now and revisit next pass.
-                c.execute("UPDATE outbox SET sending_at=? WHERE id=? AND status=?",
-                          (_now_utc(), msg["id"], SENDING))
+                c.execute(f"UPDATE outbox SET sending_at={db.utc_now_sql()} "
+                          "WHERE id=? AND status=?", (msg["id"], SENDING))
                 continue
             if stamp.tzinfo is None:
                 # Written before `sending_at` carried its offset (see
-                # `_now_utc`), so it names a wall-clock reading on an unknown
+                # `db.utc_now_sql`), so it names a wall-clock reading on an unknown
                 # host. There is no sound way to place it on the timeline: read
                 # as the reader's local zone, a writer to the west resolves
                 # hours into the past, and a one-second-old live claim is
@@ -663,8 +640,8 @@ def reclaim_stuck_sending(max_age_seconds: int = 900) -> int:
                 # wedged at deploy time takes two passes — after the restamp, the
                 # row must age out again (up to max_age_seconds); the alternative
                 # is sending a live message twice.
-                c.execute("UPDATE outbox SET sending_at=? WHERE id=? AND status=?",
-                          (_now_utc(), msg["id"], SENDING))
+                c.execute(f"UPDATE outbox SET sending_at={db.utc_now_sql()} "
+                          "WHERE id=? AND status=?", (msg["id"], SENDING))
                 continue
             if stamp.timestamp() >= cutoff:
                 continue
@@ -755,8 +732,8 @@ def set_status(msg_id: int, status: str, *, error: str | None = None,
         # When the send actually started — which is what "stuck" is measured
         # against. `approved_at` cannot answer that: a message approved into
         # quiet hours sits queued for hours before anyone picks it up.
-        sets.append("sending_at=?")
-        vals.append(_now_utc())  # absolute: read by other hosts, see `_now_utc`
+        # Stamped by the *database's* clock, not this host's: see `db.utc_now_sql`.
+        sets.append(f"sending_at={db.utc_now_sql()}")
         sets.append("attempts=COALESCE(attempts,0)+1")
     if status == SENT:
         sets.append("sent_at=?")

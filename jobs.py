@@ -80,7 +80,7 @@ def _now_utc() -> str:
     `reap_stale` then never frees its stranded jobs.
 
     So this column carries its offset. Deliberately narrow, mirroring
-    `outbox._now_utc`: `_now()` is shared with `created_at`/`updated_at`, which
+    `db.utc_now_sql` (the shared-clock helper `outbox` now uses): `_now()` is shared with `created_at`/`updated_at`, which
     are left naive here only because they are outside this change's scope --
     *not* because they were checked and cleared. Both in fact cross the same
     host boundary and are wrong in the same way: `created_at` via `reap_stale`,
