@@ -101,11 +101,27 @@ def _idle():
 
 def _stub_browser(monkeypatch):
     """Neutralise the FurnishedFinder seam so `_send_worker` can run for real
-    without a browser. Channels are emptied, so the worker takes its normal
-    success path straight to the terminal write."""
-    monkeypatch.setattr(runner, "_channels", lambda _t: set())
+    without a browser. Channels are pinned to platform-only and the platform
+    reply is a no-op that always "delivers", so the worker takes its normal
+    success path straight to the terminal write (VEN-218: an empty channel set
+    is now a genuine zero-delivery arm that raises, not a stand-in for "the
+    platform reply succeeded")."""
+    import check_leads
+    from sites import furnishedfinder
+
+    monkeypatch.setattr(runner, "_channels", lambda _t: {"platform"})
     monkeypatch.setattr(runner.furnishedfinder, "set_context", lambda *a, **k: None)
     monkeypatch.setattr(runner.furnishedfinder, "clear_context", lambda *a, **k: None)
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def _page(tenant_id):
+        yield object()
+
+    monkeypatch.setattr(check_leads, "browser_page", _page)
+    monkeypatch.setattr(furnishedfinder, "send_reply", lambda *a, **k: None)
+    monkeypatch.setattr(furnishedfinder, "send_message_reply", lambda *a, **k: None)
 
 
 # ---------------------------------------------------------------------------
