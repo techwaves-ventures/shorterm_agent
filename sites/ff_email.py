@@ -206,8 +206,13 @@ _FORWARD_LOOKAHEAD = 6
 # turned a reply reading "Sounds good." into the quoted "Any update?".
 #
 # So the marker gets its own pattern, honoured only when the header block under
-# it names FurnishedFinder: a forward *of a notification* carries our sender, a
-# reply quoting our mail carries the host's.
+# it names FurnishedFinder. What that separates is "quotes our notification"
+# from "quotes the host" — not "forward" from "reply". A host *replying* from
+# Outlook while quoting our notification passes the gate, and their own line
+# above the marker is dropped along with the wrapper. That is the right trade
+# and the same one a forward with a host's note above it makes: the guest's
+# words are what belongs in a guest message, and the id lands on the deal the
+# notification already opened.
 _OUTLOOK_BANNER = re.compile(r"^\s*-{2,}\s*original message\s*-{2,}\s*$", re.I)
 # Outlook on the web forwards with no banner at all — it just prepends the
 # header block. A bare run of headers is too weak a signal on its own, so all
@@ -233,8 +238,24 @@ _FORWARD_FROM_DOMAINS = ("furnishedfinder.com",)
 
 def _from_is_ff(line: str) -> bool:
     """Whether a `From:` header line names a FurnishedFinder address."""
+    if not any(d in line.lower() for d in _FORWARD_FROM_DOMAINS):
+        # Necessary condition for the comparison below — the domain has to be
+        # in the line literally for a mailbox to end with it — and far cheaper
+        # than `parseaddr`. Not a shortcut in the "probably fine" sense: a
+        # substring is exactly what a suffix test needs, which is why it can
+        # only ever answer earlier and never differently. Without it, a 512KB
+        # body that is nothing but non-FurnishedFinder `From:` lines costs 3x a
+        # body with none, since the header run has no bound on its length.
+        return False
     _, addr = parseaddr(line.split(":", 1)[1] if ":" in line else "")
-    domain = addr.strip().lower().rpartition("@")[2]
+    addr = addr.strip().lower()
+    if "@" not in addr:
+        # `rpartition` hands back the whole string when the separator is absent,
+        # so a bare `From: furnishedfinder.com` would pass a domain comparison
+        # that never saw a mailbox. `sender_allowed` compares the domain of an
+        # address; so does this.
+        return False
+    domain = addr.rpartition("@")[2]
     return bool(domain) and any(
         domain == d or domain.endswith("." + d) for d in _FORWARD_FROM_DOMAINS
     )
@@ -259,7 +280,10 @@ def _forward_header_block(lines: list[str], i: int) -> tuple[int, str, set, bool
         labels.add(label)
         if label in ("date", "sent"):
             date = lines[j].split(":", 1)[1].strip()
-        if label == "from" and _from_is_ff(lines[j]):
+        # One `parseaddr` per `From:` line, over a header run with no bound on
+        # its length, doubled the cost of parsing a body that is nothing but
+        # headers. One answer is all this needs, so stop asking once it is yes.
+        if label == "from" and not from_ff and _from_is_ff(lines[j]):
             from_ff = True
         j += 1
     return j, date, labels, from_ff
@@ -272,11 +296,19 @@ def _forward_split_once(lines: list[str]) -> tuple[int, str]:
             j, date, _, _ = _forward_header_block(lines, i + 1)
             return j, date
         if _OUTLOOK_BANNER.match(line):
-            # Ambiguous marker: only a block naming FurnishedFinder is a
-            # forward. Anything else is quoted history, and `_strip_quoted`
-            # owns it — so give up rather than guess at a later banner.
+            # Ambiguous marker: only a block naming FurnishedFinder makes it a
+            # forward wrapper. Anything else is quoted history and
+            # `_strip_quoted` owns it — but keep scanning, because an
+            # *unambiguous* banner can sit underneath one. A host whose Gmail
+            # auto-forwards their FurnishedFinder mail and who then sends it on
+            # from Outlook renders exactly that: Outlook's marker naming their
+            # own address, with Gmail's banner below it. Returning here read
+            # that body as "not a forward" at all — this ticket's own two
+            # symptoms, one layer further out, on a shape that already worked.
             j, date, _, from_ff = _forward_header_block(lines, i + 1)
-            return (j, date) if from_ff else (0, "")
+            if from_ff:
+                return j, date
+            continue
     # No banner: a headerless forward only counts when the body *opens* with the
     # header block, names all three required labels, and names FurnishedFinder.
     for line in lines[:_FORWARD_LOOKAHEAD]:

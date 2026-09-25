@@ -33,10 +33,21 @@ hazard `_QUOTE_START`'s own comment warns about, and
 `test_a_short_reply_above_an_outlook_quote_keeps_the_guests_line` is the
 control that keeps it fixed.
 
-The discriminator is the header block: a forward *of a notification* names a
-furnishedfinder.com `From:`, a reply quoting our own mail names the host. So
-`_FORWARD_BANNER` is byte-identical to before — nothing that worked already can
-move — and Outlook's marker is matched separately, behind that gate.
+The discriminator is the header block: what it names is either our notification
+or the host. So `_FORWARD_BANNER` is byte-identical to before — nothing that
+worked already can move — and Outlook's marker is matched separately, behind
+that gate.
+
+## Refusing the ambiguous marker is not the same as giving up
+
+The gate lives inside a scan over a lookahead window, and refusing the marker
+with a `return` abandoned the rest of that window — so an unambiguous banner
+sitting underneath one stopped being seen. `test_an_outlook_wrapper_around_a_
+gmail_forward_still_collapses` is that case: a host whose Gmail relays their
+FurnishedFinder mail into Outlook, sending it on from there. It parses correctly
+before any of this work, and the regression produced this ticket's own two
+symptoms on it. A moved id is only safe when it moves *onto* the notification's
+key; those moved away from it.
 
 Tenants are namespaced `v222-*` so a whole-suite run cannot collide this file's
 dedup rows with a sibling's — `db.DB_PATH` is resolved once per process.
@@ -214,6 +225,74 @@ def test_a_short_reply_above_an_outlook_quote_keeps_the_guests_line(tenant):
     )
 
 
+REPLY_FROM_OUTLOOK_QUOTING_FF = "Thanks, I will call them.\n\n" + fwd_outlook(msg())
+
+
+def test_a_host_replying_from_outlook_is_read_as_quoting_our_notification(tenant):
+    """What the gate actually separates, pinned so the comment stays honest.
+
+    It is not "forward" against "reply" — it is "quotes our notification"
+    against "quotes the host". This body is a host *replying* to us with our own
+    notification quoted underneath, so it passes the gate and their aside above
+    the marker goes with the wrapper.
+
+    That is the intended trade, and the same one `fwd_outlook_intro` makes: what
+    belongs in a guest message is the guest's words, and the id has to land on
+    the deal the notification already opened rather than starting a new one.
+    """
+    _, item = ingest(tenant, "RE: New message", REPLY_FROM_OUTLOOK_QUOTING_FF,
+                     FORWARD_DATE)
+
+    assert item["body"].strip() == "Any update?"
+    assert item["dedup_id"] == "596d5ef7f49cbe36"
+
+
+# --- an unrecognised wrapper must not hide a real banner underneath it -------
+
+def relay_via_outlook(inner, sender="Dana Host <dana@gmail.com>"):
+    """The host's Outlook wrapped around a forward some other client made.
+
+    Their Gmail auto-forwards FurnishedFinder's mail to the mailbox they read in
+    Outlook, and they send that on to us. Outlook's header block names *their*
+    address, so the FurnishedFinder gate refuses it — correctly — and the banner
+    that does belong to a forward is the one below.
+    """
+    return ("-----Original Message-----\n"
+            f"From: {sender}\n"
+            "Sent: Saturday, August 15, 2026 9:12 AM\n"
+            "Subject: Fwd: New message\n\n") + inner
+
+
+@pytest.mark.parametrize("inner", [fwd_gmail, fwd_apple], ids=["gmail", "apple"])
+def test_an_outlook_wrapper_around_a_gmail_forward_still_collapses(tenant, inner):
+    """Refusing the ambiguous marker must not abandon the scan.
+
+    `_forward_split_once` walks a lookahead window, so returning on the
+    ambiguous marker threw away the rest of that window — including an
+    unambiguous `_FORWARD_BANNER` sitting right under it. These bodies parse
+    correctly on `63f2df6`, before any of this work: split 11, the guest's words
+    stored, the id on the notification's key. Refusing the marker with a
+    `return` instead of a `continue` regressed them to split 0, header noise as
+    the stored body, and an id pointing *away* from `596d5ef7f49cbe36` — a
+    second deal for one conversation, which is the defect this ticket is about.
+
+    Moving away from the notification's key is the direction that is not safe: a
+    deal opened by one of these forwards would be orphaned rather than joined.
+    """
+    body = relay_via_outlook(inner(msg()))
+
+    assert ff_email._forward_split(body)[0] != 0, (
+        "an unrecognised Outlook marker suppressed the banner beneath it"
+    )
+
+    assert ingest(tenant, "New message", msg(), ORIGINAL_DATE)[0]
+    took, item = ingest(tenant, "Fwd: New message", body, FORWARD_DATE)
+
+    assert not took, "the relayed forward opened a second deal"
+    assert item["dedup_id"] == "596d5ef7f49cbe36"
+    assert item["body"].strip() == "Any update?"
+
+
 @pytest.mark.parametrize(
     "sender, is_forward",
     [
@@ -222,8 +301,13 @@ def test_a_short_reply_above_an_outlook_quote_keeps_the_guests_line(tenant):
         ("Evil <x@furnishedfinder.com.evil.example>", False),
         ('"no-reply@furnishedfinder.com" <x@evil.example>', False),
         ("Host <host@example.com>", False),
+        ("furnishedfinder.com", False),
+        ("mail.furnishedfinder.com", False),
+        ("x@evil.example, y@furnishedfinder.com", False),
     ],
-    ids=["ff", "ff_subdomain", "suffix_lookalike", "display_name_spoof", "host"],
+    ids=["ff", "ff_subdomain", "suffix_lookalike", "display_name_spoof", "host",
+         "bare_domain_no_mailbox", "bare_subdomain_no_mailbox",
+         "second_address_is_ff"],
 )
 def test_the_from_gate_matches_the_domain_the_way_the_allowlist_does(
         sender, is_forward):
@@ -235,6 +319,12 @@ def test_the_from_gate_matches_the_domain_the_way_the_allowlist_does(
     exact shape `inbound.sender_allowed` already carries scar tissue for, so
     this gate is written the same way.
 
+    `rpartition("@")` returns the whole string when there is no `@`, so a bare
+    `From: furnishedfinder.com` compared equal to the allowed domain without
+    ever naming a mailbox; the two bare-domain cases pin that shut. And
+    `parseaddr` reads the *first* address in the value, which is what makes
+    `x@evil.example, y@furnishedfinder.com` refused rather than accepted.
+
     Being wrong here cannot forge a deal — the envelope is what authenticates
     mail, in `inbound.sender_allowed`, and this only ever decides how much of a
     body to strip. It is still worth not diverging from the allowlist.
@@ -245,6 +335,60 @@ def test_the_from_gate_matches_the_domain_the_way_the_allowlist_does(
             "Subject: New message\n\n") + _quote(msg())
 
     assert (ff_email._forward_split(body)[0] != 0) is is_forward
+
+
+def _from_is_ff_reference(line):
+    """`_from_is_ff` without its substring fast path — the slow, obvious form."""
+    from email.utils import parseaddr
+
+    _, addr = parseaddr(line.split(":", 1)[1] if ":" in line else "")
+    addr = addr.strip().lower()
+    if "@" not in addr:
+        return False
+    domain = addr.rpartition("@")[2]
+    return bool(domain) and any(
+        domain == d or domain.endswith("." + d)
+        for d in ff_email._FORWARD_FROM_DOMAINS
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "From: FurnishedFinder <no-reply@furnishedfinder.com>",
+        "From: NO-REPLY@FURNISHEDFINDER.COM",
+        "From: FF <no-reply@mail.furnishedfinder.com>",
+        "From: x@furnishedfinder.com.evil.example",
+        'From: "no-reply@furnishedfinder.com" <x@evil.example>',
+        "From: furnishedfinder.com",
+        "From: <furnishedfinder.com>",
+        "From: x@evil.example, y@furnishedfinder.com",
+        "From: y@furnishedfinder.com, x@evil.example",
+        "From: Host <host@example.com>",
+        "From: host@furnishedfinder.com.br",
+        'From: "weird\\"quote"@furnishedfinder.com',
+        "From: x@(comment)furnishedfinder.com",
+        "From: x@FurnishedFinder.Com ",
+        "From: mail.furnishedfinder.com",
+        "From:",
+        "From: ",
+        "From: nofurnishedfinder.comhere",
+        "from: no-reply@furnishedfinder.com",
+        "From: no-reply@sub.mail.furnishedfinder.com",
+    ],
+)
+def test_the_substring_fast_path_never_changes_the_gates_answer(line):
+    """The cheap test in front of `parseaddr` has to be transparent.
+
+    `_from_is_ff` runs once per `From:` line over a header run with no bound on
+    its length, so on a body that is nothing but headers `parseaddr` dominated
+    the cost of parsing the whole email. The fast path is a substring test,
+    which is a necessary condition for the suffix comparison that follows — so
+    it can answer *earlier* but never differently. This pins that claim rather
+    than asserting it, against the same adversarial lines the gate itself is
+    tested on plus the shapes where `parseaddr` is least predictable.
+    """
+    assert ff_email._from_is_ff(line) is _from_is_ff_reference(line)
 
 
 # --- FurnishedFinder's own wrapper is not a forward header block ------------
