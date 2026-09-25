@@ -674,7 +674,11 @@ def recover(tenant_id: str, item: dict, site: str = "furnishedfinder") -> tuple[
     import storage
 
     kind = item.get("kind", "lead")
-    if storage.already_seen(tenant_id, site, kind, item.get("id", "")):
+    # `item=` so this read and the `filter_new` write below answer on the same
+    # rule. Without it a re-forward of a message already held looks unseen here
+    # while `store` would have dropped it, and recovery opens a second deal for
+    # a copy.
+    if storage.already_seen(tenant_id, site, kind, item.get("id", ""), item=item):
         # `seen` does not mean "landed": `store` keeps its dedup row even when
         # the board refuses the item, so that the stored payload survives for
         # `pipeline.backfill` to heal from. Reporting on_board from the flag
