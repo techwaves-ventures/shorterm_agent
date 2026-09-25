@@ -191,19 +191,14 @@ def test_a_forward_arriving_before_the_original_still_collapses(tenant):
     assert not took, "the original arriving after its forward opened a second deal"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Pre-existing and out of VEN-155's scope: `_FORWARD_BANNER` does not "
-           "know Outlook's '-----Original Message-----', so the banner is never "
-           "stripped and the body fingerprints differ. Fails identically on "
-           "63f2df6 — measured, not assumed. Strict, so fixing it turns this "
-           "red and forces the marker off.",
-)
 def test_an_outlook_re_forward_does_not_open_a_second_deal(tenant):
-    """Documented, not fixed. Widening the banner regex changes what
-    `_strip_forwarded` removes, which changes every message fingerprint and
-    therefore re-keys live conversations — the one thing this ticket was told
-    not to do. It needs its own ticket and its own re-key measurement."""
+    """Was a strict xfail here; fixed by VEN-222, which did the re-key
+    measurement this ticket was not allowed to skip. Outlook's marker is not in
+    `_FORWARD_BANNER` even now — it doubles as a reply-quote marker, so it is
+    matched separately and only honoured when the header block under it names
+    FurnishedFinder. Kept in this file because it is the direction VEN-155's
+    two-key rule has to keep satisfying; the rest of that work is in
+    `tests/test_ven222_outlook_forward.py`."""
     assert ingest(tenant, "New message", msg(), ORIGINAL_DATE)[0]
     took, _ = ingest(tenant, "Fwd: New message", fwd_outlook(msg()), FORWARD_DATE)
     assert not took
