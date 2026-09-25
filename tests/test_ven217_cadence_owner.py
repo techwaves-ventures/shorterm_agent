@@ -68,9 +68,9 @@ def contacts(monkeypatch):
     calls = []
     real = automation.after_contact
 
-    def counting(tenant_id, site, item_id):
+    def counting(tenant_id, site, item_id, **kw):
         calls.append(item_id)
-        return real(tenant_id, site, item_id)
+        return real(tenant_id, site, item_id, **kw)
 
     monkeypatch.setattr(automation, "after_contact", counting)
     return calls
