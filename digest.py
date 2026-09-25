@@ -55,8 +55,26 @@ def build(tenant_id: str, now: datetime | None = None) -> dict | None:
     channel, so a day with no leads, no pending approvals and no failures sends
     nothing at all.
     """
-    local_now = scheduler.local_now(tenant_id, now)
-    since = local_now - timedelta(hours=24)
+    # The window boundary has to be in the same frame as the stamps it filters.
+    # `created_at` and `sent_at` are naive *server* wall clock (pipeline._now,
+    # outbox._now), so the boundary is too. Property-local time decides *when*
+    # the digest fires (scheduler.digest_due) and must not also shift *what* it
+    # covers: reading the boundary off the property clock slid the window by the
+    # offset between the two zones, so an eastward property silently lost the
+    # tail of its own day and a westward one reported yesterday's work as today's
+    # (the filter is `>=` with no upper bound).
+    #
+    # Kept naive and suffix-free on purpose: these columns are compared as
+    # strings, so an offset suffix would break the lexicographic ordering. An
+    # aware `now` is *converted* into the server frame rather than stripped —
+    # stripping would reinstate the same class of bug one layer down.
+    #
+    # Caveat, deliberately accepted: naive wall clock minus 24h spans 23h or 25h
+    # of real time on the two days a year the *server's* zone changes offset.
+    # That is zero on a UTC host (the hosted topology) and is a far smaller error
+    # than the permanent multi-hour skew it replaces.
+    server_now = now.astimezone().replace(tzinfo=None) if (now and now.tzinfo) else (now or datetime.now())
+    since = server_now - timedelta(hours=24)
 
     responses = storage.get_responses(tenant_id, SITE)
     deals = pipeline.all_deals(tenant_id, SITE)
