@@ -189,8 +189,28 @@ def _can_deliver_in_process() -> bool:
 
     On serverless (no Playwright) or when the worker queue is forced, delivery
     belongs to worker.py instead — starting a drainer here would spin uselessly.
+
+    Delegates to `automation.can_deliver_in_process` so the routes and the
+    drainer can never drift apart on the answer. Kept as a module-level name
+    because the reclaim tests monkeypatch it to simulate a worker-queue host.
     """
-    return check_leads.playwright_available() and not _use_worker_queue()
+    return automation.can_deliver_in_process()
+
+
+# Gating `start_drainer` makes a misconfigured deploy quiet instead of loud: an
+# approved message on a Playwright-less host with no worker used to go
+# `sending` -> `failed` fast and say "Send failed", and now correctly stays
+# `queued` — but would sit there with the UI reporting "Queued to send…" and
+# nothing alive to pick it up. `queued` is the right *state*; silence about it
+# is not, and the operator asked for that misconfiguration to be surfaced.
+#
+# That surface is deliberately NOT built here. It needs a signal that means
+# "something drains the outbox", and the only liveness signal this codebase has
+# — `jobs.worker_online()` — does not mean that: `worker.run_once` heartbeats
+# and then claims a *scrape job*, never touching the outbox, and
+# `chrome_task_server.py` calls it on every authenticated `/v1/wake`. A banner
+# keyed off it suppresses itself in exactly the deployment it exists to warn
+# about. Tracked as VEN-240, which owns inventing the right beacon.
 
 
 def _live_state(tenant_id: str) -> dict:
@@ -286,15 +306,25 @@ def _board(tenant_id: str) -> dict:
     # /api/send-states poll moments later already said `queued`. The render that
     # fixes something is the render that most needs to show it.
     #
-    # The reclaim is deliberately *not* gated on `_can_deliver_in_process()`.
-    # It is pure DB work — it drives no browser — and the topology that cannot
-    # deliver in-process is exactly the one that most needs it: `start_drainer`
-    # on the approve route is ungated, so this process claims rows into
-    # `sending` whether or not it can finish them, and worker.py is then the
-    # only other reclaimer. With no worker running, gating this stranded the
-    # row forever: `sending` is not cancelable (see `outbox.CANCELABLE`), and
+    # The reclaim is *still* deliberately not gated on
+    # `_can_deliver_in_process()` — reaffirmed, but the argument for it has
+    # changed, because the premise it used to rest on is gone.
+    #
+    # It used to read: this process claims rows into `sending` whether or not
+    # it can finish them (`start_drainer` on the approve route being ungated),
+    # so it must be able to recover its own strandings. `start_drainer` is now
+    # gated centrally (`automation.can_deliver_in_process`), so an incapable
+    # host no longer strands anything of its own. That justification is retired.
+    #
+    # The reclaim stays ungated for a different and simpler reason: it is pure
+    # DB work, it drives no browser, and the rows it recovers are not
+    # necessarily this host's. A crashed *capable* host leaves `sending` rows
+    # behind, and on the worker-queue topology the serverless dashboard may be
+    # the only process still running to notice. Gating it would strand those
+    # rows: `sending` is not cancelable (see `outbox.CANCELABLE`) and
     # `has_open_step` counts it as open, so the agent never re-drafts that step
-    # for that guest again.
+    # for that guest again. Recovering a row you did not strand is safe; the
+    # thing that must be gated is *claiming* one, and that now is.
     outbox.reclaim_stuck_sending()
 
     pending = {
@@ -1391,9 +1421,34 @@ def autopilot_toggle():
         check_times=",".join(t.strftime("%H:%M") for t in parsed) or config.DEFAULT_CHECK_TIMES,
     )
     if on:
-        automation.start_scheduler(SITE)
-        flash(f"Autopilot is on — checking {scheduler.next_run(tenant_id)} "
-              "and replying to good-fit leads automatically.")
+        # Only run the schedule in-process on a host that can actually drive a
+        # browser. This matches `_start_background_agents`, which has always
+        # been gated this way — so before this, boot and the toggle disagreed:
+        # a serverless host started no scheduler at boot but did start one the
+        # moment someone flipped this switch, and that thread then called
+        # `start_drainer` every 60s forever, claiming rows it could not send.
+        #
+        # Gating it does *not* turn the feature off. The durable effect of this
+        # route is the `save_settings` write above, and worker.py reads that
+        # same row (worker.py -> run_scheduled_checks -> scheduler.due_tenants
+        # -> is_on -> config.get_settings). On the worker-queue topology the
+        # worker runs the schedule; the in-process thread is only the execution
+        # engine for single-host deploys. Refusing the toggle here would have
+        # made autopilot unreachable on the deployment it is documented for.
+        #
+        # The message names who will honour the setting and stops there. It
+        # deliberately does not claim the worker is *up*: `jobs.worker_online()`
+        # tracks the scrape-job worker, not whatever drains the outbox, so a
+        # liveness claim read off it would be wrong in both directions. VEN-240
+        # owns surfacing "nothing can send" once a beacon exists that means it.
+        if _can_deliver_in_process():
+            automation.start_scheduler(SITE)
+            flash(f"Autopilot is on — checking {scheduler.next_run(tenant_id)} "
+                  "and replying to good-fit leads automatically.")
+        else:
+            flash(f"Autopilot is on — checking {scheduler.next_run(tenant_id)} "
+                  "and replying to good-fit leads automatically. Checks run on "
+                  "the worker service for this deployment.")
     else:
         flash("Autopilot is off. Checks and replies are manual again.")
     return redirect(url_for("automations"))

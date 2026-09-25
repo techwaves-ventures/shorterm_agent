@@ -336,12 +336,18 @@ def test_a_host_that_cannot_deliver_still_reclaims_its_own_stranded_sends(
     directly with an age no production caller uses, so it passed even while the
     real call site was unreachable. This one goes through `_board`.
 
-    `start_drainer` on the approve route is *not* gated on
-    `_can_deliver_in_process()`, so a worker-queue host claims rows into
-    `sending` regardless. Gating the reclaim on it meant that host never
-    recovered its own stranded rows, and with `sending` no longer cancelable
-    the operator had no route left at all: `has_open_step` counts the row as
+    Historically `start_drainer` was ungated, so a worker-queue host claimed
+    rows into `sending` it could not finish and had to be able to recover them.
+    It is gated now (`automation.can_deliver_in_process`, VEN-149), so an
+    incapable host strands nothing of its own — but the reclaim must stay
+    ungated regardless, which is what this still pins. A crashed *capable* host
+    leaves `sending` rows behind and the serverless dashboard may be the only
+    process left to notice; with `sending` not cancelable, gating the reclaim
+    would leave the operator no route at all: `has_open_step` counts the row as
     open, so the agent never re-drafts that step for that guest either.
+
+    The name says "its own" for history; the property under test is the one
+    that outlived the premise — an incapable host reclaims, full stop.
     """
     import dashboard
 

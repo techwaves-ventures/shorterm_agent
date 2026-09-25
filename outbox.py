@@ -69,9 +69,15 @@ APPROVABLE = (PENDING, FAILED)
 # nothing: a row wedged by a crashed process is returned to `queued` (or failed
 # at the attempt cap) by `reclaim_stuck_sending`, which every dashboard render
 # now calls unconditionally — it is pure DB work, and gating it on "can this
-# process drive a browser" left the worker-queue topology unable to recover the
-# rows its own ungated `start_drainer` had claimed. Both of those states are
+# process drive a browser" would leave a crashed *capable* host's rows
+# unrecoverable on the worker-queue topology, where the serverless dashboard
+# may be the only process left running to notice them. Both of those states are
 # cancelable again.
+#
+# (That reason used to be stated as recovering "the rows its own ungated
+# `start_drainer` had claimed". An incapable host no longer claims any:
+# `start_drainer` is gated centrally on `automation.can_deliver_in_process`.
+# The reclaim stays ungated, but now purely to recover *other* hosts' rows.)
 #
 # Accepted cost: for the first `reclaim_stuck_sending` interval (900s from
 # `sending_at`) a crashed send is uncancelable, where before it was cancelable
