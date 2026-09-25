@@ -542,20 +542,19 @@ def test_abandonment_bound_is_anchored_to_midnight_not_to_the_hour(
 
 def test_inquiry_at_holds_two_frames_in_indistinguishable_shapes(
         tenant, monkeypatch):
-    """VEN-225 AC1 — the premise, asserted from the real write path.
+    """VEN-225 AC1 — the premise, updated by VEN-226.
 
-    Green on `main` and on VEN-223: it documents what the column already
-    contains rather than anything this change introduces. It is here because the
-    entire design rests on the *second* assertion — that the two stored shapes
-    are identical — and a design resting on an unasserted fact is resting on a
-    comment.
+    Rows written before VEN-226 hold two frames in shapes no reader can tell
+    apart: `f"{listing_date}T09:00:00"` (a property-calendar date at 09:00) and
+    `_now()` (a server instant). Both arrive naive, `T`-separated and to the
+    second, so `norm_ts` passes both through untouched, and no reader downstream
+    could tell which arm wrote a given row.
 
-    `derive` writes `f"{listing_date}T09:00:00"` when the listing's date parses,
-    a zoneless **property**-calendar date, and `_now()` when it does not, a
-    server instant. Both arrive naive, `T`-separated and to the second, so
-    `norm_ts` — which converts only space-separated values, the database's UTC
-    default — passes both through untouched, and no reader downstream can tell
-    which arm wrote a given row.
+    After VEN-226 both arms write in the SERVER frame, so new rows no longer
+    hold mixed frames. This test keeps its purpose — the core payload is the
+    second half (both values are naive, T-separated, seconds precision, so
+    `norm_ts` handles both correctly) — and now also asserts that the parsed arm
+    stores 09:00 property-local *in the server frame*.
     """
     zone, server_now, prop_date = _zone_where_property_is(BEHIND)
     assert prop_date != server_now.date(), ("vacuity guard", zone)
@@ -572,15 +571,19 @@ def test_inquiry_at_holds_two_frames_in_indistinguishable_shapes(
     pipeline.ensure(tenant, SITE, unparseable, None)
 
     parsed, fallback = _inquiry_at(tenant, "parsed"), _inquiry_at(tenant, "fallback")
-    # The listing's calendar date at 09:00 — the property's frame, not ours.
-    assert parsed == f"{listing.isoformat()}T09:00:00", (zone, parsed)
+    # 09:00 on the listing's date, in the PROPERTY zone, expressed in the server frame.
+    expected_parsed = scheduler.server_naive(
+        tenant, datetime.combine(listing, time(9, 0))
+    ).isoformat(timespec="seconds")
+    assert parsed == expected_parsed, (zone, parsed, expected_parsed)
     assert fallback == server_now.isoformat(timespec="seconds"), fallback
-    assert parsed[:10] != fallback[:10], (
-        "vacuity guard: the two write paths must land on different days here, "
-        "or 'indistinguishable' is being asserted of one value")
+    # Vacuity: the zone must be non-zero so the conversion produces a different
+    # value from the bare "<date>T09:00:00" the old code produced.
+    assert parsed != f"{listing.isoformat()}T09:00:00", (
+        "vacuity guard: server_naive must differ from a bare 09:00 stamp — "
+        "the zone is non-zero, so the conversion should change the time")
 
-    # The fact the whole design turns on: nothing about the stored value says
-    # which frame it is in, so no per-row bound can be chosen.
+    # The fact `norm_ts` handles both: both are naive, T-separated, seconds precision.
     for value in (parsed, fallback):
         assert len(value) == 19 and value[10] == "T", value
         assert datetime.fromisoformat(value).microsecond == 0, value
@@ -923,27 +926,34 @@ def test_untouched_deals_are_unchanged_when_no_property_zone_is_set(
 
 def test_a_deal_in_the_ahead_direction_closes_a_day_late_on_purpose(
         tenant, monkeypatch):
-    """VEN-225 AC7 — the accepted cost, asserted so it is not a surprise.
+    """VEN-225 AC7 — the accepted cost on legacy-framed rows, re-scoped by VEN-226.
 
-    Green before and after. When the property is a day *ahead* of the server the
-    earlier of the two bounds is the server's, so a deal
-    `STALE_CLOSE_DAYS + 1` property-days cold is not closed until the next day's
-    pass. That is deliberate, and it is the price of the fix: a row's frame is
-    unknowable, so a bound can be exact or it can never be early, not both.
+    After VEN-226 the new writer stores `inquiry_at` in the server frame, so a
+    genuinely 22-property-day-old deal now closes on time. The one-day delay that
+    VEN-225 accepted as a cost only applies to rows whose `inquiry_at` is still in
+    the legacy property frame — written before VEN-226, or whose item no longer
+    parses — where the stored prefix cannot be attributed to either frame.
 
-    Erring late is the cheap direction, and `STALE_CLOSE_DAYS` already says why
-    — "dropping out of the queue is a display decision and recoverable, closing
-    the deal is a lifecycle decision and shows as a loss". A day of delay on a
-    21-day window is invisible; the next worker pass closes it. Whoever reads
-    this test wanting it to be exact should read that comment first.
+    This test asserts that cost on exactly that population: three deals SQL-stamped
+    in the legacy format (`f"{date}T09:00:00"`) so the abandonment bound still
+    protects them. The VEN-225 rationale stands for these rows; removing `min()` is
+    not this ticket's call.
+
+    `colder` and `warm` are controls: one that definitely closes (verifies the arm
+    fires at all) and one that stays open (verifies it doesn't over-fire).
     """
     zone, server_now, prop_date = _zone_where_property_is(AHEAD)
     assert prop_date == server_now.date() + timedelta(days=1), (zone, prop_date)
     config.save_settings(tenant, timezone=zone)
 
-    _untouched(tenant, "cold", prop_date - timedelta(days=STALE + 1))
-    _untouched(tenant, "colder", prop_date - timedelta(days=STALE + 2))
-    _untouched(tenant, "warm", prop_date - timedelta(days=5))
+    # SQL-stamp directly in the legacy property frame so the abandonment bound
+    # protects these rows exactly as VEN-225 described.
+    for item_id, listing_date in (
+        ("cold", prop_date - timedelta(days=STALE + 1)),
+        ("colder", prop_date - timedelta(days=STALE + 2)),
+        ("warm", prop_date - timedelta(days=5)),
+    ):
+        _inquiry_only(tenant, item_id, f"{listing_date.isoformat()}T09:00:00")
 
     _freeze(monkeypatch, server_now, pipeline, scheduler)
     moved = pipeline.advance_lifecycle(tenant, SITE)

@@ -343,7 +343,7 @@ def test_a_new_year_message_is_not_auto_closed_as_abandoned(freeze, tenant):
     assert fresh["closed_reason"] is None
 
     cold = pipeline.get(tenant, SITE, "cold")
-    assert cold["inquiry_at"] == "2026-11-01T09:00:00"
+    assert cold["inquiry_at"] == "2026-11-01T14:00:00"
     assert cold["stage"] == "lost"
     assert cold["closed_reason"] == f"No reply for {pipeline.STALE_CLOSE_DAYS} days"
     assert moved["lost"] == 1
