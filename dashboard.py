@@ -147,9 +147,13 @@ def _start_background_agents() -> None:
     On serverless (no Playwright) or when the worker queue is forced, worker.py
     owns this instead — starting a scheduler here would fire checks that can
     never run.
+
+    `_can_drive_browser_in_process` is defined below this function but called
+    from it at runtime; the only call to `_start_background_agents` is at the
+    bottom of the module, long after both names exist.
     """
     try:
-        if check_leads.playwright_available() and not _use_worker_queue():
+        if _can_drive_browser_in_process():
             automation.start_scheduler(SITE)
     except Exception:
         app.logger.exception("Could not start the autopilot scheduler")
@@ -184,13 +188,30 @@ def _use_worker_queue() -> bool:
     return os.getenv("FORCE_WORKER_QUEUE", "").strip().lower() in ("1", "true", "yes")
 
 
+def _can_drive_browser_in_process() -> bool:
+    """Whether this process can drive a real browser itself.
+
+    One decision, five consumers: `_start_background_agents` (the autopilot
+    scheduler), the drainer (delivery), `_live_state` (which state the UI
+    projects), and the `/refresh` and `/otp` routes (scrape and OTP). On
+    serverless (no Playwright) or when the worker queue is forced, all five
+    belong to worker.py instead.
+
+    Deliberately named for the *capability*, not for delivery: four of the five
+    consumers do not deliver anything, and this used to be spelled out inline at
+    each of them, so the five copies could drift apart one edit at a time. If
+    you add a sixth consumer, call this — do not spell the expression out again.
+    """
+    return check_leads.playwright_available() and not _use_worker_queue()
+
+
 def _can_deliver_in_process() -> bool:
     """Whether this process can drive the browser to deliver queued messages.
 
     On serverless (no Playwright) or when the worker queue is forced, delivery
     belongs to worker.py instead — starting a drainer here would spin uselessly.
     """
-    return check_leads.playwright_available() and not _use_worker_queue()
+    return _can_drive_browser_in_process()
 
 
 def _live_state(tenant_id: str) -> dict:
@@ -205,7 +226,7 @@ def _live_state(tenant_id: str) -> dict:
     projection and no meaning to a client, and everything reached from here is
     served to one (`/api/status`, `/otp`, `/refresh`, and the `state | tojson`
     inlined into every dashboard page)."""
-    if check_leads.playwright_available() and not _use_worker_queue():
+    if _can_drive_browser_in_process():
         return runner.public_state(tenant_id)
     return jobs.public_state(tenant_id)
 
@@ -1418,7 +1439,7 @@ def api_status():
 @scrape_allowed
 def refresh():
     tenant_id = current_user.tenant_id
-    if check_leads.playwright_available() and not _use_worker_queue():
+    if _can_drive_browser_in_process():
         # Browser is available here: run the scrape in-process (local/worker host).
         # Not routed through `_live_state`: when a run is already active for this
         # same tenant, `start_scrape` returns the live `_state` directly, so a
@@ -1436,7 +1457,7 @@ def refresh():
 def otp():
     tenant_id = current_user.tenant_id
     code = request.form.get("code", "") or (request.json or {}).get("code", "")
-    if check_leads.playwright_available() and not _use_worker_queue():
+    if _can_drive_browser_in_process():
         ok = runner.submit_otp(tenant_id, code)
     else:
         # Route the code to the tenant's active worker job via the shared DB.
